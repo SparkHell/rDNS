@@ -6,6 +6,17 @@ fn local_runtime_protocols_and_certificate_reload() {
 }
 
 #[test]
+fn default_and_live_listener_management() {
+    let result = Command::new("python3")
+        .arg("tests/smoke.py")
+        .env("RDNS_BIN", env!("CARGO_BIN_EXE_rdns"))
+        .env("RDNS_LISTENER_TEST", "1")
+        .status()
+        .expect("launch listener smoke script");
+    assert!(result.success(), "listener smoke script failed");
+}
+
+#[test]
 #[ignore = "requires outbound DNS access to authoritative servers"]
 fn live_root_dnssec_and_ech() {
     run_smoke(true, false);

@@ -10,15 +10,15 @@ use std::{
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub database: PathBuf,
-    pub dns_udp: SocketAddr,
-    pub dns_tcp: SocketAddr,
-    pub doh: SocketAddr,
-    pub dot: SocketAddr,
-    pub doq: SocketAddr,
+    pub dns_udp: Option<SocketAddr>,
+    pub dns_tcp: Option<SocketAddr>,
+    pub doh: Option<SocketAddr>,
+    pub dot: Option<SocketAddr>,
+    pub doq: Option<SocketAddr>,
     pub admin: SocketAddr,
     pub allowed_clients: Vec<IpNet>,
-    pub certificate: PathBuf,
-    pub private_key: PathBuf,
+    pub certificate: Option<PathBuf>,
+    pub private_key: Option<PathBuf>,
     pub subscription_ca: Option<PathBuf>,
     pub root_hints: Option<PathBuf>,
     #[serde(default = "default_log_days")]
@@ -35,15 +35,20 @@ impl Config {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut config: Self = toml::from_str(&raw).context("parsing configuration")?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
-        for value in [
-            &mut config.database,
-            &mut config.certificate,
-            &mut config.private_key,
-        ] {
-            if value.is_relative() {
-                *value = base.join(&*value);
+        if config.database.is_relative() {
+            config.database = base.join(&config.database);
+        }
+        for value in [&mut config.certificate, &mut config.private_key] {
+            if let Some(path) = value
+                && path.is_relative()
+            {
+                *path = base.join(&*path);
             }
         }
+        anyhow::ensure!(
+            config.certificate.is_some() == config.private_key.is_some(),
+            "certificate and private_key must be configured together"
+        );
         if let Some(value) = &mut config.subscription_ca
             && value.is_relative()
         {

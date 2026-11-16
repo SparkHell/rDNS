@@ -31,7 +31,14 @@ pub fn install(config_path: &Path) -> Result<()> {
             ],
         )?;
     }
-    for path in [&config_path, &config.certificate, &config.private_key] {
+    for path in [&config_path, &binary] {
+        anyhow::ensure!(path.exists(), "required file missing: {}", path.display());
+        ensure_readable_by_service(path)?;
+    }
+    for path in [&config.certificate, &config.private_key]
+        .into_iter()
+        .flatten()
+    {
         anyhow::ensure!(path.exists(), "required file missing: {}", path.display());
         ensure_readable_by_service(path)?;
     }
@@ -41,7 +48,6 @@ pub fn install(config_path: &Path) -> Result<()> {
     if let Some(hints) = &config.root_hints {
         ensure_readable_by_service(hints)?;
     }
-    ensure_readable_by_service(&binary)?;
     ensure_writable_by_service(data_dir)?;
     let unit = unit_text(&binary, &config_path, data_dir)?;
     let unit_path = Path::new(UNIT_PATH);

@@ -1,3 +1,4 @@
+use crate::{cache::CacheSettings, runtime::ListenerSettings};
 use anyhow::{Context, Result};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use chrono::{DateTime, Utc};
@@ -8,11 +9,23 @@ use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{path::Path, str::FromStr};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 #[derive(Clone)]
 pub struct Store {
     pub pool: SqlitePool,
+}
+
+pub struct QueryLogEntry<'a> {
+    pub client: &'a str,
+    pub domain: &'a str,
+    pub qtype: &'a str,
+    pub outcome: &'a str,
+    pub protocol: &'a str,
+    pub duration_ms: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -71,11 +84,112 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS query_log (id INTEGER PRIMARY KEY, at TEXT NOT NULL, client TEXT NOT NULL, domain TEXT NOT NULL, qtype TEXT NOT NULL, outcome TEXT NOT NULL, protocol TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS client_networks (cidr TEXT PRIMARY KEY)",
+            "CREATE TABLE IF NOT EXISTS certificate_paths (id INTEGER PRIMARY KEY CHECK(id=1), certificate TEXT NOT NULL, private_key TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS listener_settings (id INTEGER PRIMARY KEY CHECK(id=1), settings TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS cache_settings (id INTEGER PRIMARY KEY CHECK(id=1), settings TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS cache_entries (cache_key TEXT PRIMARY KEY, response BLOB NOT NULL, inserted_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, kind TEXT NOT NULL, byte_size INTEGER NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_cache_entries_expiry ON cache_entries(expires_at)",
             "CREATE INDEX IF NOT EXISTS idx_query_log_at ON query_log(at DESC)",
         ] {
             sqlx::query(ddl).execute(&pool).await?;
         }
+        let columns = sqlx::query("PRAGMA table_info(query_log)")
+            .fetch_all(&pool)
+            .await?;
+        if !columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "duration_ms")
+        {
+            sqlx::query("ALTER TABLE query_log ADD COLUMN duration_ms REAL")
+                .execute(&pool)
+                .await?;
+        }
         Ok(Self { pool })
+    }
+
+    pub async fn certificate_paths(&self) -> Result<Option<(PathBuf, PathBuf)>> {
+        let row = sqlx::query("SELECT certificate, private_key FROM certificate_paths WHERE id=1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| {
+            (
+                PathBuf::from(row.get::<String, _>("certificate")),
+                PathBuf::from(row.get::<String, _>("private_key")),
+            )
+        }))
+    }
+
+    pub async fn listener_settings(&self) -> Result<Option<ListenerSettings>> {
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT settings FROM listener_settings WHERE id=1")
+                .fetch_optional(&self.pool)
+                .await?;
+        raw.map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    pub async fn cache_settings(&self) -> Result<Option<CacheSettings>> {
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT settings FROM cache_settings WHERE id=1")
+                .fetch_optional(&self.pool)
+                .await?;
+        raw.map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    pub async fn set_cache_settings(&self, settings: &CacheSettings) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO cache_settings(id,settings) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET settings=excluded.settings")
+            .bind(serde_json::to_string(settings)?).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM cache_entries")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn cache_entry(&self, key: &str) -> Result<Option<(Vec<u8>, i64, i64)>> {
+        let row = sqlx::query("SELECT response,inserted_at,expires_at FROM cache_entries WHERE cache_key=? AND expires_at>?")
+            .bind(key).bind(Utc::now().timestamp()).fetch_optional(&self.pool).await?;
+        Ok(row.map(|r| (r.get("response"), r.get("inserted_at"), r.get("expires_at"))))
+    }
+
+    pub async fn set_cache_entry(
+        &self,
+        key: &str,
+        response: &[u8],
+        inserted: i64,
+        expiry: i64,
+        kind: &str,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO cache_entries(cache_key,response,inserted_at,expires_at,kind,byte_size) VALUES(?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET response=excluded.response,inserted_at=excluded.inserted_at,expires_at=excluded.expires_at,kind=excluded.kind,byte_size=excluded.byte_size")
+            .bind(key).bind(response).bind(inserted).bind(expiry).bind(kind).bind(response.len() as i64)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn cache_stats(&self) -> Result<(i64, i64)> {
+        let row = sqlx::query("SELECT COUNT(*) AS count,COALESCE(SUM(byte_size),0) AS bytes FROM cache_entries WHERE expires_at>?")
+            .bind(Utc::now().timestamp()).fetch_one(&self.pool).await?;
+        Ok((row.get("count"), row.get("bytes")))
+    }
+
+    pub async fn set_listener_settings(&self, settings: &ListenerSettings) -> Result<()> {
+        sqlx::query("INSERT INTO listener_settings(id,settings) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET settings=excluded.settings")
+            .bind(serde_json::to_string(settings)?).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn set_certificate_paths(
+        &self,
+        certificate: &Path,
+        private_key: &Path,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO certificate_paths(id,certificate,private_key) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET certificate=excluded.certificate, private_key=excluded.private_key")
+            .bind(certificate.to_string_lossy().as_ref())
+            .bind(private_key.to_string_lossy().as_ref())
+            .execute(&self.pool).await?;
+        Ok(())
     }
 
     pub async fn create_account(&self, username: &str, password: &str, role: &str) -> Result<()> {
@@ -349,32 +463,26 @@ impl Store {
         Ok(rows.into_iter().map(|r| serde_json::json!({"at":r.get::<String,_>("at"),"actor":r.get::<String,_>("actor"),"action":r.get::<String,_>("action"),"detail":r.get::<String,_>("detail")})).collect())
     }
 
-    pub async fn log_query(
-        &self,
-        client: &str,
-        domain: &str,
-        qtype: &str,
-        outcome: &str,
-        protocol: &str,
-    ) -> Result<()> {
+    pub async fn log_query(&self, entry: QueryLogEntry<'_>) -> Result<()> {
         sqlx::query(
-            "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol,duration_ms) VALUES(?,?,?,?,?,?,?)",
         )
         .bind(Utc::now().to_rfc3339())
-        .bind(client)
-        .bind(domain)
-        .bind(qtype)
-        .bind(outcome)
-        .bind(protocol)
+        .bind(entry.client)
+        .bind(entry.domain)
+        .bind(entry.qtype)
+        .bind(entry.outcome)
+        .bind(entry.protocol)
+        .bind(entry.duration_ms)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
     pub async fn logs(&self) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT at,client,domain,qtype,outcome,protocol FROM query_log ORDER BY id DESC LIMIT 200")
+        let rows = sqlx::query("SELECT at,client,domain,qtype,outcome,protocol,duration_ms FROM query_log ORDER BY id DESC LIMIT 200")
             .fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|r| serde_json::json!({"at":r.get::<String,_>("at"), "client":r.get::<String,_>("client"), "domain":r.get::<String,_>("domain"), "qtype":r.get::<String,_>("qtype"), "outcome":r.get::<String,_>("outcome"), "protocol":r.get::<String,_>("protocol")})).collect())
+        Ok(rows.into_iter().map(|r| serde_json::json!({"at":r.get::<String,_>("at"), "client":r.get::<String,_>("client"), "domain":r.get::<String,_>("domain"), "qtype":r.get::<String,_>("qtype"), "outcome":r.get::<String,_>("outcome"), "protocol":r.get::<String,_>("protocol"), "duration_ms":r.get::<Option<f64>,_>("duration_ms")})).collect())
     }
 
     pub async fn stats(&self) -> Result<serde_json::Value> {
@@ -398,6 +506,10 @@ impl Store {
             .bind(Utc::now().to_rfc3339())
             .execute(&self.pool)
             .await?;
+        sqlx::query("DELETE FROM cache_entries WHERE expires_at<=?")
+            .bind(Utc::now().timestamp())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }
@@ -409,6 +521,42 @@ fn hash_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn old_query_logs_migrate_without_inventing_durations() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "rdns-log-migration-{}.sqlite3",
+            rand::random::<u64>()
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new().connect_with(options).await?;
+        sqlx::query("CREATE TABLE query_log (id INTEGER PRIMARY KEY, at TEXT NOT NULL, client TEXT NOT NULL, domain TEXT NOT NULL, qtype TEXT NOT NULL, outcome TEXT NOT NULL, protocol TEXT NOT NULL)").execute(&pool).await?;
+        sqlx::query("INSERT INTO query_log VALUES(1,'2026-01-01','127.0.0.1','old.example','A','local','udp')").execute(&pool).await?;
+        pool.close().await;
+        let store = Store::open(&path).await?;
+        assert!(store.logs().await?[0]["duration_ms"].is_null());
+        store
+            .log_query(QueryLogEntry {
+                client: "127.0.0.1",
+                domain: "new.example",
+                qtype: "A",
+                outcome: "local",
+                protocol: "udp",
+                duration_ms: 0.125,
+            })
+            .await?;
+        assert_eq!(store.logs().await?[0]["duration_ms"], 0.125);
+        store.pool.close().await;
+        let reopened = Store::open(&path).await?;
+        assert_eq!(reopened.logs().await?.len(), 2);
+        reopened.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn short_nonempty_password_can_be_used_to_create_and_log_in() -> Result<()> {

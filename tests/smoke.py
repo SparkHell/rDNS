@@ -6,6 +6,7 @@ import base64
 import http.server
 import json
 import os
+import sqlite3
 from pathlib import Path
 import shutil
 import socket
@@ -117,6 +118,7 @@ def fake_forwarder(sock):
     sock.settimeout(8)
     try:
         request, peer = sock.recvfrom(4096)
+        time.sleep(0.05)
         answer = request[:2] + struct.pack("!HHHHH", 0x81A0, 1, 1, 0, 0) + request[12:]
         answer += b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton("198.51.100.7")
         sock.sendto(answer, peer)
@@ -220,6 +222,8 @@ def run():
                     forwarded = udp(query("host.corp.example"), dns_port)
                     assert rcode(forwarded) == 0 and socket.inet_aton("198.51.100.7") in forwarded
                     assert forwarded[3] & 0x20 == 0, "forwarded answer retained untrusted AD bit"
+                    forward_log = api(base, "/logs", token=token)[0]
+                    assert forward_log["outcome"] == "forward" and forward_log["duration_ms"] >= 50, "query duration omitted upstream wait"
                     thread.join(timeout=2)
 
                 assert api(base, "/clients", token=token) == ["127.0.0.0/8"]
@@ -233,11 +237,14 @@ def run():
                 assert api(base, "/stats", token=viewer)["total"] > 0
                 expect_http_error(403, lambda: api(base, "/certificates/reload", token=viewer, method="POST"))
                 expect_http_error(403, lambda: api(base, "/clients", {"cidrs": ["127.0.0.0/8"]}, viewer, method="PUT"))
+                expect_http_error(403, lambda: api(base, "/cache", api(base, "/cache", token=token)["settings"], viewer, method="PUT"))
+                expect_http_error(403, lambda: api(base, "/listeners", api(base, "/listeners", token=token)["settings"], viewer, method="PUT"))
 
                 sub = api(base, "/subscriptions", {"url": f"https://localhost:{list_port}/block.txt"}, token)["id"]
                 assert api(base, f"/subscriptions/{sub}/refresh", token=token, method="POST")["count"] == 1
                 assert rcode(udp(query("ads.subscription.invalid"), dns_port)) == 3
                 assert api(base, "/logs", token=token)[0]["outcome"] == "blocked"
+                assert api(base, "/logs", token=token)[0]["duration_ms"] >= 0
                 filter_http.filter_body = b""
                 expect_http_error(502, lambda: api(base, f"/subscriptions/{sub}/refresh", token=token, method="POST"))
                 assert rcode(udp(query("ads.subscription.invalid"), dns_port)) == 3
@@ -260,6 +267,13 @@ def run():
                         capture_output=True, text=True, timeout=25, check=True,
                     )
                     assert "ech=" in ech.stdout.lower(), f"ECH HTTPS record absent: {ech.stdout.strip()}\n{log.read_text()[-3000:]}"
+                    with sqlite3.connect(directory / "rdns.sqlite3") as database:
+                        cached = dict(database.execute("SELECT kind,COUNT(*) FROM cache_entries GROUP BY kind"))
+                    assert cached.get("delegation", 0) > 0 and cached.get("answer", 0) > 0, f"missing persisted NS/answer records: {cached}"
+                    stats = api(base, "/cache", token=token)
+                    assert stats["disk_entries"] >= cached.get("delegation", 0) + cached.get("answer", 0)
+                    assert stats["process_rss_bytes"] > 0
+                    print(f"SQLite persisted cache: {cached}")
                     print("PASS: root recursion, DNSSEC failure and public ECH HTTPS record")
 
                 first = peer_fingerprint(dot_port)
@@ -280,11 +294,20 @@ def run():
                 assert peer_fingerprint(dot_port) == second, "failed reload changed certificate"
                 assert first_doh != peer_fingerprint(doh_port), "failed reload changed DoH certificate"
                 subprocess.run([os.environ["RDNS_DOQ_PROBE"], f"127.0.0.1:{doq_port}", str(cert2)], check=True)
+                assert api(base, "/certificates", token=token) == {"certificate": str(live_cert), "private_key": str(live_key)}
+                expect_http_error(403, lambda: api(base, "/certificates", token=viewer))
+                expect_http_error(403, lambda: api(base, "/certificates", {"certificate": str(cert1), "private_key": str(key1)}, viewer, method="PUT"))
+                expect_http_error(400, lambda: api(base, "/certificates", {"certificate": str(cert1), "private_key": str(key2)}, token, method="PUT"))
+                assert peer_fingerprint(dot_port) == second, "invalid path update changed active certificate"
+                paths = api(base, "/certificates", {"certificate": str(cert1), "private_key": str(key1)}, token, method="PUT")
+                assert paths == {"certificate": str(cert1), "private_key": str(key1)}
+                assert peer_fingerprint(dot_port) == first, "saving paths did not switch DoT certificate"
+                assert peer_fingerprint(doh_port) == first_doh, "saving paths did not switch DoH certificate"
+                subprocess.run([os.environ["RDNS_DOQ_PROBE"], f"127.0.0.1:{doq_port}", str(cert1)], check=True)
                 events = api(base, "/audit", token=token)
                 assert sum(item["action"] == "certificate.reload" for item in events) >= 2
                 server.terminate()
                 server.wait(timeout=5)
-                shutil.copyfile(cert2, live_cert)
                 server = subprocess.Popen([str(BIN), str(config)], stdout=output, stderr=subprocess.STDOUT)
                 for _ in range(100):
                     try:
@@ -296,7 +319,11 @@ def run():
                     raise AssertionError(f"server did not restart:\n{log.read_text()[-2000:]}")
                 assert socket.inet_aton("192.0.2.10") in udp(packet, dns_port), "local rule not restored"
                 assert rcode(udp(query("ads.subscription.invalid"), dns_port)) == 3, "subscription state not restored"
-                print("PASS: UDP, TCP, DoH GET/POST, DoT, DoQ, rules, subscription, roles, certificate reload and restart persistence")
+                assert peer_fingerprint(dot_port) == first, "certificate paths were not restored after restart"
+                assert api(base, "/certificates", token=token) == paths
+                if os.environ.get("RDNS_LIVE_DNS") == "1":
+                    assert api(base, "/cache", token=token)["disk_entries"] > 0, "SQLite cache lost after restart"
+                print("PASS: UDP, TCP, DoH GET/POST, DoT, DoQ, rules, subscription, roles, certificate paths, reload and restart persistence")
             finally:
                 filter_http.shutdown()
                 filter_http.server_close()
@@ -308,5 +335,71 @@ def run():
                     server.wait()
 
 
+def listener_run():
+    with tempfile.TemporaryDirectory(prefix="rdns-listener-") as tmp:
+        directory = Path(tmp)
+        dns_port, admin_port, occupied_port = [port() for _ in range(3)]
+        config = directory / "config.toml"
+        config.write_text(
+            f'database = "{directory / "rdns.sqlite3"}"\n'
+            f'admin = "127.0.0.1:{admin_port}"\n'
+            'allowed_clients = ["127.0.0.0/8"]\n', encoding="utf-8",
+        )
+        subprocess.run([str(BIN), "init-admin", str(config), "admin"], input=PASSWORD.encode(), check=True, stdout=subprocess.DEVNULL)
+        log = directory / "server.log"
+        with log.open("wb") as output:
+            server = subprocess.Popen([str(BIN), str(config)], stdout=output, stderr=subprocess.STDOUT)
+            try:
+                base = f"http://127.0.0.1:{admin_port}"
+                for _ in range(100):
+                    if server.poll() is not None: raise AssertionError(log.read_text())
+                    try:
+                        token = api(base, "/login", {"username":"admin","password":PASSWORD})["token"]
+                        break
+                    except urllib.error.URLError:
+                        time.sleep(0.1)
+                else: raise AssertionError("admin listener did not start")
+                initial = api(base, "/listeners", token=token)
+                assert not any(setting["enabled"] for setting in initial["settings"].values())
+                assert not any(initial["running"].values())
+                assert initial["settings"]["dns_udp"]["address"] == "0.0.0.0:53"
+                cache = api(base, "/cache", token=token)
+                assert cache["settings"]["memory_mib"] == 64
+                cache_settings = {**cache["settings"], "memory_mib":8, "ns_max_ttl":3600}
+                assert api(base, "/cache", cache_settings, token, method="PUT")["settings"] == cache_settings
+                expect_http_error(409, lambda: api(base, "/listeners", {
+                    **initial["settings"], "dot":{"enabled":True,"address":f"127.0.0.1:{dns_port}"}
+                }, token, method="PUT"))
+                api(base, "/rules", {"kind":"local","domain":"internal.example","record_type":"A","value":"192.0.2.10"}, token)
+                desired = {**initial["settings"], "dns_udp":{"enabled":True,"address":f"127.0.0.1:{dns_port}"}}
+                result = api(base, "/listeners", desired, token, method="PUT")
+                assert result["running"]["dns_udp"]
+                assert socket.inet_aton("192.0.2.10") in udp(query("internal.example"), dns_port)
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as occupied:
+                    occupied.bind(("127.0.0.1", occupied_port))
+                    expect_http_error(409, lambda: api(base, "/listeners", {
+                        **desired, "dns_udp":{"enabled":True,"address":f"127.0.0.1:{occupied_port}"}
+                    }, token, method="PUT"))
+                assert socket.inet_aton("192.0.2.10") in udp(query("internal.example"), dns_port)
+                disabled = api(base, "/listeners", {**desired, "dns_udp":{"enabled":False,"address":f"127.0.0.1:{dns_port}"}}, token, method="PUT")
+                assert not disabled["running"]["dns_udp"]
+                server.terminate(); server.wait(timeout=5)
+                server = subprocess.Popen([str(BIN), str(config)], stdout=output, stderr=subprocess.STDOUT)
+                for _ in range(100):
+                    try:
+                        snapshot = api(base, "/listeners", token=token)
+                        break
+                    except urllib.error.URLError:
+                        time.sleep(0.1)
+                else: raise AssertionError("service did not restart")
+                assert not snapshot["settings"]["dns_udp"]["enabled"]
+                assert api(base, "/cache", token=token)["settings"] == cache_settings
+                print("PASS: default listeners off, certificate prerequisite, live enable/disable, port conflict, cache settings and persistence")
+            finally:
+                server.terminate()
+                try: server.wait(timeout=5)
+                except subprocess.TimeoutExpired: server.kill(); server.wait()
+
+
 if __name__ == "__main__":
-    run()
+    listener_run() if os.environ.get("RDNS_LISTENER_TEST") == "1" else run()

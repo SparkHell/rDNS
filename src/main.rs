@@ -1,6 +1,8 @@
 mod api;
+mod cache;
 mod config;
 mod resolver;
+mod runtime;
 mod service;
 mod store;
 mod tls;
@@ -52,21 +54,30 @@ async fn main() -> Result<()> {
         println!("administrator created: {user}");
         return Ok(());
     }
-    let tls = tls::TlsState::new(
-        config.certificate.clone(),
-        config.private_key.clone(),
-        config.doq,
-    )
-    .await?;
-    let engine = resolver::Engine::new(config.clone(), store).await?;
+    let (cert_path, key_path) = store
+        .certificate_paths()
+        .await?
+        .map(|(cert, key)| (Some(cert), Some(key)))
+        .unwrap_or_else(|| (config.certificate.clone(), config.private_key.clone()));
+    let tls = tls::TlsState::new(cert_path, key_path).await?;
+    let cache = cache::PersistentCache::new(store.clone()).await?;
+    let engine = resolver::Engine::new(config.clone(), store, cache.clone()).await?;
+    let listeners = runtime::ListenerManager::new(&config);
     let state = api::ApiState {
         engine: engine.clone(),
         tls: tls.clone(),
+        listeners: listeners.clone(),
     };
     let admin_listener = TcpListener::bind(config.admin)
         .await
         .context("binding admin API")?;
-    tracing::info!(dns_udp=%config.dns_udp, dns_tcp=%config.dns_tcp, doh=%config.doh, dot=%config.dot, doq=%config.doq, admin=%config.admin, "rDns starting");
+    let initial = engine
+        .store
+        .listener_settings()
+        .await?
+        .unwrap_or_else(|| runtime::ListenerSettings::from_config(&config));
+    listeners.apply(state.clone(), initial, false).await?;
+    tracing::info!(admin=%config.admin, "rDns starting");
 
     let maintenance_engine = engine.clone();
     let maintenance = async move {
@@ -81,17 +92,8 @@ async fn main() -> Result<()> {
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
-    let doh = axum_server::bind_rustls(config.doh, tls.doh.clone()).serve(
-        api::doh_router(state.clone())
-            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    );
     let admin = axum::serve(admin_listener, api::admin_router(state));
     tokio::select! {
-        result = transport::udp(engine.clone()) => result?,
-        result = transport::tcp(engine.clone()) => result?,
-        result = transport::dot(engine.clone(), tls.clone()) => result?,
-        result = transport::doq(engine, tls) => result?,
-        result = doh => result.context("DoH listener")?,
         result = admin => result.context("admin listener")?,
         result = maintenance => result?,
         _ = tokio::signal::ctrl_c() => tracing::info!("shutdown requested"),

@@ -1,5 +1,5 @@
 use crate::{resolver::Engine, tls::TlsState};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -8,12 +8,8 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
-pub async fn udp(engine: Arc<Engine>) -> Result<()> {
-    let socket = Arc::new(
-        UdpSocket::bind(engine.config.dns_udp)
-            .await
-            .context("binding DNS UDP")?,
-    );
+pub async fn udp(engine: Arc<Engine>, socket: UdpSocket) -> Result<()> {
+    let socket = Arc::new(socket);
     let limit = Arc::new(Semaphore::new(256));
     loop {
         let mut buffer = vec![0u8; 4096];
@@ -52,10 +48,7 @@ pub async fn udp(engine: Arc<Engine>) -> Result<()> {
     }
 }
 
-pub async fn tcp(engine: Arc<Engine>) -> Result<()> {
-    let listener = TcpListener::bind(engine.config.dns_tcp)
-        .await
-        .context("binding DNS TCP")?;
+pub async fn tcp(engine: Arc<Engine>, listener: TcpListener) -> Result<()> {
     let limit = Arc::new(Semaphore::new(512));
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -72,10 +65,7 @@ pub async fn tcp(engine: Arc<Engine>) -> Result<()> {
     }
 }
 
-pub async fn dot(engine: Arc<Engine>, tls: Arc<TlsState>) -> Result<()> {
-    let listener = TcpListener::bind(engine.config.dot)
-        .await
-        .context("binding DoT")?;
+pub async fn dot(engine: Arc<Engine>, tls: Arc<TlsState>, listener: TcpListener) -> Result<()> {
     let limit = Arc::new(Semaphore::new(512));
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -86,7 +76,10 @@ pub async fn dot(engine: Arc<Engine>, tls: Arc<TlsState>) -> Result<()> {
         let tls = tls.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let acceptor = TlsAcceptor::from(tls.dot.load_full());
+            let Ok(config) = tls.dot_config() else {
+                return;
+            };
+            let acceptor = TlsAcceptor::from(config);
             match tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream)).await {
                 Ok(Ok(stream)) => {
                     if let Err(error) = dns_stream(stream, peer, engine, "dot").await {
@@ -125,8 +118,7 @@ where
     }
 }
 
-pub async fn doq(engine: Arc<Engine>, tls: Arc<TlsState>) -> Result<()> {
-    let endpoint = tls.doq.clone();
+pub async fn doq(engine: Arc<Engine>, endpoint: quinn::Endpoint) -> Result<()> {
     let connections = Arc::new(Semaphore::new(512));
     while let Some(incoming) = endpoint.accept().await {
         let Ok(permit) = connections.clone().try_acquire_owned() else {

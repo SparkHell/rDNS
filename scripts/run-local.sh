@@ -16,11 +16,6 @@ fi
 
 cat > "$runtime_dir/config.toml" <<EOF
 database = "$runtime_dir/rdns.sqlite3"
-dns_udp = "127.0.0.1:1053"
-dns_tcp = "127.0.0.1:1053"
-doh = "127.0.0.1:8443"
-dot = "127.0.0.1:8853"
-doq = "127.0.0.1:8853"
 admin = "127.0.0.1:3000"
 allowed_clients = ["127.0.0.0/8", "::1/128"]
 certificate = "$runtime_dir/server.crt"
@@ -45,7 +40,8 @@ if [[ ! -f "$runtime_dir/admin.initialized" ]]; then
 fi
 
 printf 'Console: http://127.0.0.1:3000 (user: admin)\n'
-printf 'DNS: dig @127.0.0.1 -p 1053 cloudflare.com A +dnssec\n'
-printf 'DoH: https://localhost:8443/dns-query (test certificate: %s)\n' "$runtime_dir/server.crt"
+printf 'DNS listeners start disabled. In 监听服务, set DNS UDP to 127.0.0.1:1053 and enable it.\n'
+printf 'Then query: dig @127.0.0.1 -p 1053 cloudflare.com A +dnssec\n'
+printf 'Local test certificate: %s\n' "$runtime_dir/server.crt"
 printf 'Press Ctrl+C to stop.\n'
 exec target/debug/rdns "$runtime_dir/config.toml"

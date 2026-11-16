@@ -1,4 +1,5 @@
 use crate::{
+    cache::{CacheSettings, CachedProvider, PersistentCache},
     config::Config,
     store::{Rule, RuleInput, Store},
 };
@@ -12,7 +13,8 @@ use hickory_proto::{
     },
 };
 use hickory_resolver::{
-    net::runtime::TokioRuntimeProvider,
+    TtlConfig,
+    config::ResolverOpts,
     recursor::{DnssecConfig, DnssecPolicy, Recursor, RecursorOptions},
 };
 use std::{
@@ -39,11 +41,17 @@ pub struct Engine {
     pub store: Store,
     policy: ArcSwap<Policy>,
     clients: ArcSwap<Vec<ipnet::IpNet>>,
-    recursor: Recursor<TokioRuntimeProvider>,
+    recursor: ArcSwap<Recursor<CachedProvider>>,
+    cache: Arc<PersistentCache>,
+    roots: Vec<IpAddr>,
 }
 
 impl Engine {
-    pub async fn new(config: Config, store: Store) -> Result<Arc<Self>> {
+    pub async fn new(
+        config: Config,
+        store: Store,
+        cache: Arc<PersistentCache>,
+    ) -> Result<Arc<Self>> {
         // Root addresses bootstrap iterative lookups; the recursor follows referrals with RD=0.
         let mut roots = if let Some(path) = &config.root_hints {
             parse_root_hints(
@@ -68,14 +76,7 @@ impl Engine {
             !roots.is_empty(),
             "no root hints match the available IP family"
         );
-        let recursor = Recursor::new(
-            &roots,
-            DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
-            None,
-            RecursorOptions::default(),
-            TokioRuntimeProvider::default(),
-        )
-        .context("starting validating recursor")?;
+        let recursor = build_recursor(&roots, &cache)?;
         if store.client_networks().await?.is_empty() {
             store
                 .replace_client_networks(
@@ -92,11 +93,25 @@ impl Engine {
             store,
             policy: ArcSwap::from_pointee(Policy::default()),
             clients: ArcSwap::from_pointee(Vec::new()),
-            recursor,
+            recursor: ArcSwap::from_pointee(recursor),
+            cache,
+            roots,
         });
         engine.reload_policy().await?;
         engine.reload_clients().await?;
         Ok(engine)
+    }
+
+    pub async fn cache_stats(&self) -> serde_json::Value {
+        self.cache.stats().await
+    }
+
+    pub async fn update_cache_settings(&self, settings: CacheSettings) -> Result<()> {
+        settings.validate()?;
+        let recursor = build_recursor_with_settings(&self.roots, &self.cache, &settings)?;
+        self.cache.set_settings(settings).await?;
+        self.recursor.store(Arc::new(recursor));
+        Ok(())
     }
 
     pub async fn reload_clients(&self) -> Result<()> {
@@ -199,6 +214,7 @@ impl Engine {
     }
 
     pub async fn answer(&self, wire: &[u8], peer: SocketAddr, protocol: &str) -> Result<Vec<u8>> {
+        let started = Instant::now();
         let request = Message::from_vec(wire).context("invalid DNS message")?;
         let mut response = response(&request, ResponseCode::NoError);
         if !self.client_allowed(peer) {
@@ -265,9 +281,10 @@ impl Engine {
                 .edns
                 .as_ref()
                 .is_some_and(|edns| edns.flags().dnssec_ok);
+            let recursor = self.recursor.load_full();
             match tokio::time::timeout(
                 Duration::from_secs(15),
-                self.recursor.resolve(query.clone(), Instant::now(), do_bit),
+                recursor.resolve(query.clone(), Instant::now(), do_bit),
             )
             .await
             {
@@ -321,15 +338,58 @@ impl Engine {
                 }
             }
         }
+        let wire = response.to_vec()?;
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         if let Err(error) = self
             .store
-            .log_query(&peer.ip().to_string(), &domain, &kind, outcome, protocol)
+            .log_query(crate::store::QueryLogEntry {
+                client: &peer.ip().to_string(),
+                domain: &domain,
+                qtype: &kind,
+                outcome,
+                protocol,
+                duration_ms,
+            })
             .await
         {
             tracing::warn!(%error, "query log write failed");
         }
-        Ok(response.to_vec()?)
+        Ok(wire)
     }
+}
+
+fn build_recursor(
+    roots: &[IpAddr],
+    cache: &Arc<PersistentCache>,
+) -> Result<Recursor<CachedProvider>> {
+    build_recursor_with_settings(roots, cache, &cache.settings())
+}
+
+fn build_recursor_with_settings(
+    roots: &[IpAddr],
+    cache: &Arc<PersistentCache>,
+    settings: &CacheSettings,
+) -> Result<Recursor<CachedProvider>> {
+    let mut resolver_options = ResolverOpts::default();
+    resolver_options.positive_max_ttl = Some(Duration::from_secs(u64::from(
+        settings.ns_max_ttl.min(settings.answer_max_ttl),
+    )));
+    resolver_options.negative_max_ttl =
+        Some(Duration::from_secs(u64::from(settings.negative_max_ttl)));
+    // Hickory counts cached responses, not bytes. Keep this small; the byte-bounded cache is below.
+    let options = RecursorOptions {
+        response_cache_size: 2_048,
+        cache_policy: TtlConfig::from_opts(&resolver_options),
+        ..RecursorOptions::default()
+    };
+    Recursor::new(
+        roots,
+        DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
+        None,
+        options,
+        CachedProvider::new(cache.clone()),
+    )
+    .context("starting validating recursor")
 }
 
 fn response(request: &Message, code: ResponseCode) -> Message {

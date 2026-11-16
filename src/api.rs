@@ -1,12 +1,17 @@
 use crate::{
+    cache::CacheSettings,
     resolver::{Engine, parse_filter_list},
+    runtime::{ListenerManager, ListenerSettings},
     store::{Account, RuleInput, Store},
     tls::TlsState,
 };
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{
+        ConnectInfo, Path, Query, State,
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -22,6 +27,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 pub struct ApiState {
     pub engine: Arc<Engine>,
     pub tls: Arc<TlsState>,
+    pub listeners: Arc<ListenerManager>,
 }
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
@@ -37,6 +43,12 @@ pub fn admin_router(state: ApiState) -> Router {
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/logs", get(logs))
         .route("/api/v1/clients", get(clients).put(update_clients))
+        .route(
+            "/api/v1/listeners",
+            get(listener_status).put(update_listeners),
+        )
+        .route("/api/v1/cache", get(cache_status).put(update_cache))
+        .route("/api/v1/ws", get(websocket))
         .route("/api/v1/rules", get(rules).post(add_rule))
         .route("/api/v1/rules/{id}", axum::routing::delete(delete_rule))
         .route(
@@ -57,6 +69,10 @@ pub fn admin_router(state: ApiState) -> Router {
             axum::routing::delete(delete_account),
         )
         .route("/api/v1/audit", get(audit_events))
+        .route(
+            "/api/v1/certificates",
+            get(certificate_paths).put(update_certificate_paths),
+        )
         .route("/api/v1/certificates/reload", post(reload_certificate))
         .route("/", get(index))
         .route("/{*path}", get(asset))
@@ -175,6 +191,158 @@ async fn clients(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult
             .await
             .map_err(internal)?
     )))
+}
+
+async fn listener_status(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
+    require(&headers, &state.engine.store, "viewer").await?;
+    Ok(Json(state.listeners.snapshot().await))
+}
+
+async fn cache_status(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
+    require(&headers, &state.engine.store, "viewer").await?;
+    Ok(Json(state.engine.cache_stats().await))
+}
+
+async fn update_cache(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(settings): Json<CacheSettings>,
+) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "admin").await?;
+    state
+        .engine
+        .update_cache_settings(settings)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    state
+        .engine
+        .store
+        .audit(&account.username, "cache.update", "applied without restart")
+        .await
+        .map_err(internal)?;
+    let stats = state.engine.cache_stats().await;
+    state
+        .listeners
+        .publish(json!({"type":"cache", "stats":stats}));
+    Ok(Json(stats))
+}
+
+async fn update_listeners(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(settings): Json<ListenerSettings>,
+) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "admin").await?;
+    match state.listeners.apply(state.clone(), settings, true).await {
+        Ok(()) => {
+            state
+                .engine
+                .store
+                .audit(
+                    &account.username,
+                    "listeners.update",
+                    "applied without restart",
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Json(state.listeners.snapshot().await))
+        }
+        Err(error) => Err((StatusCode::CONFLICT, error.to_string())),
+    }
+}
+
+async fn websocket(State(state): State<ApiState>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
+    upgrade.on_upgrade(move |socket| websocket_session(state, socket))
+}
+
+async fn websocket_session(state: ApiState, mut socket: WebSocket) {
+    let auth = tokio::time::timeout(Duration::from_secs(5), socket.next()).await;
+    let Some(Ok(WsMessage::Text(text))) = auth.ok().flatten() else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    if value["type"] != "auth" {
+        return;
+    }
+    let Some(token) = value["token"].as_str() else {
+        return;
+    };
+    let Ok(Some(account)) = state.engine.store.account_for_token(token).await else {
+        return;
+    };
+    let mut events = state.listeners.subscribe();
+    if socket
+        .send(WsMessage::Text(
+            json!({"type":"ready","account":account}).to_string().into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if socket
+        .send(WsMessage::Text(
+            state.listeners.snapshot().await.to_string().into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if socket
+        .send(WsMessage::Text(
+            json!({"type":"cache","stats":state.engine.cache_stats().await})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut tick = tokio::time::interval(Duration::from_secs(3));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let status = json!({"type":"cache","stats":state.engine.cache_stats().await});
+                if socket.send(WsMessage::Text(status.to_string().into())).await.is_err() { return; }
+            }
+            event = events.recv() => {
+                if let Ok(event) = event
+                    && socket.send(WsMessage::Text(event.into())).await.is_err() { return; }
+            }
+            message = socket.next() => {
+                let Some(Ok(WsMessage::Text(text))) = message else { return; };
+                let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
+                if value["type"] != "listeners.update" && value["type"] != "cache.update" { continue; }
+                let request_id = value["request_id"].clone();
+                let result = if account.role == "admin" {
+                    if value["type"] == "listeners.update" {
+                        match serde_json::from_value::<ListenerSettings>(value["settings"].clone()) {
+                            Ok(settings) => state.listeners.apply(state.clone(), settings, true).await.map_err(|e| e.to_string()),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    } else {
+                        match serde_json::from_value::<CacheSettings>(value["settings"].clone()) {
+                            Ok(settings) => state.engine.update_cache_settings(settings).await.map_err(|e| e.to_string()),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                } else { Err("administrator role required".to_string()) };
+                if result.is_ok() {
+                    let action = if value["type"] == "listeners.update" { "listeners.update" } else { "cache.update" };
+                    let _ = state.engine.store.audit(&account.username, action, "applied without restart").await;
+                    if value["type"] == "cache.update" {
+                        state.listeners.publish(json!({"type":"cache","stats":state.engine.cache_stats().await}));
+                    }
+                }
+                let reply = json!({"type":"result","request_id":request_id,"ok":result.is_ok(),"error":result.err()});
+                if socket.send(WsMessage::Text(reply.to_string().into())).await.is_err() { return; }
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -429,6 +597,11 @@ async fn reload_certificate(State(state): State<ApiState>, headers: HeaderMap) -
     match state.tls.reload().await {
         Ok(()) => {
             state
+                .listeners
+                .refresh_doq_config(&state.tls)
+                .await
+                .map_err(internal)?;
+            state
                 .engine
                 .store
                 .audit(&account.username, "certificate.reload", "success")
@@ -443,6 +616,87 @@ async fn reload_certificate(State(state): State<ApiState>, headers: HeaderMap) -
                 .audit(
                     &account.username,
                     "certificate.reload",
+                    &format!("failed: {error}"),
+                )
+                .await
+                .map_err(internal)?;
+            Err((StatusCode::BAD_REQUEST, error.to_string()))
+        }
+    }
+}
+
+async fn certificate_paths(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
+    require(&headers, &state.engine.store, "admin").await?;
+    let (certificate, private_key) = state
+        .tls
+        .paths()
+        .await
+        .map(|(cert, key)| {
+            (
+                cert.to_string_lossy().into_owned(),
+                key.to_string_lossy().into_owned(),
+            )
+        })
+        .unwrap_or_else(|| (String::new(), String::new()));
+    Ok(Json(
+        json!({"certificate":certificate,"private_key":private_key}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct CertificatePathsInput {
+    certificate: String,
+    private_key: String,
+}
+
+async fn update_certificate_paths(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<CertificatePathsInput>,
+) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "admin").await?;
+    let certificate = std::path::PathBuf::from(input.certificate);
+    let private_key = std::path::PathBuf::from(input.private_key);
+    match state
+        .tls
+        .set_paths(
+            &state.engine.store,
+            certificate.clone(),
+            private_key.clone(),
+        )
+        .await
+    {
+        Ok(()) => {
+            state
+                .listeners
+                .refresh_doq_config(&state.tls)
+                .await
+                .map_err(internal)?;
+            state
+                .engine
+                .store
+                .audit(
+                    &account.username,
+                    "certificate.paths.update",
+                    &format!(
+                        "certificate={} private_key={}",
+                        certificate.display(),
+                        private_key.display()
+                    ),
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Json(
+                json!({"certificate":certificate,"private_key":private_key}),
+            ))
+        }
+        Err(error) => {
+            state
+                .engine
+                .store
+                .audit(
+                    &account.username,
+                    "certificate.paths.update",
                     &format!("failed: {error}"),
                 )
                 .await

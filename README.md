@@ -14,13 +14,13 @@ Requirements: Rust toolchain, Node.js 20+, npm, and C build tools for `ring`/SQL
 
 The script installs the locked web dependencies, builds `web/dist`, then builds `target/release/rdns` using `Cargo.lock`. `cargo build` alone requires an existing `web/dist` directory because the frontend is embedded at compile time.
 
-For hands-on local use, run `./scripts/run-local.sh`. It builds the app, asks you to set the initial `admin` password, creates a local test certificate, and runs rDns in the foreground. Open `http://127.0.0.1:3000`, then query `dig @127.0.0.1 -p 1053 cloudflare.com A +dnssec`. Use Ctrl+C to stop; subsequent starts keep the local database and password. The local instance listens only on loopback and uses `data/local` for its files.
+For hands-on local use, run `./scripts/run-local.sh`. It builds the app, asks you to set the initial `admin` password, creates a local test certificate, and starts only the loopback management panel. Open `http://127.0.0.1:3000`, set DNS UDP to `127.0.0.1:1053` and enable it in **监听服务**, then query `dig @127.0.0.1 -p 1053 cloudflare.com A +dnssec`. Use Ctrl+C to stop; subsequent starts keep the local database and password. The local instance uses `data/local` for its files.
 Run `./packaging/package.sh` after the release build to create an architecture-labelled tarball and `SHA256SUMS`. CI builds and packages on native Linux x86_64 and ARM64 runners.
 Pushes to `main` and the nightly schedule update one rolling `nightly` pre-release with both architecture archives and a combined checksum file. Tags matching `v*` publish an independent formal release for that tag. Pull requests run checks without publishing.
 
 ## Configure and run
 
-Create an `rdns` service user and `/var/lib/rdns` owned by that user. Copy `config.example.toml` to `/etc/rdns/config.toml`, set listening addresses and client CIDRs, and place a PEM certificate chain and matching private key at the configured paths. The sample binds all listeners to loopback and uses high ports; deployers may bind the DNS ports to a LAN address. Keep the admin HTTP listener on loopback and publish it through an authenticated HTTPS reverse proxy if remote administrators need access.
+Create an `rdns` service user and `/var/lib/rdns` owned by that user. Copy `config.example.toml` to `/etc/rdns/config.toml` and set client CIDRs. A new instance starts only the loopback management panel; all DNS listeners are disabled. Use the panel to select addresses and enable protocols. DoH defaults to 443, DoT and DoQ to 853, and plain DNS to 53. Encrypted listeners require PEM paths configured in the certificate page. Keep the admin HTTP listener on loopback and publish it through an authenticated HTTPS reverse proxy if remote administrators need access.
 
 Create the first administrator by passing a nonempty password on standard input:
 
@@ -34,6 +34,13 @@ On Linux, after placing the binary, configuration and readable PEM files, run `s
 Suggested production ports: UDP/TCP 53, DoH 443 (`/dns-query`), DoT TCP 853, DoQ UDP 853. `allowed_clients` must name every authorized client subnet. IPv4 and IPv6 CIDRs are supported. The SQLite database path must be writable by the service account; certificate files only need read access.
 
 On first start, `allowed_clients` seeds the database. Subsequent client allowlist changes are managed in the console or with `PUT /api/v1/clients` and survive restarts.
+Existing TOML listener addresses are enabled on first upgrade, preserving the current deployment; after a listener configuration is saved in the panel, the SQLite setting takes precedence on restart. The panel sends listener changes over an authenticated WebSocket and receives live status/errors. A new port is bound before settings are saved, so occupied ports leave the current listeners running.
+
+## Cache
+
+Authoritative NS/Glue referrals and DNS answers are persisted as upstream responses in SQLite. Cached upstream responses are replayed through Hickory's DNSSEC validation; the database is never treated as a validated answer by itself. A byte-weighted LRU cache keeps hot responses in memory with a default 64 MiB payload budget. The cache page shows its current weighted size, SQLite entry count/bytes, hits, and the process RSS (which includes Hickory and other runtime memory).
+
+The defaults follow Unbound's TTL limits: positive answers and NS/Glue are capped at 86,400 seconds, negative responses at 3,600 seconds, with no artificial minimum. Every cache entry expires at the earliest of its authoritative TTL, configured limit, and any DNSSEC signature expiration. These limits and the memory budget are configurable in the panel and apply without restarting; changing them clears old cache entries.
 
 ## DNS behavior
 
@@ -53,12 +60,17 @@ For an internal HTTPS list, set `subscription_ca` to the PEM CA certificate that
 
 All endpoints below are under `/api/v1`. Login returns a bearer token valid for 12 hours. The console stores it in session storage. Management HTTP binds to loopback; expose it remotely only through HTTPS.
 
+Query logs include `duration_ms`: server processing time from decoding the request through encoding its response, including lookup/cache/filter work, excluding TLS handshakes, network transit and writing the log to SQLite. Historical rows recorded before this field was added return `null` and display `—` in the console.
+
 | Method | Path | Role | Purpose |
 | --- | --- | --- | --- |
 | POST | `/login` | Public | Exchange username/password for a token |
 | POST | `/logout` | Viewer | Revoke current token |
 | GET | `/me`, `/stats`, `/logs` | Viewer | Profile and recent activity |
 | GET, PUT | `/clients` | Viewer, Admin | Inspect or replace allowed client CIDRs |
+| GET, PUT | `/listeners` | Viewer, Admin | Inspect or atomically apply live DNS listener settings |
+| GET, PUT | `/cache` | Viewer, Admin | View cache usage and update memory/TTL limits |
+| GET | `/ws` | Authenticated | WebSocket status stream and live listener/cache updates; first message is `{"type":"auth","token":"..."}` |
 | GET, POST | `/rules` | Viewer, Editor | List and add rules |
 | DELETE | `/rules/{id}` | Editor | Remove a rule |
 | GET, POST | `/subscriptions` | Viewer, Editor | List and add filter sources |
@@ -67,6 +79,7 @@ All endpoints below are under `/api/v1`. Login returns a bearer token valid for 
 | GET, POST | `/accounts` | Admin | List and add accounts |
 | DELETE | `/accounts/{id}` | Admin | Delete an account |
 | GET | `/audit` | Admin | Recent configuration events |
+| GET, PUT | `/certificates` | Admin | View or replace absolute PEM certificate and private key paths; validated paths take effect immediately and persist in SQLite |
 | POST | `/certificates/reload` | Admin | Re-read PEM files and switch new TLS connections |
 
 To reload a certificate after an external certificate process has replaced both PEM files:
@@ -75,7 +88,7 @@ To reload a certificate after an external certificate process has replaced both 
 curl -X POST -H "Authorization: Bearer $RDNS_TOKEN" http://127.0.0.1:3000/api/v1/certificates/reload
 ```
 
-The reload endpoint checks all three protocol configurations before switching DoH, DoT and DoQ. Invalid PEM or mismatched keys produce a non-2xx response and leave the previous certificate in service. Every reload attempt is audited. Existing connections may continue on their established TLS session.
+The console's certificate page can save new absolute paths. Saving validates the PEM pair, persists the paths, and switches DoH, DoT and DoQ for new connections. The configured TOML paths serve as defaults until paths are saved in the console. The reload endpoint then reads the saved paths. Invalid PEM or mismatched keys produce a non-2xx response and leave the previous paths and certificate in service. Path changes and reload attempts are audited. Existing connections may continue on their established TLS session.
 
 ## Verification
 
