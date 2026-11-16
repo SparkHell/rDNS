@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use hickory_proto::{
-    op::{Message, MessageType, OpCode, ResponseCode},
+    op::{Edns, Message, MessageType, OpCode, ResponseCode},
     rr::{
         DNSClass, Name, RData, Record,
         rdata::{A, AAAA, CNAME, TXT},
@@ -278,6 +278,15 @@ impl Engine {
                         resolved.metadata.recursion_desired = request.metadata.recursion_desired;
                         resolved.metadata.recursion_available = true;
                         resolved.metadata.authentic_data = secure;
+                        resolved.queries = vec![query.clone()];
+                        if request.edns.is_some() {
+                            let mut edns = Edns::new();
+                            edns.set_max_payload(request.max_payload())
+                                .set_dnssec_ok(do_bit);
+                            resolved.edns = Some(edns);
+                        } else {
+                            resolved.edns = None;
+                        }
                         response = resolved;
                     } else {
                         response.metadata.response_code = ResponseCode::ServFail;

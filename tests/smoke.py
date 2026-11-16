@@ -49,6 +49,7 @@ def query(name, qtype=1):
 
 def rcode(packet):
     assert packet[:2] == b"\x12\x34", "DNS ID mismatch"
+    assert packet[4:6] == b"\0\1", "response must contain the original question"
     return packet[3] & 0x0F
 
 
