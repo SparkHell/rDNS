@@ -2,6 +2,9 @@
 name = "rdns"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Validating recursive DNS service with encrypted transports and an embedded management console"
+repository = "https://github.com/inbjo/rDns"
 
 [dependencies]
 anyhow = "1"

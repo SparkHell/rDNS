@@ -10,13 +10,15 @@ esac
 
 binary=target/release/rdns
 test -x "$binary"
+version="${RDNS_PACKAGE_VERSION:-v0.1.0}"
+[[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { printf 'invalid package version\n' >&2; exit 1; }
 mkdir -p release
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
 cp "$binary" "$staging/rdns"
-cp config.example.toml README.md "$staging/"
+cp config.example.toml README.md LICENSE "$staging/"
 cp packaging/rdns.service "$staging/"
-archive="release/rdns-v0.1.0-${target}.tar.gz"
+archive="release/rdns-${version}-${target}.tar.gz"
 tar -C "$staging" -czf "$archive" .
 (cd release && sha256sum "$(basename "$archive")" > SHA256SUMS)
 printf '%s\n' "$archive"

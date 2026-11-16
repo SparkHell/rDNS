@@ -1,5 +1,7 @@
 # rDns
 
+Licensed under the [MIT License](LICENSE).
+
 Rust DNS resolver and administration console for a single organization. Public names are resolved iteratively from root hints with DNSSEC validation. UDP/TCP DNS, DoH, DoT and DoQ share local rules, filtering and query logging. The React + Tailwind CSS console is embedded in the binary.
 
 ## Build
@@ -12,6 +14,7 @@ Requirements: Rust toolchain, Node.js 20+, npm, and C build tools for `ring`/SQL
 
 The script installs the locked web dependencies, builds `web/dist`, then builds `target/release/rdns` using `Cargo.lock`. `cargo build` alone requires an existing `web/dist` directory because the frontend is embedded at compile time.
 Run `./packaging/package.sh` after the release build to create an architecture-labelled tarball and `SHA256SUMS`. CI builds and packages on native Linux x86_64 and ARM64 runners.
+Pushes to `main` and the nightly schedule update one rolling `nightly` pre-release with both architecture archives and a combined checksum file. Tags matching `v*` publish an independent formal release for that tag. Pull requests run checks without publishing.
 
 ## Configure and run
 
