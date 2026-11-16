@@ -1,0 +1,8 @@
+/target
+/web/node_modules
+/web/dist
+/data
+/release
+*.sqlite3*
+__pycache__/
+*.pyc

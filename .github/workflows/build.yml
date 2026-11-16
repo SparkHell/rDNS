@@ -1,0 +1,39 @@
+name: build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install frontend dependencies
+        run: npm --prefix web install --no-audit --no-fund
+      - name: Build embedded frontend
+        run: npm --prefix web run build
+      - name: Rust format check
+        run: cargo fmt --check
+      - name: Rust tests
+        run: cargo test --locked
+      - name: Rust lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build binary
+        run: cargo build --release --locked --bin rdns
+      - name: Verify release binary
+        run: cargo test --test smoke release_binary_protocols -- --ignored --nocapture
+      - name: Package binary
+        run: ./packaging/package.sh
+      - name: Verify package checksum
+        run: cd release && sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rdns-${{ matrix.runner }}
+          path: release/*

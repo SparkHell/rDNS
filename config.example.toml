@@ -1,0 +1,15 @@
+database = "/var/lib/rdns/rdns.sqlite3"
+dns_udp = "127.0.0.1:1053"
+dns_tcp = "127.0.0.1:1053"
+doh = "127.0.0.1:8443"
+dot = "127.0.0.1:8853"
+doq = "127.0.0.1:8853"
+admin = "127.0.0.1:3000"
+allowed_clients = ["127.0.0.0/8", "::1/128"]
+certificate = "/etc/rdns/server.crt"
+private_key = "/etc/rdns/server.key"
+# Optional CA bundle for HTTPS filter lists hosted by the organization.
+# subscription_ca = "/etc/rdns/subscription-ca.crt"
+# Optional override for the bundled InterNIC root hints.
+# root_hints = "/etc/rdns/named.root"
+query_log_days = 7

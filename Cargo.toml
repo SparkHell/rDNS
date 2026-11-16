@@ -1,0 +1,38 @@
+[package]
+name = "rdns"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+arc-swap = "1"
+argon2 = "0.5"
+axum = { version = "0.8", features = ["json"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+hex = "0.4"
+hickory-proto = "=0.26.3"
+hickory-resolver = { version = "=0.26.3", features = ["recursor", "dnssec-ring", "tokio"] }
+ipnet = { version = "2", features = ["serde"] }
+quinn = "0.11"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rust-embed = "8"
+rustls = "0.23"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

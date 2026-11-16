@@ -1,0 +1,5 @@
+[source.crates-io]
+replace-with = "sina"
+
+[source.sina]
+registry = "sparse+https://sina.dev/crates-index/"

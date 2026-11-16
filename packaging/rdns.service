@@ -1,0 +1,24 @@
+[Unit]
+Description=rDns recursive DNS service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rdns
+Group=rdns
+ExecStart=/usr/local/bin/rdns /etc/rdns/config.toml
+WorkingDirectory=/var/lib/rdns
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rdns
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
