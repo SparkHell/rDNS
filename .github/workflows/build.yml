@@ -38,9 +38,11 @@ jobs:
           key: ${{ matrix.target }}
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '26'
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - name: Verify Node.js version
+        run: node --version && npm --version
       - name: Install frontend dependencies
         run: npm --prefix web ci --no-audit --no-fund
       - name: Build embedded frontend
