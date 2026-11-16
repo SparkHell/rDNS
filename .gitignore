@@ -3,6 +3,7 @@
 /web/dist
 /data
 /release
+/.rdns-git/
 *.sqlite3*
 __pycache__/
 *.pyc
