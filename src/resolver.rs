@@ -279,6 +279,7 @@ impl Engine {
                         resolved.metadata.recursion_available = true;
                         resolved.metadata.authentic_data = secure;
                         resolved.queries = vec![query.clone()];
+                        resolved = resolved.maybe_strip_dnssec_records(do_bit);
                         if request.edns.is_some() {
                             let mut edns = Edns::new();
                             edns.set_max_payload(request.max_payload())

@@ -247,6 +247,11 @@ def run():
                     public = udp(query("cloudflare.com"), dns_port, timeout=20)
                     print(f"cloudflare.com: rcode={rcode(public)} AD={bool(public[3] & 0x20)} answers={int.from_bytes(public[6:8], 'big')}")
                     assert rcode(public) == 0, f"public root recursion returned RCODE {rcode(public)}\n{log.read_text()[-3000:]}"
+                    unsigned_response = subprocess.run(
+                        ["dig", "+tcp", "+time=20", "+tries=1", "+noall", "+answer", "-p", str(dns_port), "@127.0.0.1", "cloudflare.com", "A"],
+                        capture_output=True, text=True, timeout=25, check=True,
+                    )
+                    assert "RRSIG" not in unsigned_response.stdout, "RRSIG leaked without DNSSEC DO bit"
                     bogus = udp(query("dnssec-failed.org"), dns_port, timeout=20)
                     print(f"dnssec-failed.org: rcode={rcode(bogus)} AD={bool(bogus[3] & 0x20)} answers={int.from_bytes(bogus[6:8], 'big')}")
                     assert rcode(bogus) == 2, f"bogus DNSSEC domain returned RCODE {rcode(bogus)}\n{log.read_text()[-3000:]}"
