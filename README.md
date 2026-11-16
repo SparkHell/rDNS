@@ -13,6 +13,8 @@ Requirements: Rust toolchain, Node.js 20+, npm, and C build tools for `ring`/SQL
 ```
 
 The script installs the locked web dependencies, builds `web/dist`, then builds `target/release/rdns` using `Cargo.lock`. `cargo build` alone requires an existing `web/dist` directory because the frontend is embedded at compile time.
+
+For hands-on local use, run `./scripts/run-local.sh`. It builds the app, asks you to set the initial `admin` password, creates a local test certificate, and runs rDns in the foreground. Open `http://127.0.0.1:3000`, then query `dig @127.0.0.1 -p 1053 cloudflare.com A +dnssec`. Use Ctrl+C to stop; subsequent starts keep the local database and password. The local instance listens only on loopback and uses `data/local` for its files.
 Run `./packaging/package.sh` after the release build to create an architecture-labelled tarball and `SHA256SUMS`. CI builds and packages on native Linux x86_64 and ARM64 runners.
 Pushes to `main` and the nightly schedule update one rolling `nightly` pre-release with both architecture archives and a combined checksum file. Tags matching `v*` publish an independent formal release for that tag. Pull requests run checks without publishing.
 
@@ -26,6 +28,8 @@ Create the first administrator by passing a password of at least 12 characters o
 sudo -u rdns rdns init-admin /etc/rdns/config.toml admin
 rdns /etc/rdns/config.toml
 ```
+
+On Linux, after placing the binary, configuration and readable PEM files, run `sudo /opt/rDns/rdns service install /opt/rDns/config.toml`. From a directory containing `config.toml`, `sudo /opt/rDns/rdns service install` uses that file automatically. The command creates the `rdns` system account if needed, checks its file and database directory access, installs `/etc/systemd/system/rdns.service`, runs `systemctl daemon-reload`, and enables and starts the service. Running `rdns` without arguments also loads `config.toml` from the current working directory.
 
 Suggested production ports: UDP/TCP 53, DoH 443 (`/dns-query`), DoT TCP 853, DoQ UDP 853. `allowed_clients` must name every authorized client subnet. IPv4 and IPv6 CIDRs are supported. The SQLite database path must be writable by the service account; certificate files only need read access.
 

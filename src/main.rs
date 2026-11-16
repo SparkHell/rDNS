@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod resolver;
+mod service;
 mod store;
 mod tls;
 mod transport;
@@ -22,12 +23,21 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("installing rustls ring crypto provider"))?;
     let args: Vec<String> = std::env::args().collect();
     let (config_path, init_user) = match args.as_slice() {
+        [_] => (PathBuf::from("config.toml"), None),
         [_, path] => (PathBuf::from(path), None),
+        [_, command, action] if command == "service" && action == "install" => {
+            service::install(&PathBuf::from("config.toml"))?;
+            return Ok(());
+        }
+        [_, command, action, path] if command == "service" && action == "install" => {
+            service::install(&PathBuf::from(path))?;
+            return Ok(());
+        }
         [_, command, path, user] if command == "init-admin" => {
             (PathBuf::from(path), Some(user.as_str()))
         }
         _ => anyhow::bail!(
-            "usage: rdns <config.toml> | rdns init-admin <config.toml> <username> (password on stdin)"
+            "usage: rdns [config.toml] | rdns service install [config.toml] | rdns init-admin <config.toml> <username> (password on stdin)"
         ),
     };
     let config = config::Config::load(&config_path)?;
