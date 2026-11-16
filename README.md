@@ -22,7 +22,7 @@ Pushes to `main` and the nightly schedule update one rolling `nightly` pre-relea
 
 Create an `rdns` service user and `/var/lib/rdns` owned by that user. Copy `config.example.toml` to `/etc/rdns/config.toml`, set listening addresses and client CIDRs, and place a PEM certificate chain and matching private key at the configured paths. The sample binds all listeners to loopback and uses high ports; deployers may bind the DNS ports to a LAN address. Keep the admin HTTP listener on loopback and publish it through an authenticated HTTPS reverse proxy if remote administrators need access.
 
-Create the first administrator by passing a password of at least 12 characters on standard input:
+Create the first administrator by passing a nonempty password on standard input:
 
 ```sh
 sudo -u rdns rdns init-admin /etc/rdns/config.toml admin

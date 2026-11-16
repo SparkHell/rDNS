@@ -36,7 +36,7 @@ npm --prefix web run build
 cargo build --locked --bin rdns
 
 if [[ ! -f "$runtime_dir/admin.initialized" ]]; then
-  read -r -s -p 'Set local admin password (at least 12 characters): ' local_admin_password
+  read -r -s -p 'Set local admin password: ' local_admin_password
   printf '\n'
   printf '%s\n' "$local_admin_password" | target/debug/rdns init-admin "$runtime_dir/config.toml" admin
   unset local_admin_password

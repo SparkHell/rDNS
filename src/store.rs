@@ -84,9 +84,10 @@ impl Store {
             "invalid role"
         );
         anyhow::ensure!(
-            username.len() >= 3 && password.len() >= 12,
-            "username >=3 and password >=12 characters required"
+            username.len() >= 3,
+            "username must have at least 3 characters"
         );
+        anyhow::ensure!(!password.is_empty(), "password cannot be empty");
         let salt = SaltString::generate(&mut OsRng);
         let hash = Argon2::default()
             .hash_password(password.as_bytes(), &salt)
@@ -403,4 +404,27 @@ impl Store {
 
 fn hash_token(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn short_nonempty_password_can_be_used_to_create_and_log_in() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "rdns-short-password-{}-{}.sqlite3",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store = Store::open(&path).await?;
+        store.create_account("admin", "x", "admin").await?;
+        assert!(store.login("admin", "x").await?.is_some());
+        assert!(store.create_account("other", "", "viewer").await.is_err());
+        store.pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        Ok(())
+    }
 }
