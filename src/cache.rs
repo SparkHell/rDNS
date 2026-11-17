@@ -107,7 +107,7 @@ impl PersistentCache {
         let (disk_entries, disk_bytes) = self.store.cache_stats().await.unwrap_or((0, 0));
         serde_json::json!({"settings":self.settings(), "memory_bytes":memory.weighted_size(), "memory_entries":memory.entry_count(), "disk_entries":disk_entries, "disk_bytes":disk_bytes, "process_rss_bytes":process_rss_bytes(), "memory_hits":self.memory_hits.load(Ordering::Relaxed), "disk_hits":self.disk_hits.load(Ordering::Relaxed), "misses":self.misses.load(Ordering::Relaxed)})
     }
-    async fn get(&self, key: &str, request_id: u16) -> Option<DnsResponse> {
+    pub async fn get(&self, key: &str, request_id: u16) -> Option<DnsResponse> {
         let now = Utc::now().timestamp();
         let (entry, from_disk) = match self.memory.load().get(key) {
             Some(entry) => (entry, false),
@@ -149,7 +149,7 @@ impl PersistentCache {
         }
         Some(response)
     }
-    async fn insert(&self, key: &str, response: &DnsResponse) {
+    pub async fn insert(&self, key: &str, response: &DnsResponse) {
         let settings = self.settings();
         let now = Utc::now().timestamp();
         let Some((kind, ttl)) = cache_ttl(response, &settings, now) else {

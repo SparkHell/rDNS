@@ -34,7 +34,8 @@ impl Config {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut config: Self = toml::from_str(&raw).context("parsing configuration")?;
-        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        let absolute = std::env::current_dir()?.join(path);
+        let base = absolute.parent().unwrap_or_else(|| Path::new("."));
         if config.database.is_relative() {
             config.database = base.join(&config.database);
         }

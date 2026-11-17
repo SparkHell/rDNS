@@ -16,7 +16,9 @@ mkdir -p release
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
 cp "$binary" "$staging/rdns"
-cp config.example.toml README.md LICENSE "$staging/"
+cp config.example.toml README.md LICENSE THIRD-PARTY.md "$staging/"
+mkdir -p "$staging/resources"
+cp resources/gfwlist.txt resources/gfwlist-LICENSE.txt "$staging/resources/"
 cp packaging/rdns.service "$staging/"
 archive="release/rdns-${version}-${target}.tar.gz"
 tar -C "$staging" -czf "$archive" .

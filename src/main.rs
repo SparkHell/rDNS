@@ -1,12 +1,17 @@
+mod access;
 mod api;
 mod cache;
 mod config;
+mod features;
+mod geoip;
+mod gfwlist;
 mod resolver;
 mod runtime;
 mod service;
 mod store;
 mod tls;
 mod transport;
+mod upstream;
 
 use anyhow::{Context, Result};
 use std::{path::PathBuf, time::Duration};
@@ -81,13 +86,18 @@ async fn main() -> Result<()> {
 
     let maintenance_engine = engine.clone();
     let maintenance = async move {
+        let mut last_subscriptions = tokio::time::Instant::now();
         loop {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-            let _ = maintenance_engine
-                .store
-                .prune(maintenance_engine.config.query_log_days)
-                .await;
-            api::refresh_all(&maintenance_engine).await;
+            maintenance_engine.features.maintain().await;
+            if last_subscriptions.elapsed() >= Duration::from_secs(3600) {
+                let _ = maintenance_engine
+                    .store
+                    .prune(maintenance_engine.config.query_log_days)
+                    .await;
+                api::refresh_all(&maintenance_engine).await;
+                last_subscriptions = tokio::time::Instant::now();
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())

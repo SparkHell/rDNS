@@ -1,6 +1,27 @@
 use std::process::Command;
 
 #[test]
+#[ignore = "requires outbound public DoH access; optional RDNS_TEST_UPSTREAM_PROXY"]
+fn live_doh_dnssec_and_ech() {
+    let result = Command::new("python3")
+        .arg("tests/doh_live.py")
+        .env("RDNS_BIN", env!("CARGO_BIN_EXE_rdns"))
+        .status()
+        .expect("launch live DoH check");
+    assert!(result.success(), "live DoH check failed");
+}
+
+#[test]
+fn forwarding_access_geoip_and_gfwlist() {
+    let result = Command::new("python3")
+        .arg("tests/features_smoke.py")
+        .env("RDNS_BIN", env!("CARGO_BIN_EXE_rdns"))
+        .status()
+        .expect("launch feature smoke script");
+    assert!(result.success(), "feature smoke script failed");
+}
+
+#[test]
 fn local_runtime_protocols_and_certificate_reload() {
     run_smoke(false, false);
 }

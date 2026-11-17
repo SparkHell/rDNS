@@ -22,7 +22,8 @@ ipnet = { version = "2", features = ["serde"] }
 moka = { version = "0.12", features = ["sync"] }
 quinn = "0.11"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "socks"] }
 rust-embed = "8"
 rustls = "0.23"
 rustls-pemfile = "2"

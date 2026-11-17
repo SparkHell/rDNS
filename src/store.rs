@@ -26,6 +26,10 @@ pub struct QueryLogEntry<'a> {
     pub outcome: &'a str,
     pub protocol: &'a str,
     pub duration_ms: f64,
+    pub country: Option<&'a str>,
+    pub province: Option<&'a str>,
+    pub city: Option<&'a str>,
+    pub upstream: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -87,6 +91,7 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS certificate_paths (id INTEGER PRIMARY KEY CHECK(id=1), certificate TEXT NOT NULL, private_key TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS listener_settings (id INTEGER PRIMARY KEY CHECK(id=1), settings TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS cache_settings (id INTEGER PRIMARY KEY CHECK(id=1), settings TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS runtime_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS cache_entries (cache_key TEXT PRIMARY KEY, response BLOB NOT NULL, inserted_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, kind TEXT NOT NULL, byte_size INTEGER NOT NULL)",
             "CREATE INDEX IF NOT EXISTS idx_cache_entries_expiry ON cache_entries(expires_at)",
             "CREATE INDEX IF NOT EXISTS idx_query_log_at ON query_log(at DESC)",
@@ -104,7 +109,50 @@ impl Store {
                 .execute(&pool)
                 .await?;
         }
+        for name in ["country", "province", "city", "upstream"] {
+            if !columns
+                .iter()
+                .any(|column| column.get::<String, _>("name") == name)
+            {
+                sqlx::query(&format!("ALTER TABLE query_log ADD COLUMN {name} TEXT"))
+                    .execute(&pool)
+                    .await?;
+            }
+        }
         Ok(Self { pool })
+    }
+
+    pub async fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT value FROM runtime_settings WHERE key=?")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
+            .transpose()
+    }
+
+    pub async fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        sqlx::query("INSERT INTO runtime_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            .bind(key).bind(serde_json::to_string(value)?).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn set_features(&self, settings: &crate::features::FeatureSettings) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO runtime_settings(key,value) VALUES('features',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            .bind(serde_json::to_string(settings)?).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM client_networks")
+            .execute(&mut *tx)
+            .await?;
+        for cidr in &settings.access.cidrs {
+            sqlx::query("INSERT OR IGNORE INTO client_networks(cidr) VALUES(?)")
+                .bind(cidr)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn certificate_paths(&self) -> Result<Option<(PathBuf, PathBuf)>> {
@@ -465,7 +513,7 @@ impl Store {
 
     pub async fn log_query(&self, entry: QueryLogEntry<'_>) -> Result<()> {
         sqlx::query(
-            "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol,duration_ms) VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol,duration_ms,country,province,city,upstream) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(entry.client)
@@ -474,15 +522,16 @@ impl Store {
         .bind(entry.outcome)
         .bind(entry.protocol)
         .bind(entry.duration_ms)
+        .bind(entry.country).bind(entry.province).bind(entry.city).bind(entry.upstream)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
     pub async fn logs(&self) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT at,client,domain,qtype,outcome,protocol,duration_ms FROM query_log ORDER BY id DESC LIMIT 200")
+        let rows = sqlx::query("SELECT at,client,domain,qtype,outcome,protocol,duration_ms,country,province,city,upstream FROM query_log ORDER BY id DESC LIMIT 200")
             .fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|r| serde_json::json!({"at":r.get::<String,_>("at"), "client":r.get::<String,_>("client"), "domain":r.get::<String,_>("domain"), "qtype":r.get::<String,_>("qtype"), "outcome":r.get::<String,_>("outcome"), "protocol":r.get::<String,_>("protocol"), "duration_ms":r.get::<Option<f64>,_>("duration_ms")})).collect())
+        Ok(rows.into_iter().map(|r| serde_json::json!({"at":r.get::<String,_>("at"), "client":r.get::<String,_>("client"), "domain":r.get::<String,_>("domain"), "qtype":r.get::<String,_>("qtype"), "outcome":r.get::<String,_>("outcome"), "protocol":r.get::<String,_>("protocol"), "duration_ms":r.get::<Option<f64>,_>("duration_ms"), "country":r.get::<Option<String>,_>("country"),"province":r.get::<Option<String>,_>("province"),"city":r.get::<Option<String>,_>("city"),"upstream":r.get::<Option<String>,_>("upstream")})).collect())
     }
 
     pub async fn stats(&self) -> Result<serde_json::Value> {
@@ -493,7 +542,9 @@ impl Store {
             sqlx::query_scalar("SELECT COUNT(*) FROM query_log WHERE outcome='blocked'")
                 .fetch_one(&self.pool)
                 .await?;
-        Ok(serde_json::json!({"total":total,"blocked":blocked}))
+        let rows = sqlx::query("SELECT COALESCE(country,'未知') AS country,COALESCE(province,'未知') AS province,COUNT(*) AS count FROM query_log GROUP BY country,province ORDER BY count DESC LIMIT 50").fetch_all(&self.pool).await?;
+        let regions: Vec<_> = rows.into_iter().map(|r| serde_json::json!({"country":r.get::<String,_>("country"),"province":r.get::<String,_>("province"),"count":r.get::<i64,_>("count")})).collect();
+        Ok(serde_json::json!({"total":total,"blocked":blocked,"regions":regions}))
     }
 
     pub async fn prune(&self, days: i64) -> Result<()> {
@@ -545,6 +596,10 @@ mod tests {
                 outcome: "local",
                 protocol: "udp",
                 duration_ms: 0.125,
+                country: None,
+                province: None,
+                city: None,
+                upstream: None,
             })
             .await?;
         assert_eq!(store.logs().await?[0]["duration_ms"], 0.125);

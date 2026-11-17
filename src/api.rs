@@ -1,5 +1,6 @@
 use crate::{
     cache::CacheSettings,
+    features::FeatureSettings,
     resolver::{Engine, parse_filter_list},
     runtime::{ListenerManager, ListenerSettings},
     store::{Account, RuleInput, Store},
@@ -48,6 +49,10 @@ pub fn admin_router(state: ApiState) -> Router {
             get(listener_status).put(update_listeners),
         )
         .route("/api/v1/cache", get(cache_status).put(update_cache))
+        .route("/api/v1/features", get(feature_status).put(update_features))
+        .route("/api/v1/gfwlist/refresh", post(refresh_gfwlist))
+        .route("/api/v1/geoip/refresh", post(refresh_geoip))
+        .route("/api/v1/geoip/lookup", post(lookup_geoip))
         .route("/api/v1/ws", get(websocket))
         .route("/api/v1/rules", get(rules).post(add_rule))
         .route("/api/v1/rules/{id}", axum::routing::delete(delete_rule))
@@ -203,6 +208,115 @@ async fn cache_status(State(state): State<ApiState>, headers: HeaderMap) -> ApiR
     Ok(Json(state.engine.cache_stats().await))
 }
 
+async fn feature_status(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "viewer").await?;
+    Ok(Json(
+        state
+            .engine
+            .features
+            .snapshot(account.role == "admin")
+            .await,
+    ))
+}
+
+async fn update_features(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(settings): Json<FeatureSettings>,
+) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "admin").await?;
+    state
+        .engine
+        .features
+        .apply(settings)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    state
+        .engine
+        .store
+        .audit(
+            &account.username,
+            "features.update",
+            "applied without restart",
+        )
+        .await
+        .map_err(internal)?;
+    // Broadcast only a change notification; each session obtains its authorized view.
+    state.listeners.publish(json!({"type":"features.changed"}));
+    Ok(Json(state.engine.features.snapshot(true).await))
+}
+
+async fn refresh_gfwlist(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "admin").await?;
+    state.engine.features.refresh_list().await.map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "GFWList 更新失败，已保留原有名单，请检查来源地址和上游组代理".into(),
+        )
+    })?;
+    state
+        .engine
+        .store
+        .audit(&account.username, "gfwlist.refresh", "updated")
+        .await
+        .map_err(internal)?;
+    state.listeners.publish(json!({"type":"features.changed"}));
+    Ok(Json(state.engine.features.snapshot(true).await))
+}
+
+#[derive(Deserialize)]
+struct GeoVersion {
+    ip_version: u8,
+}
+async fn refresh_geoip(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<GeoVersion>,
+) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "admin").await?;
+    state
+        .engine
+        .features
+        .refresh_geo(input.ip_version)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "GeoIP 更新失败，已保留原有数据库，请检查地址、代理与数据库格式".into(),
+            )
+        })?;
+    state
+        .engine
+        .store
+        .audit(
+            &account.username,
+            "geoip.refresh",
+            &format!("IPv{}", input.ip_version),
+        )
+        .await
+        .map_err(internal)?;
+    state.listeners.publish(json!({"type":"features.changed"}));
+    Ok(Json(state.engine.features.snapshot(true).await))
+}
+
+#[derive(Deserialize)]
+struct GeoLookup {
+    ip: std::net::IpAddr,
+}
+async fn lookup_geoip(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<GeoLookup>,
+) -> ApiResult {
+    require(&headers, &state.engine.store, "viewer").await?;
+    let current = state.engine.features.current.load_full();
+    let location = current.geo.lookup(crate::access::canonical_ip(input.ip));
+    let decision = current.access.decide(input.ip, &location);
+    Ok(Json(
+        json!({"ip":input.ip,"location":location,"allowed":decision.is_ok(),"reason":decision.err()}),
+    ))
+}
+
 async fn update_cache(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -302,6 +416,21 @@ async fn websocket_session(state: ApiState, mut socket: WebSocket) {
     {
         return;
     }
+    if socket
+        .send(WsMessage::Text(
+            state
+                .engine
+                .features
+                .snapshot(account.role == "admin")
+                .await
+                .to_string()
+                .into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     loop {
         tokio::select! {
@@ -310,13 +439,16 @@ async fn websocket_session(state: ApiState, mut socket: WebSocket) {
                 if socket.send(WsMessage::Text(status.to_string().into())).await.is_err() { return; }
             }
             event = events.recv() => {
-                if let Ok(event) = event
-                    && socket.send(WsMessage::Text(event.into())).await.is_err() { return; }
+                if let Ok(event) = event {
+                    let value: Value = serde_json::from_str(&event).unwrap_or_default();
+                    let event = if value["type"] == "features.changed" { state.engine.features.snapshot(account.role == "admin").await.to_string() } else { event };
+                    if socket.send(WsMessage::Text(event.into())).await.is_err() { return; }
+                }
             }
             message = socket.next() => {
                 let Some(Ok(WsMessage::Text(text))) = message else { return; };
                 let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
-                if value["type"] != "listeners.update" && value["type"] != "cache.update" { continue; }
+                if !["listeners.update", "cache.update", "features.update", "gfwlist.refresh", "geoip.refresh"].iter().any(|kind| value["type"] == *kind) { continue; }
                 let request_id = value["request_id"].clone();
                 let result = if account.role == "admin" {
                     if value["type"] == "listeners.update" {
@@ -324,18 +456,30 @@ async fn websocket_session(state: ApiState, mut socket: WebSocket) {
                             Ok(settings) => state.listeners.apply(state.clone(), settings, true).await.map_err(|e| e.to_string()),
                             Err(error) => Err(error.to_string()),
                         }
-                    } else {
+                    } else if value["type"] == "cache.update" {
                         match serde_json::from_value::<CacheSettings>(value["settings"].clone()) {
                             Ok(settings) => state.engine.update_cache_settings(settings).await.map_err(|e| e.to_string()),
                             Err(error) => Err(error.to_string()),
                         }
+                    } else if value["type"] == "features.update" {
+                        match serde_json::from_value::<FeatureSettings>(value["settings"].clone()) {
+                            Ok(settings) => state.engine.features.apply(settings).await.map_err(|e| e.to_string()),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    } else if value["type"] == "gfwlist.refresh" {
+                        state.engine.features.refresh_list().await.map(|_| ()).map_err(|_| "GFWList 更新失败，保留原有名单".to_string())
+                    } else {
+                        state.engine.features.refresh_geo(value["settings"]["ip_version"].as_u64().unwrap_or(0) as u8).await.map_err(|_| "GeoIP 更新失败，保留原有数据库".to_string())
                     }
                 } else { Err("administrator role required".to_string()) };
                 if result.is_ok() {
-                    let action = if value["type"] == "listeners.update" { "listeners.update" } else { "cache.update" };
+                    let action = value["type"].as_str().unwrap_or("settings.update");
                     let _ = state.engine.store.audit(&account.username, action, "applied without restart").await;
                     if value["type"] == "cache.update" {
                         state.listeners.publish(json!({"type":"cache","stats":state.engine.cache_stats().await}));
+                    }
+                    if ["features.update", "gfwlist.refresh", "geoip.refresh"].iter().any(|kind| value["type"] == *kind) {
+                        state.listeners.publish(json!({"type":"features.changed"}));
                     }
                 }
                 let reply = json!({"type":"result","request_id":request_id,"ok":result.is_ok(),"error":result.err()});
@@ -713,12 +857,16 @@ struct DohQuery {
 async fn doh_get(
     State(state): State<ApiState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Query(input): Query<DohQuery>,
 ) -> Response {
     let Ok(wire) = URL_SAFE_NO_PAD.decode(input.dns.as_bytes()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    doh_answer(state, peer, &wire).await
+    let forwarded = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok());
+    doh_answer(state, peer, forwarded, &wire).await
 }
 async fn doh_post(
     State(state): State<ApiState>,
@@ -733,13 +881,32 @@ async fn doh_post(
     {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
-    doh_answer(state, peer, &body).await
+    let forwarded = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok());
+    doh_answer(state, peer, forwarded, &body).await
 }
-async fn doh_answer(state: ApiState, peer: SocketAddr, wire: &[u8]) -> Response {
+async fn doh_answer(
+    state: ApiState,
+    peer: SocketAddr,
+    forwarded: Option<&str>,
+    wire: &[u8],
+) -> Response {
     if wire.len() > 65535 {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    match state.engine.answer(wire, peer, "doh").await {
+    let ip = state
+        .engine
+        .features
+        .current
+        .load()
+        .access
+        .client_ip(peer.ip(), forwarded);
+    match state
+        .engine
+        .answer(wire, SocketAddr::new(ip, peer.port()), "doh")
+        .await
+    {
         Ok(answer) => (
             [
                 (header::CONTENT_TYPE, "application/dns-message"),

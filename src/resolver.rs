@@ -1,7 +1,9 @@
 use crate::{
     cache::{CacheSettings, CachedProvider, PersistentCache},
     config::Config,
+    features::Features,
     store::{Rule, RuleInput, Store},
+    upstream::{DohGroup, ResolveMode},
 };
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -40,7 +42,7 @@ pub struct Engine {
     pub config: Config,
     pub store: Store,
     policy: ArcSwap<Policy>,
-    clients: ArcSwap<Vec<ipnet::IpNet>>,
+    pub features: Arc<Features>,
     recursor: ArcSwap<Recursor<CachedProvider>>,
     cache: Arc<PersistentCache>,
     roots: Vec<IpAddr>,
@@ -88,17 +90,17 @@ impl Engine {
                 )
                 .await?;
         }
+        let features = Features::new(config.clone(), store.clone(), cache.clone()).await?;
         let engine = Arc::new(Self {
             config,
             store,
             policy: ArcSwap::from_pointee(Policy::default()),
-            clients: ArcSwap::from_pointee(Vec::new()),
+            features,
             recursor: ArcSwap::from_pointee(recursor),
             cache,
             roots,
         });
         engine.reload_policy().await?;
-        engine.reload_clients().await?;
         Ok(engine)
     }
 
@@ -115,23 +117,10 @@ impl Engine {
     }
 
     pub async fn reload_clients(&self) -> Result<()> {
-        let networks = self
-            .store
-            .client_networks()
-            .await?
-            .into_iter()
-            .map(|cidr| cidr.parse())
-            .collect::<std::result::Result<Vec<ipnet::IpNet>, _>>()?;
-        anyhow::ensure!(!networks.is_empty(), "client allowlist cannot be empty");
-        self.clients.store(Arc::new(networks));
-        Ok(())
-    }
-
-    pub fn client_allowed(&self, peer: SocketAddr) -> bool {
-        self.clients
-            .load()
-            .iter()
-            .any(|network| network.contains(&peer.ip()))
+        let mut settings = self.features.current.load().settings.clone();
+        settings.access.mode = crate::access::AccessMode::Whitelist;
+        settings.access.cidrs = self.store.client_networks().await?;
+        self.features.apply(settings).await
     }
 
     pub async fn reload_policy(&self) -> Result<()> {
@@ -217,10 +206,6 @@ impl Engine {
         let started = Instant::now();
         let request = Message::from_vec(wire).context("invalid DNS message")?;
         let mut response = response(&request, ResponseCode::NoError);
-        if !self.client_allowed(peer) {
-            response.metadata.response_code = ResponseCode::Refused;
-            return Ok(response.to_vec()?);
-        }
         if request.metadata.message_type != MessageType::Query
             || request.metadata.op_code != OpCode::Query
             || request.queries.len() != 1
@@ -236,8 +221,14 @@ impl Engine {
         let domain = normalize_domain(&query.name().to_ascii())?;
         let kind = query.query_type().to_string();
         let policy = self.policy.load_full();
-        let mut outcome = "recursive";
-        if policy.local.iter().any(|r| r.domain == domain) {
+        let runtime = self.features.current.load_full();
+        let location = runtime.geo.lookup(crate::access::canonical_ip(peer.ip()));
+        let mut selected_upstream = None;
+        let outcome;
+        if let Err(reason) = runtime.access.decide(peer.ip(), &location) {
+            response.metadata.response_code = ResponseCode::Refused;
+            outcome = reason;
+        } else if policy.local.iter().any(|r| r.domain == domain) {
             for record in policy.local.iter().filter(|r| {
                 r.domain == domain
                     && (r.record_type.as_deref() == Some(kind.as_str())
@@ -277,60 +268,113 @@ impl Engine {
                 }
             }
         } else {
-            let do_bit = request
-                .edns
-                .as_ref()
-                .is_some_and(|edns| edns.flags().dnssec_ok);
-            let recursor = self.recursor.load_full();
+            let settings = &runtime.settings;
+            let gfw = settings.gfwlist.enabled && self.features.list.load().matches(&domain);
+            let group_name = if gfw {
+                &settings.gfwlist.group
+            } else {
+                &settings.resolution.group
+            };
+            let group = runtime.groups.get(group_name).cloned();
+            let mode = if gfw {
+                ResolveMode::Doh
+            } else {
+                settings.resolution.mode.clone()
+            };
+            let lookup = async {
+                match mode {
+                    ResolveMode::Recursive => self.recursive_lookup(&request).await,
+                    ResolveMode::Doh => {
+                        let primary = group
+                            .context("missing upstream group")
+                            .map_err(|_| LookupFailure::Unavailable)?;
+                        let reserve_fallback = gfw && group_name != &settings.resolution.group;
+                        let budget = if reserve_fallback {
+                            primary
+                                .timeout()
+                                .min(Duration::from_millis(settings.resolution.timeout_ms / 2))
+                        } else {
+                            primary.timeout()
+                        };
+                        let result = tokio::time::timeout(
+                            budget,
+                            doh_lookup(
+                                primary,
+                                request.clone(),
+                                settings.resolution.validate_dnssec,
+                            ),
+                        )
+                        .await
+                        .unwrap_or(Err(LookupFailure::Unavailable));
+                        if gfw
+                            && matches!(result, Err(LookupFailure::Unavailable))
+                            && group_name != &settings.resolution.group
+                        {
+                            let fallback = runtime
+                                .groups
+                                .get(&settings.resolution.group)
+                                .cloned()
+                                .ok_or(LookupFailure::Unavailable)?;
+                            let mut answer = doh_lookup(
+                                fallback,
+                                request.clone(),
+                                settings.resolution.validate_dnssec,
+                            )
+                            .await?;
+                            answer.outcome = "gfw_fallback_doh";
+                            Ok(answer)
+                        } else {
+                            result
+                        }
+                    }
+                    ResolveMode::Parallel => {
+                        let doh = group
+                            .context("missing upstream group")
+                            .map_err(|_| LookupFailure::Unavailable)?;
+                        prefer_recursive(
+                            self.recursive_lookup(&request),
+                            doh_lookup(doh, request.clone(), settings.resolution.validate_dnssec),
+                            Duration::from_millis(settings.resolution.priority_ms),
+                        )
+                        .await
+                    }
+                }
+            };
             match tokio::time::timeout(
-                Duration::from_secs(15),
-                recursor.resolve(query.clone(), Instant::now(), do_bit),
+                Duration::from_millis(settings.resolution.timeout_ms),
+                lookup,
             )
             .await
             {
-                Ok(Ok(mut resolved)) => {
-                    tracing::debug!(%domain, ?resolved.metadata, proofs = ?resolved.all_sections().map(|r| (r.record_type(), r.proof)).collect::<Vec<_>>(), "recursor result");
-                    if let Some(secure) = validated_answer_is_secure(&resolved) {
-                        resolved.metadata.id = request.metadata.id;
-                        resolved.metadata.recursion_desired = request.metadata.recursion_desired;
-                        resolved.metadata.recursion_available = true;
-                        resolved.metadata.authentic_data = secure;
-                        resolved.queries = vec![query.clone()];
-                        resolved = resolved.maybe_strip_dnssec_records(do_bit);
-                        if request.edns.is_some() {
-                            let mut edns = Edns::new();
-                            edns.set_max_payload(request.max_payload())
-                                .set_dnssec_ok(do_bit);
-                            resolved.edns = Some(edns);
-                        } else {
-                            resolved.edns = None;
-                        }
-                        response = resolved;
-                    } else {
-                        response.metadata.response_code = ResponseCode::ServFail;
-                        outcome = "dnssec_bogus";
+                Ok(Ok(mut answer)) => {
+                    selected_upstream = answer.upstream.clone();
+                    if gfw && answer.outcome == "doh" {
+                        answer.outcome = "gfw_doh";
                     }
+                    let do_bit = request
+                        .edns
+                        .as_ref()
+                        .is_some_and(|edns| edns.flags().dnssec_ok);
+                    answer.message.metadata.id = request.metadata.id;
+                    answer.message.metadata.recursion_desired = request.metadata.recursion_desired;
+                    answer.message.metadata.recursion_available = true;
+                    answer.message.queries = request.queries.clone();
+                    response = answer.message.maybe_strip_dnssec_records(do_bit);
+                    response.edns = request.edns.as_ref().map(|_| {
+                        let mut edns = Edns::new();
+                        edns.set_max_payload(request.max_payload())
+                            .set_dnssec_ok(do_bit);
+                        edns
+                    });
+                    outcome = answer.outcome;
                 }
                 Ok(Err(error)) => {
-                    if error.is_nx_domain() {
-                        response.metadata.response_code = ResponseCode::NXDomain;
-                        outcome = "nxdomain";
-                    } else if error.is_no_records_found() {
-                        outcome = "nodata";
+                    response.metadata.response_code = ResponseCode::ServFail;
+                    outcome = if error == LookupFailure::Bogus {
+                        "dnssec_bogus"
                     } else {
-                        tracing::warn!(%error, %domain, "recursive lookup failed");
-                        response.metadata.response_code = ResponseCode::ServFail;
-                        outcome = "error";
-                    }
-                    if matches!(outcome, "nxdomain" | "nodata")
-                        && let Some(soa) = error.into_soa()
-                    {
-                        response.add_authority(Record::from_rdata(
-                            soa.name,
-                            soa.ttl,
-                            RData::SOA(soa.data),
-                        ));
-                    }
+                        "error"
+                    };
                 }
                 Err(_) => {
                     response.metadata.response_code = ResponseCode::ServFail;
@@ -349,12 +393,162 @@ impl Engine {
                 outcome,
                 protocol,
                 duration_ms,
+                country: location.country.as_deref(),
+                province: location.province.as_deref(),
+                city: location.city.as_deref(),
+                upstream: selected_upstream.as_deref(),
             })
             .await
         {
             tracing::warn!(%error, "query log write failed");
         }
         Ok(wire)
+    }
+    async fn recursive_lookup(&self, request: &Message) -> Result<Resolved, LookupFailure> {
+        let query = request.queries[0].clone();
+        let do_bit = request.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok);
+        let recursor = self.recursor.load_full();
+        match recursor
+            .resolve(query.clone(), Instant::now(), do_bit)
+            .await
+        {
+            Ok(mut message) => {
+                let secure = validated_answer_is_secure(&message).ok_or(LookupFailure::Bogus)?;
+                if !matches!(
+                    message.metadata.response_code,
+                    ResponseCode::NoError | ResponseCode::NXDomain
+                ) {
+                    return Err(LookupFailure::Unavailable);
+                }
+                message.metadata.authentic_data = secure;
+                Ok(Resolved {
+                    message,
+                    outcome: "recursive",
+                    upstream: None,
+                })
+            }
+            Err(error) if error.is_nx_domain() || error.is_no_records_found() => {
+                let nx = error.is_nx_domain();
+                let mut message = response(
+                    request,
+                    if nx {
+                        ResponseCode::NXDomain
+                    } else {
+                        ResponseCode::NoError
+                    },
+                );
+                if let Some(soa) = error.into_soa() {
+                    message.add_authority(Record::from_rdata(
+                        soa.name,
+                        soa.ttl,
+                        RData::SOA(soa.data),
+                    ));
+                }
+                Ok(Resolved {
+                    message,
+                    outcome: if nx { "nxdomain" } else { "nodata" },
+                    upstream: None,
+                })
+            }
+            Err(error) => {
+                tracing::debug!(%error, "recursive lookup failed");
+                if matches!(&error, hickory_resolver::recursor::RecursorError::Net(error) if crate::upstream::dnssec_error(error))
+                {
+                    Err(LookupFailure::Bogus)
+                } else {
+                    Err(LookupFailure::Unavailable)
+                }
+            }
+        }
+    }
+}
+
+struct Resolved {
+    message: Message,
+    outcome: &'static str,
+    upstream: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LookupFailure {
+    Unavailable,
+    Bogus,
+}
+
+async fn doh_lookup(
+    group: Arc<DohGroup>,
+    request: Message,
+    validate: bool,
+) -> Result<Resolved, LookupFailure> {
+    match group.resolve(request, validate).await {
+        Ok(mut message) => {
+            if validate {
+                let secure = validated_answer_is_secure(&message).ok_or(LookupFailure::Bogus)?;
+                // Negative answers have no answer RRsets; the validator sets AD from the NSEC proof.
+                message.metadata.authentic_data =
+                    secure || (message.answers.is_empty() && message.metadata.authentic_data);
+            } else {
+                message.metadata.authentic_data = false;
+            }
+            Ok(Resolved {
+                message,
+                outcome: "doh",
+                upstream: Some(group.name.clone()),
+            })
+        }
+        Err(error) => {
+            tracing::debug!(group = %group.name, %error, "DoH lookup failed");
+            if error
+                .downcast_ref::<hickory_resolver::net::NetError>()
+                .is_some_and(crate::upstream::dnssec_error)
+            {
+                Err(LookupFailure::Bogus)
+            } else {
+                Err(LookupFailure::Unavailable)
+            }
+        }
+    }
+}
+
+async fn prefer_recursive<R, D>(
+    recursive: R,
+    doh: D,
+    priority: Duration,
+) -> Result<Resolved, LookupFailure>
+where
+    R: std::future::Future<Output = Result<Resolved, LookupFailure>>,
+    D: std::future::Future<Output = Result<Resolved, LookupFailure>>,
+{
+    tokio::pin!(recursive, doh);
+    let deadline = tokio::time::sleep(priority);
+    tokio::pin!(deadline);
+    let mut rec_pending = true;
+    let mut doh_pending = true;
+    let mut elapsed = false;
+    let mut ready = None;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut recursive, if rec_pending => {
+                rec_pending = false;
+                match result { Ok(answer) => return Ok(answer), Err(LookupFailure::Bogus) => return Err(LookupFailure::Bogus), Err(_) => {} }
+                if let Some(answer) = ready.take() { return Ok(answer); }
+                if !doh_pending { return Err(LookupFailure::Unavailable); }
+            }
+            result = &mut doh, if doh_pending => {
+                doh_pending = false;
+                match result {
+                    Ok(answer) if !rec_pending || elapsed => return Ok(answer),
+                    Ok(answer) => ready = Some(answer),
+                    Err(LookupFailure::Bogus) => return Err(LookupFailure::Bogus),
+                    Err(_) if !rec_pending => return Err(LookupFailure::Unavailable),
+                    Err(_) => {}
+                }
+            }
+            _ = &mut deadline, if !elapsed => {
+                elapsed = true;
+                if let Some(answer) = ready.take() { return Ok(answer); }
+            }
+        }
     }
 }
 
@@ -563,6 +757,62 @@ pub fn parse_filter_list(text: &str) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use hickory_proto::dnssec::Proof;
+
+    fn ready(outcome: &'static str) -> Result<Resolved, LookupFailure> {
+        Ok(Resolved {
+            message: Message::query(),
+            outcome,
+            upstream: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn recursive_priority_window_and_failure_semantics() {
+        let result = prefer_recursive(
+            async { ready("recursive") },
+            async { ready("doh") },
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, "recursive");
+        let started = Instant::now();
+        let result = prefer_recursive(
+            std::future::pending(),
+            async { ready("doh") },
+            Duration::from_millis(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, "doh");
+        assert!(started.elapsed() >= Duration::from_millis(25));
+        let result = prefer_recursive(
+            async { Err(LookupFailure::Unavailable) },
+            async { ready("doh") },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, "doh");
+        let result = prefer_recursive(
+            async { Err(LookupFailure::Bogus) },
+            async { ready("doh") },
+            Duration::from_millis(0),
+        )
+        .await;
+        assert!(matches!(result, Err(LookupFailure::Bogus)));
+        let result = prefer_recursive(
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ready("recursive")
+            },
+            async { Err(LookupFailure::Unavailable) },
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, "recursive");
+    }
     #[test]
     fn filtering_parses_hosts_and_adblock_domains() {
         let domains = parse_filter_list(

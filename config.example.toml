@@ -7,10 +7,14 @@ database = "/var/lib/rdns/rdns.sqlite3"
 # doq = "0.0.0.0:853"
 admin = "127.0.0.1:3000"
 allowed_clients = ["127.0.0.0/8", "::1/128"]
+# Initial whitelist only. The console can later select open/whitelist/blacklist
+# modes and geographic restrictions; saved SQLite settings take precedence.
+# DoH upstream pools, parallel mode, proxies, GeoIP and GFWList routing are
+# configured live in the console (or /api/v1/features), not in this TOML file.
 # Set paths in the management panel before enabling encrypted listeners.
 # certificate = "/etc/rdns/server.crt"
 # private_key = "/etc/rdns/server.key"
-# Optional CA bundle for HTTPS filter lists hosted by the organization.
+# Optional extra trusted PEM certificate for internal subscription/DoH/data URLs.
 # subscription_ca = "/etc/rdns/subscription-ca.crt"
 # Optional override for the bundled InterNIC root hints.
 # root_hints = "/etc/rdns/named.root"
