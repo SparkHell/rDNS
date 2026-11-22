@@ -2,6 +2,7 @@
 """Exercise access/GeoIP, DoH pools, GFWList fallback and actual proxy tunnels."""
 import base64
 from collections import Counter
+from contextlib import closing
 import concurrent.futures
 import http.server
 import json
@@ -44,6 +45,9 @@ def xdb(version):
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.counts['GET'+self.path] += 1
+        if self.path == getattr(self.server, 'paused_path', None):
+            self.server.download_started.set()
+            assert self.server.resume_download.wait(8)
         data = self.server.resources.get(self.path, b'<html>invalid</html>')
         self.send_response(200)
         self.send_header('Content-Length', str(len(data)))
@@ -68,6 +72,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         question = packet[12:p+5]
         if qtype == 65:
             value = b'\0\1\0' + struct.pack('!HH', 5, 5) + b'\0\3ech'
+        elif qtype == 2:
+            value = b'\x02ns\x04test\0'
         else:
             value = socket.inet_aton('198.51.100.21' if self.path == '/one' else '198.51.100.22')
         answer = packet[:2] + struct.pack('!5H', 0x81a0, 1, 1, 0, 0) + question
@@ -78,7 +84,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(answer)
-        except (BrokenPipeError, ssl.SSLError):
+        except (ConnectionError, ssl.SSLError):
             pass
 
     def log_message(self, *_):
@@ -148,8 +154,24 @@ def run():
             proxy.kind, proxy.requests, proxy.upstream_port = kind, [], server.server_port
             threading.Thread(target=proxy.serve_forever, daemon=True).start()
             proxies.append(proxy)
+        # Keep recursion offline so a public NXDOMAIN cannot win the parallel lookup.
+        (directory / 'named.root').write_text(
+            'A.ROOT-SERVERS.NET. 3600 A 127.0.0.201\n'
+            'B.ROOT-SERVERS.NET. 3600 A 127.0.0.202\n'
+        )
         config = directory / 'config.toml'
-        config.write_text(f'database="{directory}/db.sqlite3"\nadmin="127.0.0.1:{admin_port}"\ndns_udp="127.0.0.1:{dns_port}"\ndoh="127.0.0.1:{doh_port}"\ncertificate="{cert}"\nprivate_key="{key}"\nallowed_clients=["127.0.0.0/8"]\nsubscription_ca="{cert}"\n')
+        config.write_text(
+            f'database="db.sqlite3"\nadmin="127.0.0.1:{admin_port}"\n'
+            f'dns_udp="127.0.0.1:{dns_port}"\ndoh="127.0.0.1:{doh_port}"\n'
+            f'certificate="{cert.name}"\nprivate_key="{key.name}"\nsubscription_ca="{cert.name}"\n'
+            'allowed_clients=["127.0.0.0/8"]\nroot_hints="named.root"\n'
+        )
+        # Seed the previous rules schema, including nullable duplicate keys.
+        with closing(sqlite3.connect(directory / 'db.sqlite3')) as db, db:
+            db.execute('CREATE TABLE rules (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, domain TEXT NOT NULL, record_type TEXT, value TEXT, ttl INTEGER, UNIQUE(kind,domain,record_type,value))')
+            for kind, value in [('allow', None), ('block', None), ('forward', '127.0.0.1:53')]:
+                db.executemany('INSERT INTO rules(kind,domain,value) VALUES(?,?,?)', [(kind, 'legacy.test', value)] * 2)
+            db.execute("INSERT INTO rules(kind,domain,value) VALUES('forward','legacy.test','127.0.0.2:53')")
         subprocess.run([str(BIN), 'init-admin', str(config), 'admin'], input=b'x', check=True, stdout=subprocess.DEVNULL)
         output = (directory / 'server.log').open('w+')
         process = subprocess.Popen([str(BIN), str(config)], stdout=output, stderr=output)
@@ -163,6 +185,10 @@ def run():
                     time.sleep(.05)
             else:
                 raise AssertionError('service did not start')
+            migrated = api(base, '/rules', token=token)
+            assert sorted(r['id'] for r in migrated) == [1, 3, 5, 7], migrated
+            for rule in migrated:
+                expect_http_error(409, lambda: api(base, '/rules', rule, token))
             def status(): return api(base, '/features', token=token)
             settings = status()['settings']
             original = json.loads(json.dumps(settings))
@@ -186,19 +212,77 @@ def run():
                 answer = udp(query(f'rr{i}.test'), dns_port)
                 assert rcode(answer) == 0 and not (answer[3] & 0x20), 'unvalidated upstream AD must be cleared'
             assert server.counts['/one'] == 2 and server.counts['/two'] == 2, server.counts
+            groups_before = sorted(status()['groups'], key=lambda g: g['name'])
+            settings['access']['cidrs'] = ['127.0.0.1/32']
+            save()
+            assert sorted(status()['groups'], key=lambda g: g['name']) == groups_before
+            root = query('.', 2)
+            for answer in [udp(root, dns_port), doh(root)]:
+                assert rcode(answer) == 0 and answer[12:17] == root[12:] and b'\x02ns\x04test\0' in answer
             before = sum(server.counts.values())
             assert rcode(udp(query('rr0.test'), dns_port)) == 0
             assert sum(server.counts.values()) == before, 'DoH answer cache missed'
+            if os.environ.get('RDNS_LATENCY_BASELINE') == '1':
+                api(base, '/rules', {'kind':'local', 'domain':'local.test', 'record_type':'A', 'value':'192.0.2.1'}, token)
+                for name in ['local.test', 'rr0.test']:
+                    packet = query(name)
+                    samples = []
+                    for _ in range(500):
+                        start = time.perf_counter_ns()
+                        assert rcode(udp(packet, dns_port)) == 0
+                        samples.append((time.perf_counter_ns() - start) / 1e6)
+                    samples.sort()
+                    print(f'{name} UDP milliseconds (500 sequential): P95={samples[474]:.3f} P99={samples[494]:.3f}')
+                return
             https = udp(query('ech.test', 65), dns_port)
             assert rcode(https) == 0 and b'ech' in https, 'HTTPS/ECH record lost'
 
-            api(base, '/gfwlist/refresh', {}, token)
+            # An obsolete download cannot publish after its source changes, and
+            # a paused network read must not block unrelated settings writes.
+            for path, field, key, endpoint, payload in [
+                ('/list', 'gfwlist', 'url', '/gfwlist/refresh', {}),
+                ('/v4', 'geo', 'ipv4_url', '/geoip/refresh', {'ip_version': 4}),
+            ]:
+                server.paused_path = path
+                server.download_started, server.resume_download = threading.Event(), threading.Event()
+                before = status()
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    old = executor.submit(expect_http_error, 502, lambda: api(base, endpoint, payload, token))
+                    try:
+                        assert server.download_started.wait(3)
+                        settings[field][key] = base_upstream + '/invalid'
+                        save()
+                        settings[field][key] = base_upstream + path
+                        save()
+                    finally:
+                        server.resume_download.set()
+                    old.result()
+                server.paused_path = None
+                after = status()
+                assert after['geo_meta'] == before['geo_meta'] and after['gfwlist'] == before['gfwlist']
+                assert after['geo']['ipv4']['available'] == before['geo']['ipv4']['available']
+            server.paused_path = '/list'
+            server.download_started, server.resume_download = threading.Event(), threading.Event()
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                refresh = executor.submit(api, base, '/gfwlist/refresh', {}, token)
+                try:
+                    assert server.download_started.wait(3)
+                    settings['access']['cidrs'] = ['127.0.0.0/8']
+                    save()
+                finally:
+                    server.resume_download.set()
+                assert refresh.result()['gfwlist']['count'] == 2
+            server.paused_path = None
             settings['gfwlist']['enabled'] = True
             save()
             assert rcode(udp(query('blocked.target.test'), dns_port)) == 0
             logs = api(base, '/logs', token=token)
             assert logs[0]['outcome'] == 'gfw_fallback_doh' and logs[0]['upstream'] == 'default', logs[0]
             assert server.counts['/fail'] == 1
+            special = next(g for g in status()['groups'] if g['name'] == 'special')
+            assert special['servers'][0]['failures'] > 0 and special['servers'][0]['cooldown_until'] > 0
+            save()
+            assert next(g for g in status()['groups'] if g['name'] == 'special') == special
             udp(query('safe.blocked.target.test'), dns_port)
             assert server.counts['/fail'] == 1, 'GFWList exception ignored'
             settings['groups'][1] = group('special', ['/one'])
@@ -242,12 +326,24 @@ def run():
             settings['resolution']['mode'] = 'parallel'
             settings['resolution']['priority_ms'] = 25
             save()
-            assert rcode(udp(query('parallel.test'), dns_port)) == 0
+            answer = udp(query('parallel.test'), dns_port)
+            assert rcode(answer) == 0 and socket.inet_aton('198.51.100.22') in answer, 'parallel lookup missed the /two DoH answer'
             settings['resolution']['mode'] = 'doh'
             save()
 
             for version in [4, 6]: api(base, '/geoip/refresh', {'ip_version': version}, token)
             assert status()['geo']['ipv4']['available'] and status()['geo']['ipv6']['available']
+            # The loaded reader must survive an unrelated settings save even
+            # if the backing file is temporarily unavailable.
+            ipv4_path = Path(settings['geo']['ipv4_path'])
+            offline_path = ipv4_path.with_suffix('.offline')
+            ipv4_path.rename(offline_path)
+            try:
+                settings['access']['cidrs'] = ['127.0.0.1/32']
+                save()
+                assert api(base, '/geoip/lookup', {'ip':'8.8.8.8'}, token)['location']['country_code'] == 'CN'
+            finally:
+                offline_path.rename(ipv4_path)
             for ip in ['8.8.8.8', '2001:4860:4860::8888']:
                 result = api(base, '/geoip/lookup', {'ip': ip}, token)
                 assert result['location']['country_code'] == 'CN' and result['location']['province'] == '广东省', result
@@ -307,7 +403,7 @@ def run():
             save()
             server.resources['/list'] = base64.b64encode(b'[AutoProxy 0.2.9]\n||scheduled.target.test\n')
             previous_updates = server.counts['GET/list']
-            with sqlite3.connect(directory/'db.sqlite3') as connection:
+            with closing(sqlite3.connect(directory/'db.sqlite3')) as connection, connection:
                 connection.execute("UPDATE runtime_settings SET value=? WHERE key='gfwlist_meta'", (json.dumps({'attempted_at':0}),))
             process.terminate(); process.wait(timeout=5)
             process = subprocess.Popen([str(BIN), str(config)], stdout=output, stderr=output)
@@ -320,8 +416,10 @@ def run():
             assert rcode(udp(query('scheduled.target.test'), dns_port))==0
             assert api(base, '/logs', token=token)[0]['outcome']=='gfw_fallback_doh', 'scheduled list match did not use the configured default DoH fallback'
             if os.environ.get('RDNS_FEATURE_UI') == '1':
+                cache_before = api(base, '/cache', token=token)['settings']
                 subprocess.run(['node', str(Path(__file__).with_name('feature-ui-smoke.mjs'))], check=True,
                     env={**os.environ, 'RDNS_UI_BASE':base, 'RDNS_UI_UPSTREAM':base_upstream})
+                assert api(base, '/cache', token=token)['settings'] == cache_before
             print('PASS: DoH round robin/cache/ECH, GFWList exceptions/fallback/retained updates, HTTP+SOCKS5 tunnels, IPv4+IPv6 XDB, access modes/regions, roles and restart persistence')
         except Exception:
             output.flush(); output.seek(0)
@@ -329,6 +427,7 @@ def run():
             raise
         finally:
             process.terminate(); process.wait(timeout=5)
+            output.close()
             server.shutdown()
             for proxy in proxies: proxy.shutdown()
 

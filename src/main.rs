@@ -5,6 +5,7 @@ mod config;
 mod features;
 mod geoip;
 mod gfwlist;
+mod query_log;
 mod resolver;
 mod runtime;
 mod service;
@@ -102,11 +103,36 @@ async fn main() -> Result<()> {
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
+    let publish_stats = async {
+        let mut ticks = tokio::time::interval(Duration::from_secs(3));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            if listeners.has_subscribers() {
+                listeners.publish(
+                    serde_json::json!({"type":"cache", "stats":engine.cache_stats().await}),
+                );
+            }
+        }
+    };
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::select! { result = tokio::signal::ctrl_c() => result?, _ = term.recv() => {} }
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await?;
+        Ok::<(), std::io::Error>(())
+    };
     let admin = axum::serve(admin_listener, api::admin_router(state));
     tokio::select! {
         result = admin => result.context("admin listener")?,
+        _ = publish_stats => {},
         result = maintenance => result?,
-        _ = tokio::signal::ctrl_c() => tracing::info!("shutdown requested"),
+        result = shutdown => result?,
     }
+    engine.store.query_log.flush().await?;
     Ok(())
 }

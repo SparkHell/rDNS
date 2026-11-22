@@ -49,14 +49,16 @@ pub async fn udp(engine: Arc<Engine>, socket: UdpSocket) -> Result<()> {
 }
 
 pub async fn tcp(engine: Arc<Engine>, listener: TcpListener) -> Result<()> {
+    let mut connections = tokio::task::JoinSet::new();
     let limit = Arc::new(Semaphore::new(512));
     loop {
+        while connections.try_join_next().is_some() {}
         let (stream, peer) = listener.accept().await?;
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
         };
         let engine = engine.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _permit = permit;
             if let Err(error) = dns_stream(stream, peer, engine, "tcp").await {
                 tracing::debug!(%error, %peer, "DNS TCP connection ended");
@@ -66,15 +68,17 @@ pub async fn tcp(engine: Arc<Engine>, listener: TcpListener) -> Result<()> {
 }
 
 pub async fn dot(engine: Arc<Engine>, tls: Arc<TlsState>, listener: TcpListener) -> Result<()> {
+    let mut connections = tokio::task::JoinSet::new();
     let limit = Arc::new(Semaphore::new(512));
     loop {
+        while connections.try_join_next().is_some() {}
         let (stream, peer) = listener.accept().await?;
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
         };
         let engine = engine.clone();
         let tls = tls.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _permit = permit;
             let Ok(config) = tls.dot_config() else {
                 return;

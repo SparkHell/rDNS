@@ -42,6 +42,7 @@ pub struct Engine {
     pub config: Config,
     pub store: Store,
     policy: ArcSwap<Policy>,
+    policy_reload: tokio::sync::Mutex<()>,
     pub features: Arc<Features>,
     recursor: ArcSwap<Recursor<CachedProvider>>,
     cache: Arc<PersistentCache>,
@@ -94,6 +95,7 @@ impl Engine {
         let engine = Arc::new(Self {
             config,
             store,
+            policy_reload: Default::default(),
             policy: ArcSwap::from_pointee(Policy::default()),
             features,
             recursor: ArcSwap::from_pointee(recursor),
@@ -111,8 +113,9 @@ impl Engine {
     pub async fn update_cache_settings(&self, settings: CacheSettings) -> Result<()> {
         settings.validate()?;
         let recursor = build_recursor_with_settings(&self.roots, &self.cache, &settings)?;
-        self.cache.set_settings(settings).await?;
-        self.recursor.store(Arc::new(recursor));
+        self.cache
+            .set_settings(settings, || self.recursor.store(Arc::new(recursor)))
+            .await?;
         Ok(())
     }
 
@@ -124,8 +127,10 @@ impl Engine {
     }
 
     pub async fn reload_policy(&self) -> Result<()> {
+        let _guard = self.policy_reload.lock().await;
+        let (rules, domains) = self.store.policy_snapshot().await?;
         let mut policy = Policy::default();
-        for rule in self.store.rules().await? {
+        for rule in rules {
             match rule.kind.as_str() {
                 "local" => policy.local.push(rule),
                 "allow" => {
@@ -142,9 +147,7 @@ impl Engine {
                 _ => {}
             }
         }
-        policy
-            .block
-            .extend(self.store.subscription_domains().await?);
+        policy.block.extend(domains);
         policy
             .forward
             .sort_by_key(|(domain, _)| std::cmp::Reverse(domain.len()));
@@ -218,7 +221,15 @@ impl Engine {
             response.metadata.response_code = ResponseCode::Refused;
             return Ok(response.to_vec()?);
         }
-        let domain = normalize_domain(&query.name().to_ascii())?;
+        let domain = if query.name().is_root() {
+            ".".to_owned()
+        } else {
+            query
+                .name()
+                .to_ascii()
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+        };
         let kind = query.query_type().to_string();
         let policy = self.policy.load_full();
         let runtime = self.features.current.load_full();
@@ -253,15 +264,20 @@ impl Engine {
             .iter()
             .find(|(suffix, _)| domain == *suffix || domain.ends_with(&format!(".{suffix}")))
         {
-            match forward(wire, *upstream).await {
-                Ok(bytes) => {
+            let budget = Duration::from_millis(runtime.settings.resolution.timeout_ms);
+            match tokio::time::timeout(budget, forward(wire, *upstream)).await {
+                Err(_) => {
+                    response.metadata.response_code = ResponseCode::ServFail;
+                    outcome = "timeout";
+                }
+                Ok(Ok(bytes)) => {
                     let mut forwarded = Message::from_vec(&bytes)?;
                     forwarded.metadata.id = request.metadata.id;
                     forwarded.metadata.authentic_data = false;
                     response = forwarded;
                     outcome = "forward";
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     tracing::warn!(%error, %upstream, "conditional forward failed");
                     response.metadata.response_code = ResponseCode::ServFail;
                     outcome = "error";
@@ -386,17 +402,19 @@ impl Engine {
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         if let Err(error) = self
             .store
-            .log_query(crate::store::QueryLogEntry {
-                client: &peer.ip().to_string(),
-                domain: &domain,
-                qtype: &kind,
-                outcome,
-                protocol,
+            .query_log
+            .push(crate::query_log::QueryLogEntry {
+                at: chrono::Utc::now().to_rfc3339(),
+                client: peer.ip().to_string(),
+                domain,
+                qtype: kind,
+                outcome: outcome.into(),
+                protocol: protocol.into(),
                 duration_ms,
-                country: location.country.as_deref(),
-                province: location.province.as_deref(),
-                city: location.city.as_deref(),
-                upstream: selected_upstream.as_deref(),
+                country: location.country,
+                province: location.province,
+                city: location.city,
+                upstream: selected_upstream,
             })
             .await
         {

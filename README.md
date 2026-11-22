@@ -34,7 +34,7 @@ On Linux, after placing the binary, configuration and readable PEM files, run `s
 Suggested production ports: UDP/TCP 53, DoH 443 (`/dns-query`), DoT TCP 853, DoQ UDP 853. `allowed_clients` seeds the initial whitelist. IPv4 and IPv6 CIDRs are supported. The SQLite database path must be writable by the service account; certificate files only need read access.
 
 On first start, `allowed_clients` seeds the database. Subsequent access policy, upstream, GeoIP and GFWList settings are managed in the console, stored in SQLite and applied without restarting. Existing installations retain their whitelist and validating recursive mode. The legacy `PUT /api/v1/clients` still replaces the whitelist and selects whitelist mode.
-Existing TOML listener addresses are enabled on first upgrade, preserving the current deployment; after a listener configuration is saved in the panel, the SQLite setting takes precedence on restart. The panel sends listener changes over an authenticated WebSocket and receives live status/errors. A new port is bound before settings are saved, so occupied ports leave the current listeners running.
+Existing TOML listener addresses are enabled on first upgrade, preserving the current deployment; after a listener configuration is saved in the panel, the SQLite setting takes precedence on restart. The panel saves listener changes over authenticated HTTP and receives live status and errors over WebSocket. A new port is bound before settings are saved, so occupied ports leave the current listeners running. Disabling or moving a TCP or DoT listener also closes its existing client connections.
 
 ## Cache
 
@@ -46,13 +46,15 @@ The defaults follow Unbound's TTL limits: positive answers and NS/Glue are cappe
 
 1. An exact local name takes precedence. A, AAAA, CNAME and TXT records are supported. An exact local name without the requested type returns NOERROR with no answer.
 2. A manual allow rule overrides block rules for the name and its subdomains. Manual blocks and subscription blocks return NXDOMAIN.
-3. The longest matching conditional forward suffix uses the configured upstream UDP/TCP socket address. Its response is not presented as DNSSEC validated.
+3. The longest matching conditional forward suffix uses the configured upstream UDP/TCP socket address. If several targets have the same suffix, the lowest remaining rule ID takes precedence. UDP and its TCP fallback share the configured resolution deadline and return SERVFAIL on timeout. Its response is not presented as DNSSEC validated.
 4. GFWList matches use their designated DoH group, including its configured proxy. If that path is unavailable, the default DoH group is tried. Both failing returns SERVFAIL; this route never falls back to root recursion. A confirmed DNSSEC failure returns SERVFAIL directly.
 5. Remaining names use the selected default mode: validating root recursion, DoH, or recursive-preferred parallel resolution. DNSSEC AD is set only after local validation; local records, conditional forwarding and DoH with local validation disabled clear it.
 
 Public HTTPS/SVCB answers, including their `ech` parameter, pass through the recursive path. rDns does not terminate ECH on its own DoH TLS listener. The chosen rustls server stack does not currently provide server-side ECH support.
 The binary bundles an InterNIC root hints snapshot (`resources/named.root`). Set `root_hints` in the configuration to use an updated file without rebuilding.
 At startup, rDns uses IPv4 root addresses when an IPv4 route is available, and IPv6 addresses on IPv6-only hosts.
+
+Duplicate allow/block rules and identical forwarding targets return HTTP 409. On upgrade, the database keeps the oldest ID for each duplicate and preserves distinct targets.
 
 Remote filter lists accept one domain per line, `0.0.0.0 domain`, `127.0.0.1 domain`, and Adblock `||domain^` entries. Unsupported list rules are ignored. Updates are size limited to 10 MiB and applied only after successful retrieval and parsing. The background refresher runs hourly; manual refresh is available in the console.
 For an internal HTTPS list, set `subscription_ca` to the PEM CA certificate that signed its server certificate. TLS verification remains enabled.
@@ -87,9 +89,9 @@ Logs include country, province, city and the selected DoH group; the overview ag
 
 **GFWList** bundles the official snapshot in `resources/gfwlist.txt` and is disabled until a route is configured. It accepts the upstream Base64 AutoProxy format or decoded AutoProxy text, supports domain suffixes, host wildcards, domain exceptions and compatible regular expressions. Positive URL rules apply to their whole hostname because DNS has no URL path. Path-only exceptions and unsupported expressions are counted as unapplied rules in the page; it is not a full PAC/URL matcher. GFWList is separate from blocking subscriptions: a match selects a resolver rather than blocking the domain.
 
-Configure a CDN URL, update interval (default six hours), and designated group. The background scheduler checks due updates every minute. List downloads use the designated group's proxy when one is configured. Only a successfully parsed nonempty update replaces active rules; failed updates and restarts retain the last valid downloaded list. With no downloaded list, the bundled snapshot is used. GFWList's designated group receives at most half the overall request budget when a distinct default group is available, reserving time for that default DoH fallback.
+Configure a CDN URL, update interval (default six hours), and designated group. The background scheduler checks due updates every minute. Source changes during a GeoIP or GFWList refresh discard the superseded download. Access-policy saves can complete while the download is in progress. List downloads use the designated group's proxy when one is configured. Only a successfully parsed nonempty update replaces active rules; failed updates and restarts retain the last valid downloaded list. With no downloaded list, the bundled snapshot is used. GFWList's designated group receives at most half the overall request budget when a distinct default group is available, reserving time for that default DoH fallback.
 
-The configuration pages use authenticated WebSocket updates and preserve unsaved form edits during status notifications. REST equivalents are available below. API snapshots expose proxy configuration only to administrators; update audits do not include proxy credentials.
+Configuration pages save through the HTTP API. Their WebSocket reconnects automatically and receives shared cache statistics every three seconds. Status notifications preserve unsaved configuration edits. API snapshots expose proxy configuration only to administrators; update audits do not include proxy credentials.
 
 ## Management API
 
@@ -132,7 +134,9 @@ The console's certificate page can save new absolute paths. Saving validates the
 ## Verification
 
 Run `cargo test --locked` for unit tests and a local integration test covering all five transports, policy rules, roles, subscription updates, certificate rotation, failure rollback and restart persistence. Run `cargo test --test smoke live_root_dnssec_and_ech -- --ignored --nocapture` where direct DNS access to authoritative servers is available; it checks root recursion, a signed answer's AD bit, the deliberately bogus `dnssec-failed.org` response and an HTTPS record carrying `ech`. Run `cargo test --test smoke console_screenshot -- --ignored --nocapture` with Chromium installed for a browser walkthrough and screenshot at `/tmp/rdns-console-dashboard.png`.
-The feature integration smoke includes local TLS DoH pools, round robin/cache and timeout failover, GFWList exceptions/default-group fallback, real HTTP CONNECT and SOCKS5 tunnels, generated IPv4/IPv6 XDB databases, trusted/untrusted forwarded IPs, region rules, roles and restart persistence. With the local Chrome path in `tests/feature-ui-smoke.mjs` available, run `RDNS_FEATURE_UI=1 python3 tests/features_smoke.py` for actual WebSocket configuration saves and desktop/mobile browser screenshots in `/tmp/rdns-ui-*.png`.
+The feature integration smoke includes local TLS DoH pools, round robin/cache and timeout failover, GFWList exceptions/default-group fallback, real HTTP CONNECT and SOCKS5 tunnels, generated IPv4/IPv6 XDB databases, trusted/untrusted forwarded IPs, region rules, roles and restart persistence. Run `npx --no-install playwright-core install chromium` from `web/` or set `RDNS_CHROME` to a local Chromium executable. Run `RDNS_FEATURE_UI=1 python3 tests/features_smoke.py` for HTTP saves, reconnect, session revocation and desktop/mobile checks. Screenshots are written to the system temporary directory.
+
+With a debug binary built, run `RDNS_LATENCY_BASELINE=1 python3 tests/features_smoke.py` to measure client-side UDP P95/P99 over 500 sequential local-rule queries and 500 warm-cache queries. Query logs queue up to 1024 entries and apply backpressure when full. The writer commits up to 64 entries per statement. The stats API reports queue depth, failed entries and the duration of the last batch write in microseconds.
 Run `cargo test --locked --test smoke live_doh_dnssec_and_ech -- --ignored --nocapture` for the public DoH/DNSSEC/ECH check. Set `RDNS_TEST_UPSTREAM_PROXY` explicitly if that test needs an HTTP/SOCKS5 proxy; the production application continues to use only its saved per-group proxy configuration.
 After `cargo build --release --locked --bin rdns`, run `cargo test --test smoke release_binary_protocols -- --ignored --nocapture` to exercise the exact release binary.
 

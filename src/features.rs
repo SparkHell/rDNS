@@ -41,7 +41,21 @@ pub struct FeatureSettings {
     pub gfwlist: GfwSettings,
 }
 
+impl FeatureSettings {
+    fn list_source(&self) -> (&str, &str, &str, bool) {
+        let group = &self.gfwlist.group;
+        let proxy = self
+            .groups
+            .iter()
+            .find(|g| &g.name == group)
+            .map_or("", |g| g.proxy.as_str());
+        (&self.gfwlist.url, group, proxy, self.gfwlist.enabled)
+    }
+}
+
 pub struct FeatureRuntime {
+    list_revision: u64,
+    geo_revision: u64,
     pub settings: FeatureSettings,
     pub access: AccessPolicy,
     pub geo: Arc<GeoIpService>,
@@ -55,6 +69,8 @@ pub struct Features {
     store: Store,
     cache: Arc<PersistentCache>,
     write: Mutex<()>,
+    list_refresh: Mutex<()>,
+    geo_refresh: [Mutex<()>; 2],
 }
 
 impl Features {
@@ -84,7 +100,7 @@ impl Features {
                 }
             }
         };
-        let runtime = Self::compile(&config, settings, cache.clone())?;
+        let runtime = Self::compile(&config, settings, cache.clone(), None)?;
         let saved = store.setting::<String>("gfwlist_data").await?;
         let list = saved
             .as_deref()
@@ -97,6 +113,8 @@ impl Features {
             store,
             cache,
             write: Mutex::new(()),
+            list_refresh: Default::default(),
+            geo_refresh: Default::default(),
         }))
     }
 
@@ -104,6 +122,7 @@ impl Features {
         config: &Config,
         mut settings: FeatureSettings,
         cache: Arc<PersistentCache>,
+        previous: Option<&FeatureRuntime>,
     ) -> Result<FeatureRuntime> {
         let access = AccessPolicy::compile(settings.access.clone())?;
         settings.access = access.settings.clone();
@@ -116,10 +135,14 @@ impl Features {
         let mut groups = HashMap::new();
         for group in &settings.groups {
             ensure!(!groups.contains_key(&group.name), "上游组名称不能重复");
-            groups.insert(
-                group.name.clone(),
-                DohGroup::build(config, group, cache.clone())?,
-            );
+            let reusable = previous
+                .filter(|runtime| runtime.settings.groups.contains(group))
+                .and_then(|runtime| runtime.groups.get(&group.name));
+            let pool = match reusable {
+                Some(pool) => pool.clone(),
+                None => DohGroup::build(config, group, cache.clone())?,
+            };
+            groups.insert(group.name.clone(), pool);
         }
         ensure!(
             r.mode == ResolveMode::Recursive || groups.contains_key(&r.group),
@@ -153,12 +176,36 @@ impl Features {
             settings.access.region_mode == RegionMode::Any || geo_settings.enabled,
             "启用地区访问规则时必须启用 GeoIP"
         );
-        let geo = Arc::new(GeoIpService::new(
-            geo_settings.enabled,
-            geo_settings.ipv4_path.clone(),
-            geo_settings.ipv6_path.clone(),
-        ));
+        let reusable_geo = previous.filter(|runtime| {
+            let old = &runtime.settings.geo;
+            old.enabled == geo_settings.enabled
+                && old.ipv4_path == geo_settings.ipv4_path
+                && old.ipv6_path == geo_settings.ipv6_path
+        });
+        let geo = match reusable_geo {
+            Some(runtime) => runtime.geo.clone(),
+            None => Arc::new(GeoIpService::new(
+                geo_settings.enabled,
+                geo_settings.ipv4_path.clone(),
+                geo_settings.ipv6_path.clone(),
+            )),
+        };
+        let list_revision = previous.map_or(0, |old| {
+            old.list_revision + u64::from(old.settings.list_source() != settings.list_source())
+        });
+        let geo_revision = previous.map_or(0, |old| {
+            let source = &old.settings.geo;
+            old.geo_revision
+                + u64::from(
+                    reusable_geo.is_none()
+                        || source.ipv4_url != geo_settings.ipv4_url
+                        || source.ipv6_url != geo_settings.ipv6_url
+                        || source.proxy != geo_settings.proxy,
+                )
+        });
         Ok(FeatureRuntime {
+            list_revision,
+            geo_revision,
             settings,
             access,
             geo,
@@ -168,7 +215,12 @@ impl Features {
 
     pub async fn apply(&self, settings: FeatureSettings) -> Result<()> {
         let _guard = self.write.lock().await;
-        let runtime = Self::compile(&self.config, settings, self.cache.clone())?;
+        let runtime = Self::compile(
+            &self.config,
+            settings,
+            self.cache.clone(),
+            Some(&self.current.load()),
+        )?;
         self.store.set_features(&runtime.settings).await?;
         self.current.store(Arc::new(runtime));
         Ok(())
@@ -195,24 +247,26 @@ impl Features {
     }
 
     pub async fn refresh_list(&self) -> Result<usize> {
-        let _guard = self.write.lock().await;
+        let _refresh = self.list_refresh.lock().await;
         let current = self.current.load_full();
-        let group = current
-            .settings
-            .groups
-            .iter()
-            .find(|g| g.name == current.settings.gfwlist.group);
-        let proxy = group.map(|g| g.proxy.as_str()).unwrap_or("");
+        let (url, _, proxy, _) = current.settings.list_source();
+        let downloaded = async {
+            let bytes = upstream::download(&self.config, url, proxy, 10 * 1024 * 1024).await?;
+            tokio::task::spawn_blocking(move || {
+                let text = String::from_utf8(bytes)?;
+                let list = GfwList::parse(&text)?;
+                Ok::<_, anyhow::Error>((text, list))
+            })
+            .await?
+        }
+        .await;
+        let _guard = self.write.lock().await;
+        ensure!(
+            self.current.load().list_revision == current.list_revision,
+            "GFWList source changed during refresh"
+        );
         let result = async {
-            let bytes = upstream::download(
-                &self.config,
-                &current.settings.gfwlist.url,
-                proxy,
-                10 * 1024 * 1024,
-            )
-            .await?;
-            let text = String::from_utf8(bytes)?;
-            let list = GfwList::parse(&text)?;
+            let (text, list) = downloaded?;
             self.store.set_setting("gfwlist_data", &text).await?;
             let count = list.count;
             self.list.store(Arc::new(list));
@@ -231,7 +285,7 @@ impl Features {
 
     pub async fn refresh_geo(&self, version: u8) -> Result<()> {
         ensure!([4, 6].contains(&version), "ip_version must be 4 or 6");
-        let _guard = self.write.lock().await;
+        let _refresh = self.geo_refresh[usize::from(version == 6)].lock().await;
         let current = self.current.load_full();
         let settings = &current.settings.geo;
         let url = if version == 4 {
@@ -239,14 +293,19 @@ impl Features {
         } else {
             &settings.ipv6_url
         };
-        let result = async {
+        let prepared = async {
             let bytes =
                 upstream::download(&self.config, url, &settings.proxy, 80 * 1024 * 1024).await?;
             let geo = current.geo.clone();
-            tokio::task::spawn_blocking(move || geo.install_database(version, &bytes)).await??;
-            Ok::<_, anyhow::Error>(())
+            tokio::task::spawn_blocking(move || geo.prepare_database(version, bytes)).await?
         }
         .await;
+        let _guard = self.write.lock().await;
+        ensure!(
+            self.current.load().geo_revision == current.geo_revision,
+            "GeoIP source changed during refresh"
+        );
+        let result = prepared.and_then(|staged| current.geo.install_prepared(version, staged));
         let mut meta = self
             .store
             .setting::<Value>("geo_meta")

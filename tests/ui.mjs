@@ -56,7 +56,7 @@ try {
   await page.waitForTimeout(300)
   const cacheResponse = await fetch(`${base}/api/v1/cache`, { headers: { Authorization: `Bearer ${token}` } })
   const savedCache = await cacheResponse.json()
-  if (savedCache.settings.memory_mib !== 32) throw new Error(`WebSocket cache update failed: ${JSON.stringify(savedCache)}`)
+  if (savedCache.settings.memory_mib !== 32) throw new Error(`HTTP cache update failed: ${JSON.stringify(savedCache)}`)
   const occupied = dgram.createSocket('udp4')
   await new Promise(resolve => occupied.bind(0, '127.0.0.1', resolve))
   try {

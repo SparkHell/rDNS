@@ -93,8 +93,12 @@ impl GfwList {
             } else {
                 &mut list.include
             };
-            if rule.starts_with('/') && rule.ends_with('/') {
-                match Regex::new(&rule[1..rule.len() - 1]) {
+            if let Some(rest) = rule.strip_prefix('/') {
+                let Some(pattern) = rest.strip_suffix('/').filter(|s| !s.is_empty()) else {
+                    list.skipped += 1;
+                    continue;
+                };
+                match Regex::new(pattern) {
                     Ok(regex) => {
                         rules.expressions.push(regex);
                         list.count += 1;
@@ -156,6 +160,17 @@ impl GfwList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn malformed_regex_delimiters_are_skipped() {
+        for rule in ["/", "//", "/[/", "@@/"] {
+            let text = format!("[AutoProxy]\n{rule}\n||example.test");
+            let rules = GfwList::parse(&text).unwrap();
+            assert_eq!(rules.skipped, 1);
+            assert!(rules.matches("example.test"));
+        }
+        assert!(GfwList::parse("[AutoProxy]\n/").is_err());
+    }
+
     #[test]
     fn embedded_and_autoproxy_rules() -> Result<()> {
         let built_in = GfwList::parse(include_str!("../resources/gfwlist.txt"))?;

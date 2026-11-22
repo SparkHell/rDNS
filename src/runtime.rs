@@ -106,6 +106,9 @@ impl ListenerManager {
             events,
         })
     }
+    pub fn has_subscribers(&self) -> bool {
+        self.events.receiver_count() > 0
+    }
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
         self.events.subscribe()
     }
@@ -218,6 +221,7 @@ impl ListenerManager {
                     endpoint.close(0u32.into(), b"listener changed");
                 }
                 entry.handle.abort();
+                let _ = entry.handle.await;
             }
             if let Some(listener) = bound.remove(&kind) {
                 let app = state.clone();

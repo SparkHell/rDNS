@@ -88,6 +88,19 @@ struct Readers {
     ipv6_error: Option<String>,
 }
 
+pub struct PreparedDatabase {
+    temporary: PathBuf,
+    previous: PathBuf,
+    reader: Arc<XdbReader>,
+}
+
+impl Drop for PreparedDatabase {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
+        let _ = fs::remove_file(&self.previous);
+    }
+}
+
 impl GeoIpService {
     pub fn new(enabled: bool, ipv4_path: PathBuf, ipv6_path: PathBuf) -> Self {
         let service = Self {
@@ -142,7 +155,7 @@ impl GeoIpService {
         }
     }
 
-    pub fn install_database(&self, version: u8, data: &[u8]) -> anyhow::Result<()> {
+    pub fn prepare_database(&self, version: u8, data: Vec<u8>) -> anyhow::Result<PreparedDatabase> {
         if data.len() > MAX_XDB_BYTES {
             bail!("XDB database exceeds the 80 MiB safety limit");
         }
@@ -151,7 +164,7 @@ impl GeoIpService {
             6 => XdbIpVersion::V6,
             _ => bail!("ip_version must be 4 or 6"),
         };
-        let reader = XdbReader::from_bytes(data.to_vec())?;
+        let reader = XdbReader::from_bytes(data)?;
         if reader.ip_version != expected_version {
             bail!("XDB IP version does not match the requested database");
         }
@@ -167,16 +180,34 @@ impl GeoIpService {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let temporary = path.with_extension("xdb.tmp");
-        let backup = path.with_extension("xdb.bak");
-        fs::write(&temporary, data)
-            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        let suffix = rand::random::<u64>();
+        let staged = PreparedDatabase {
+            temporary: path.with_extension(format!("xdb.{suffix}.tmp")),
+            previous: path.with_extension(format!("xdb.{suffix}.previous")),
+            reader: Arc::new(reader),
+        };
+        fs::write(&staged.temporary, staged.reader.bytes.as_slice())?;
         if path.exists() {
-            let _ = fs::copy(path, &backup);
+            fs::copy(path, &staged.previous)?;
         }
-        fs::rename(&temporary, path)
+        Ok(staged)
+    }
+
+    pub fn install_prepared(&self, version: u8, staged: PreparedDatabase) -> anyhow::Result<()> {
+        let path = self.database_path(version)?;
+        if staged.previous.exists() {
+            fs::rename(&staged.previous, path.with_extension("xdb.bak"))?;
+        }
+        fs::rename(&staged.temporary, path)
             .with_context(|| format!("failed to replace {}", path.display()))?;
-        self.reload();
+        let mut readers = self.readers.write().expect("GeoIP reader lock poisoned");
+        if version == 4 {
+            readers.ipv4 = Some(staged.reader.clone());
+            readers.ipv4_error = None;
+        } else {
+            readers.ipv6 = Some(staged.reader.clone());
+            readers.ipv6_error = None;
+        }
         Ok(())
     }
 

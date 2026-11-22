@@ -17,19 +17,7 @@ use std::{
 #[derive(Clone)]
 pub struct Store {
     pub pool: SqlitePool,
-}
-
-pub struct QueryLogEntry<'a> {
-    pub client: &'a str,
-    pub domain: &'a str,
-    pub qtype: &'a str,
-    pub outcome: &'a str,
-    pub protocol: &'a str,
-    pub duration_ms: f64,
-    pub country: Option<&'a str>,
-    pub province: Option<&'a str>,
-    pub city: Option<&'a str>,
-    pub upstream: Option<&'a str>,
+    pub query_log: crate::query_log::QueryLog,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -98,6 +86,18 @@ impl Store {
         ] {
             sqlx::query(ddl).execute(&pool).await?;
         }
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let migrated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='idx_rules_forward_target')")
+            .fetch_one(&mut *tx).await?;
+        if !migrated {
+            sqlx::query("DELETE FROM rules WHERE kind IN ('allow','block','forward') AND id NOT IN (SELECT MIN(id) FROM rules WHERE kind IN ('allow','block','forward') GROUP BY kind,domain,CASE WHEN kind='forward' THEN value END)")
+                .execute(&mut *tx).await?;
+            sqlx::query("CREATE UNIQUE INDEX idx_rules_filter ON rules(kind,domain) WHERE kind IN ('allow','block')")
+                .execute(&mut *tx).await?;
+            sqlx::query("CREATE UNIQUE INDEX idx_rules_forward_target ON rules(domain,value) WHERE kind='forward'")
+                .execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         let columns = sqlx::query("PRAGMA table_info(query_log)")
             .fetch_all(&pool)
             .await?;
@@ -119,7 +119,10 @@ impl Store {
                     .await?;
             }
         }
-        Ok(Self { pool })
+        Ok(Self {
+            query_log: crate::query_log::QueryLog::new(pool.clone()),
+            pool,
+        })
     }
 
     pub async fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
@@ -353,10 +356,15 @@ impl Store {
     }
 
     pub async fn rules(&self) -> Result<Vec<Rule>> {
+        let mut connection = self.pool.acquire().await?;
+        Self::read_rules(&mut connection).await
+    }
+
+    async fn read_rules(connection: &mut sqlx::SqliteConnection) -> Result<Vec<Rule>> {
         let rows = sqlx::query(
             "SELECT id,kind,domain,record_type,value,ttl FROM rules ORDER BY kind,domain,id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(connection)
         .await?;
         Ok(rows
             .into_iter()
@@ -397,7 +405,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn add_rule(&self, input: &RuleInput) -> Result<i64> {
+    pub async fn add_rule(&self, input: &RuleInput) -> Result<i64, sqlx::Error> {
         let result =
             sqlx::query("INSERT INTO rules(kind,domain,record_type,value,ttl) VALUES(?,?,?,?,?)")
                 .bind(&input.kind)
@@ -450,15 +458,14 @@ impl Store {
         Ok(())
     }
 
-    pub async fn subscription_domains(&self) -> Result<Vec<String>> {
-        Ok(
-            sqlx::query("SELECT DISTINCT domain FROM subscription_domains")
-                .fetch_all(&self.pool)
-                .await?
-                .into_iter()
-                .map(|row| row.get("domain"))
-                .collect(),
-        )
+    pub async fn policy_snapshot(&self) -> Result<(Vec<Rule>, Vec<String>)> {
+        let mut tx = self.pool.begin().await?;
+        let rules = Self::read_rules(&mut tx).await?;
+        let domains = sqlx::query_scalar("SELECT DISTINCT domain FROM subscription_domains")
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok((rules, domains))
     }
 
     pub async fn replace_subscription_domains(&self, id: i64, domains: &[String]) -> Result<()> {
@@ -511,30 +518,15 @@ impl Store {
         Ok(rows.into_iter().map(|r| serde_json::json!({"at":r.get::<String,_>("at"),"actor":r.get::<String,_>("actor"),"action":r.get::<String,_>("action"),"detail":r.get::<String,_>("detail")})).collect())
     }
 
-    pub async fn log_query(&self, entry: QueryLogEntry<'_>) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol,duration_ms,country,province,city,upstream) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(entry.client)
-        .bind(entry.domain)
-        .bind(entry.qtype)
-        .bind(entry.outcome)
-        .bind(entry.protocol)
-        .bind(entry.duration_ms)
-        .bind(entry.country).bind(entry.province).bind(entry.city).bind(entry.upstream)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn logs(&self) -> Result<Vec<serde_json::Value>> {
+        self.query_log.flush().await?;
         let rows = sqlx::query("SELECT at,client,domain,qtype,outcome,protocol,duration_ms,country,province,city,upstream FROM query_log ORDER BY id DESC LIMIT 200")
             .fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|r| serde_json::json!({"at":r.get::<String,_>("at"), "client":r.get::<String,_>("client"), "domain":r.get::<String,_>("domain"), "qtype":r.get::<String,_>("qtype"), "outcome":r.get::<String,_>("outcome"), "protocol":r.get::<String,_>("protocol"), "duration_ms":r.get::<Option<f64>,_>("duration_ms"), "country":r.get::<Option<String>,_>("country"),"province":r.get::<Option<String>,_>("province"),"city":r.get::<Option<String>,_>("city"),"upstream":r.get::<Option<String>,_>("upstream")})).collect())
     }
 
     pub async fn stats(&self) -> Result<serde_json::Value> {
+        self.query_log.flush().await?;
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
             .fetch_one(&self.pool)
             .await?;
@@ -544,7 +536,9 @@ impl Store {
                 .await?;
         let rows = sqlx::query("SELECT COALESCE(country,'未知') AS country,COALESCE(province,'未知') AS province,COUNT(*) AS count FROM query_log GROUP BY country,province ORDER BY count DESC LIMIT 50").fetch_all(&self.pool).await?;
         let regions: Vec<_> = rows.into_iter().map(|r| serde_json::json!({"country":r.get::<String,_>("country"),"province":r.get::<String,_>("province"),"count":r.get::<i64,_>("count")})).collect();
-        Ok(serde_json::json!({"total":total,"blocked":blocked,"regions":regions}))
+        Ok(
+            serde_json::json!({"total":total,"blocked":blocked,"regions":regions,"query_log":self.query_log.metrics()}),
+        )
     }
 
     pub async fn prune(&self, days: i64) -> Result<()> {
@@ -589,12 +583,14 @@ mod tests {
         let store = Store::open(&path).await?;
         assert!(store.logs().await?[0]["duration_ms"].is_null());
         store
-            .log_query(QueryLogEntry {
-                client: "127.0.0.1",
-                domain: "new.example",
-                qtype: "A",
-                outcome: "local",
-                protocol: "udp",
+            .query_log
+            .push(crate::query_log::QueryLogEntry {
+                at: Utc::now().to_rfc3339(),
+                client: "127.0.0.1".into(),
+                domain: "new.example".into(),
+                qtype: "A".into(),
+                outcome: "local".into(),
+                protocol: "udp".into(),
                 duration_ms: 0.125,
                 country: None,
                 province: None,

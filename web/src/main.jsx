@@ -20,6 +20,7 @@ const NAV = [
 
 async function api(path, token, options = {}) {
   const response = await fetch(`/api/v1${path}`, {
+    signal: AbortSignal.timeout(90000),
     ...options,
     headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options.headers },
   })
@@ -54,37 +55,54 @@ function App() {
   const [featureDraft, setFeatureDraft] = useState(null)
   const [success, setSuccess] = useState('')
   const lastFeatures = useRef('')
-  const pendingFeatures = useRef('')
   const lastCacheSettings = useRef('')
-  const socketRef = useRef(null)
-  const pendingRef = useRef(new Map())
-  const requestSeq = useRef(0)
+  const lastListeners = useRef('')
+  const activeSession = useRef(token)
+  activeSession.current = token
+
+  function receiveSettings(snapshot, lastSaved, setDraft) {
+    const before = lastSaved.current
+    lastSaved.current = JSON.stringify(snapshot)
+    setDraft(previous => !previous || JSON.stringify(previous) === before ? snapshot : previous)
+  }
+
+  function receiveListeners(snapshot) {
+    setListenerStatus(snapshot)
+    receiveSettings(snapshot.settings, lastListeners, setListenerDraft)
+  }
+
+  function receiveCache(snapshot) {
+    setCacheStatus(snapshot)
+    receiveSettings(snapshot.settings, lastCacheSettings, setCacheDraft)
+  }
 
   const canEdit = me?.role === 'admin' || me?.role === 'editor'
   const isAdmin = me?.role === 'admin'
 
-  function receiveFeatures(message) {
+  function receiveFeatures(message, submitted = '') {
     setFeatureStatus(message)
     const previousSaved = lastFeatures.current
-    const submitted = pendingFeatures.current
     setFeatureDraft(previous => !previous || JSON.stringify(previous) === previousSaved || JSON.stringify(previous) === submitted ? message.settings : previous)
     lastFeatures.current = JSON.stringify(message.settings)
-    pendingFeatures.current = ''
   }
 
   async function refresh(activeToken = token) {
     if (!activeToken) return
     try {
-      const [profile, status, recent, allRules, allSubscriptions, allClients, featureState] = await Promise.all([
-        api('/me', activeToken), api('/stats', activeToken), api('/logs', activeToken), api('/rules', activeToken), api('/subscriptions', activeToken), api('/clients', activeToken), api('/features', activeToken),
+      const [profile, status, recent, allRules, allSubscriptions, allClients, featureState, listeners, cache] = await Promise.all([
+        api('/me', activeToken), api('/stats', activeToken), api('/logs', activeToken), api('/rules', activeToken), api('/subscriptions', activeToken), api('/clients', activeToken), api('/features', activeToken), api('/listeners', activeToken), api('/cache', activeToken),
       ])
+      if (activeSession.current !== activeToken) return
+      receiveListeners(listeners); receiveCache(cache)
       setMe(profile); setStats(status); setLogs(recent); setRules(allRules); setSubscriptions(allSubscriptions); setClients(allClients); setCidrText(allClients.join('\n')); receiveFeatures(featureState); setError('')
       if (profile.role === 'admin') {
         const [allAccounts, events, paths] = await Promise.all([api('/accounts', activeToken), api('/audit', activeToken), api('/certificates', activeToken)])
+        if (activeSession.current !== activeToken) return
         setAccounts(allAccounts); setAudit(events); setCertPaths(paths)
       }
     } catch (err) {
-      if (err.message.includes('authentication')) { sessionStorage.removeItem('rdns-token'); setToken(''); setMe(null) }
+      if (activeSession.current !== activeToken) return
+      if (err.message.includes('authentication')) clearSession()
       else setError(err.message)
     }
   }
@@ -93,41 +111,49 @@ function App() {
   useEffect(() => {
     if (!token) return
     const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const socket = new WebSocket(`${scheme}//${location.host}/api/v1/ws`)
-    socketRef.current = socket
-    socket.onopen = () => socket.send(JSON.stringify({ type: 'auth', token }))
-    socket.onmessage = event => {
-      const message = JSON.parse(event.data)
-      if (message.type === 'listeners') { setListenerStatus(message); setListenerDraft(message.settings) }
-      if (message.type === 'features') receiveFeatures(message)
-      if (message.type === 'cache') { setCacheStatus(message.stats); const saved = JSON.stringify(message.stats.settings); if (saved !== lastCacheSettings.current) { lastCacheSettings.current = saved; setCacheDraft(message.stats.settings) } }
-      if (message.type === 'listener_error') { setError(`${message.protocol}: ${message.error}`); setListenerStatus(previous => previous ? { ...previous, running: { ...previous.running, [message.protocol]: false } } : previous) }
-      if (message.type === 'result') {
-        const pending = pendingRef.current.get(message.request_id)
-        if (pending) { pendingRef.current.delete(message.request_id); message.ok ? pending.resolve(message) : pending.reject(new Error(message.error || '配置失败')) }
+    let socket, timer, stopped = false, delay = 500
+    function connect() {
+      socket = new WebSocket(`${scheme}//${location.host}/api/v1/ws`)
+      socket.onopen = () => socket.send(JSON.stringify({ type: 'auth', token }))
+      socket.onmessage = event => {
+        if (stopped || activeSession.current !== token) return
+        const message = JSON.parse(event.data)
+        if (message.type === 'ready') delay = 500
+        if (message.type === 'listeners') receiveListeners(message)
+        if (message.type === 'features') receiveFeatures(message)
+        if (message.type === 'cache') receiveCache(message.stats)
+        if (message.type === 'listener_error') {
+          setError(`${message.protocol}: ${message.error}`)
+          setListenerStatus(previous => previous && { ...previous, running: { ...previous.running, [message.protocol]: false } })
+        }
+      }
+      socket.onclose = event => {
+        if (stopped || activeSession.current !== token) return
+        if (event.code === 1008) {
+          clearSession()
+          return
+        }
+        timer = setTimeout(connect, delay)
+        delay = Math.min(delay * 2, 10000)
       }
     }
-    socket.onclose = () => { if (socketRef.current === socket) socketRef.current = null; for (const pending of pendingRef.current.values()) pending.reject(new Error('实时连接已断开，请刷新页面')); pendingRef.current.clear() }
-    return () => socket.close()
+    connect()
+    return () => { stopped = true; clearTimeout(timer); socket.close() }
   }, [token])
 
-  function sendSettings(type, settings) {
-    const socket = socketRef.current
-    if (!socket || socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error('实时连接未就绪，请刷新页面'))
-    const request_id = ++requestSeq.current
-    return new Promise((resolve, reject) => {
-      pendingRef.current.set(request_id, { resolve, reject })
-      socket.send(JSON.stringify({ type, request_id, settings }))
-    })
+  function writeSettings(path, method, settings) {
+    return api(path, token, { method, body: JSON.stringify(settings) })
   }
-
-  const saveListeners = () => sendSettings('listeners.update', listenerDraft)
-  const saveCache = () => sendSettings('cache.update', cacheDraft)
-  const saveFeatures = () => { pendingFeatures.current = JSON.stringify(featureDraft); return sendSettings('features.update', cleanFeatureSettings(featureDraft)) }
+  const saveListeners = () => writeSettings('/listeners', 'PUT', listenerDraft)
+  const saveCache = () => writeSettings('/cache', 'PUT', cacheDraft)
+  async function saveFeatures() {
+    const saved = await writeSettings('/features', 'PUT', cleanFeatureSettings(featureDraft))
+    if (activeSession.current === token) receiveFeatures(saved, JSON.stringify(featureDraft))
+  }
 
   async function run(action) {
     setBusy(true); setError(''); setSuccess('')
-    try { await action(); await refresh(); setSuccess('操作已完成') } catch (err) { setError(err.message) } finally { setBusy(false) }
+    try { await action(); await refresh(); setSuccess('操作已完成') } catch (err) { await refresh(); setError(err.message) } finally { setBusy(false) }
   }
 
   async function signIn(event) {
@@ -138,7 +164,15 @@ function App() {
 
   function signOut() {
     api('/logout', token, { method: 'POST' }).catch(() => {})
-    sessionStorage.removeItem('rdns-token'); setToken(''); setMe(null); setFeatureDraft(null); setFeatureStatus(null); lastFeatures.current = ''; pendingFeatures.current = ''
+    clearSession()
+  }
+
+  function clearSession() {
+    activeSession.current = ''
+    sessionStorage.removeItem('rdns-token')
+    setToken(''); setMe(null); setFeatureDraft(null); setFeatureStatus(null)
+    setListenerDraft(null); setCacheDraft(null); setAccounts([]); setAudit([])
+    lastFeatures.current = ''; lastCacheSettings.current = ''; lastListeners.current = ''
   }
 
   if (!me) return <main className="login-page"><div className="login-shell"><div className="brand brand-large"><span className="brand-mark">r</span><span>Dns<span className="brand-dot">.</span></span></div><p className="eyebrow">SECURE DNS OPERATIONS</p><h1>欢迎回来</h1><p className="muted">登录以管理企业 DNS 服务与解析策略。</p><form onSubmit={signIn} className="login-form"><label>用户名<input autoFocus autoComplete="username" value={login.username} onChange={e => setLogin({ ...login, username: e.target.value })} required /></label><label>密码<input type="password" autoComplete="current-password" value={login.password} onChange={e => setLogin({ ...login, password: e.target.value })} required /></label>{error && <div className="notice error">{error}</div>}<button className="btn primary wide" disabled={busy}>登录控制台 <span>→</span></button></form><div className="login-foot">PRIVATE RESOLVER · DNSSEC VALIDATION</div></div></main>
@@ -147,7 +181,7 @@ function App() {
     <aside className="sidebar"><div className="brand"><span className="brand-mark">r</span><span>Dns<span className="brand-dot">.</span></span></div><div className="sidebar-label">工作台</div><nav>{NAV.filter(([id]) => id !== 'accounts' || isAdmin).map(([id, label, icon]) => <button key={id} className={`nav-item ${page === id ? 'active' : ''}`} onClick={() => setPage(id)}><span className="nav-icon">{icon}</span>{label}</button>)}</nav><div className="sidebar-bottom"><div className="health-dot"/>服务运行中<span className="version">v0.1</span></div></aside>
     <div className="main-area"><header className="topbar flex items-center justify-between"><div className="breadcrumb">控制台 <span>/</span> {NAV.find(([id]) => id === page)?.[1]}</div><div className="top-actions"><span className="env-badge">内部服务</span><span className="avatar">{me.username.slice(0, 1).toUpperCase()}</span><span className="username">{me.username}</span><button className="text-button" onClick={signOut}>退出</button></div></header>
       <main className="content"><div className="page-heading"><div><div className="eyebrow">RDNS / CONTROL CENTER</div><h1>{NAV.find(([id]) => id === page)?.[1]}</h1><p className="muted">{subtitle(page)}</p></div><button className="btn secondary" onClick={() => refresh()} disabled={busy}>↻ 刷新数据</button></div>{error && <div className="notice error" role="alert">{error}</div>}{success && <div className="notice success" role="status">{success}</div>}
-        {['clients', 'upstreams', 'gfwlist', 'geoip'].includes(page) && <FeaturePages page={page} status={featureStatus} draft={featureDraft} setDraft={setFeatureDraft} isAdmin={isAdmin} busy={busy} save={() => run(saveFeatures)} command={(type, settings = {}) => run(() => sendSettings(type, settings))} lookup={ip => api('/geoip/lookup', token, { method: 'POST', body: JSON.stringify({ ip }) }).catch(error => { setError(error.message); throw error })}/>}
+        {['clients', 'upstreams', 'gfwlist', 'geoip'].includes(page) && <FeaturePages page={page} status={featureStatus} draft={featureDraft} setDraft={setFeatureDraft} isAdmin={isAdmin} busy={busy} save={() => run(saveFeatures)} command={(type, settings = {}) => run(() => writeSettings(type === 'gfwlist.refresh' ? '/gfwlist/refresh' : '/geoip/refresh', 'POST', settings))} lookup={ip => api('/geoip/lookup', token, { method: 'POST', body: JSON.stringify({ ip }) }).catch(error => { setError(error.message); throw error })}/>}
         {page === 'overview' && <><div className="hero"><div><span className="hero-status"><i/> {featureStatus?.settings.resolution.mode === 'doh' && !featureStatus?.settings.resolution.validate_dnssec ? 'DoH 上游解析' : 'DNSSEC 本地验证'}</span><h2>从根开始，可信解析。</h2><p>本地递归与 DoH 上游按策略解析，企业规则即时生效。</p></div><div className="hero-art"><span className="orbit orbit-one"/><span className="orbit orbit-two"/><span className="orbit-core">DNS</span></div></div><div className="metric-grid"><Metric title="总查询" value={stats.total} foot="保留期内查询" icon="↗"/><Metric title="已过滤" value={stats.blocked} foot="广告及黑名单" icon="⊘"/><Metric title="过滤率" value={`${stats.total ? Math.round(stats.blocked / stats.total * 100) : 0}%`} foot="占全部查询" icon="◉"/><Metric title="策略规则" value={rules.length} foot="本地配置" icon="◈"/></div><section className="panel"><div className="panel-head"><div><h2>最新查询</h2><p>最近的解析活动</p></div><button className="text-button blue" onClick={() => setPage('logs')}>查看全部 →</button></div><Logs rows={logs.slice(0, 7)}/></section><RegionStats regions={stats.regions}/></>}
         {page === 'logs' && <section className="panel"><div className="panel-head"><div><h2>查询活动</h2><p>最多显示最近 200 条</p></div><span className="pill">{logs.length} 条记录</span></div><Logs rows={logs}/></section>}
         {page === 'rules' && <><section className="panel"><div className="panel-head"><div><h2>规则列表</h2><p>本地记录优先，其次为过滤和条件转发</p></div><span className="pill">{rules.length} 条规则</span></div><div className="table-wrap"><table><thead><tr><th>类型</th><th>域名</th><th>记录 / 上游</th><th>TTL</th><th/></tr></thead><tbody>{rules.map(item => <tr key={item.id}><td><span className={`tag ${item.kind}`}>{kindName(item.kind)}</span></td><td className="strong">{item.domain}</td><td>{item.record_type ? `${item.record_type} · ${item.value}` : item.value || '—'}</td><td>{item.ttl || '—'}</td><td>{canEdit && <button className="text-button danger" onClick={() => run(() => api(`/rules/${item.id}`, token, { method: 'DELETE' }))}>删除</button>}</td></tr>)}{!rules.length && <Empty columns={5} text="暂无规则。添加记录或过滤规则开始使用。"/>}</tbody></table></div></section>{canEdit && <section className="panel form-panel"><div className="panel-head"><div><h2>新增规则</h2><p>变更后即时应用到新查询</p></div></div><form onSubmit={event => { event.preventDefault(); run(async () => { await api('/rules', token, { method: 'POST', body: JSON.stringify(rule) }); setRule({ kind: 'local', domain: '', record_type: 'A', value: '', ttl: 300 }) }) }} className="form-grid"><label>规则类型<select value={rule.kind} onChange={e => setRule({ ...rule, kind: e.target.value })}><option value="local">本地记录</option><option value="allow">白名单</option><option value="block">黑名单</option><option value="forward">条件转发</option></select></label><label>域名<input placeholder="example.com" value={rule.domain} onChange={e => setRule({ ...rule, domain: e.target.value })} required /></label>{rule.kind === 'local' && <label>记录类型<select value={rule.record_type} onChange={e => setRule({ ...rule, record_type: e.target.value })}><option>A</option><option>AAAA</option><option>CNAME</option><option>TXT</option></select></label>}{['local', 'forward'].includes(rule.kind) && <label>{rule.kind === 'forward' ? '上游地址' : '记录值'}<input placeholder={rule.kind === 'forward' ? '10.0.0.53:53' : '192.0.2.10'} value={rule.value} onChange={e => setRule({ ...rule, value: e.target.value })} required /></label>}{rule.kind === 'local' && <label>TTL（秒）<input type="number" min="1" max="86400" value={rule.ttl} onChange={e => setRule({ ...rule, ttl: Number(e.target.value) })}/></label>}<button className="btn primary" disabled={busy}>添加规则 →</button></form></section>}</>}

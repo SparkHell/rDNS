@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run a temporary local rDns instance through DNS and management requests."""
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import base64
 import http.server
@@ -44,7 +45,7 @@ def certificate(directory, name):
 
 
 def query(name, qtype=1):
-    labels = b"".join(bytes([len(label)]) + label.encode() for label in name.split("."))
+    labels = b"".join(bytes([len(label)]) + label.encode() for label in ([] if name == "." else name.rstrip(".").split(".")))
     return struct.pack("!HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + labels + b"\0" + struct.pack("!HH", qtype, 1)
 
 
@@ -126,8 +127,59 @@ def fake_forwarder(sock):
         sock.close()
 
 
+def check_tcp_fallback(base, token, dns_port):
+    settings = api(base, "/features", token=token)["settings"]
+    with socket.socket() as listener, socket.socket(type=socket.SOCK_DGRAM) as upstream:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(5)
+        upstream.bind(listener.getsockname())
+        upstream.settimeout(5)
+        api(base, "/rules", {"kind":"forward", "domain":"fallback.example", "value":f"127.0.0.1:{listener.getsockname()[1]}"}, token)
+        def serve(stall):
+            wire, peer = upstream.recvfrom(4096)
+            upstream.sendto(wire[:2] + struct.pack("!H", 0x8300) + wire[4:], peer)
+            with listener.accept()[0] as stream:
+                stream.settimeout(5)
+                assert read_exact(stream, int.from_bytes(read_exact(stream, 2), "big")) == wire
+                answer = wire[:2] + struct.pack("!5H", 0x8180, 1, 1, 0, 0) + wire[12:]
+                answer += b'\xc0\x0c' + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton("192.0.2.33")
+                stream.sendall(len(answer).to_bytes(2, "big") + (answer[:1] if stall else answer))
+                if stall:
+                    assert stream.recv(1) == b""
+        with ThreadPoolExecutor() as executor:
+            api(base, "/features", {**settings, "resolution":{**settings["resolution"], "priority_ms":0, "timeout_ms":500}}, token, "PUT")
+            try:
+                for stall in [False, True]:
+                    served = executor.submit(serve, stall)
+                    answer = udp(query("fallback.example"), dns_port, timeout=3)
+                    assert rcode(answer) == (2 if stall else 0)
+                    if not stall: assert socket.inet_aton("192.0.2.33") in answer
+                    served.result()
+            finally:
+                api(base, "/features", settings, token, "PUT")
+
+
+def check_connection_stop(base, token, packet, port_number, kind):
+    settings = api(base, "/listeners", token=token)["settings"]
+    with socket.create_connection(("127.0.0.1", port_number), timeout=3) as raw:
+        stream = ssl._create_unverified_context().wrap_socket(raw, server_hostname="localhost") if kind == "dot" else raw
+        with stream:
+            stream.sendall(len(packet).to_bytes(2, "big") + packet)
+            assert rcode(read_exact(stream, int.from_bytes(read_exact(stream, 2), "big"))) == 0
+            api(base, "/listeners", {**settings, kind:{**settings[kind], "enabled":False}}, token, "PUT")
+            try:
+                assert stream.recv(1) == b""
+            except (ConnectionResetError, ConnectionAbortedError, ssl.SSLEOFError):
+                pass
+    api(base, "/listeners", settings, token, "PUT")
+
+
 class FilterHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if getattr(self.server, "started", None) is not None:
+            self.server.started.set()
+            assert self.server.resume.wait(8)
         body = self.server.filter_body
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -158,7 +210,7 @@ def run():
         filter_thread.start()
         config = directory / "config.toml"
         config.write_text(
-            f'database = "{directory / "rdns.sqlite3"}"\n'
+            'database = "rdns.sqlite3"\n'
             f'dns_udp = "127.0.0.1:{dns_port}"\n'
             f'dns_tcp = "127.0.0.1:{dns_port}"\n'
             f'doh = "127.0.0.1:{doh_port}"\n'
@@ -166,7 +218,7 @@ def run():
             f'doq = "127.0.0.1:{doq_port}"\n'
             f'admin = "127.0.0.1:{admin_port}"\n'
             'allowed_clients = ["127.0.0.0/8"]\n'
-            f'certificate = "{live_cert}"\nprivate_key = "{live_key}"\nsubscription_ca = "{cert1}"\n',
+            f'certificate = "{live_cert.name}"\nprivate_key = "{live_key.name}"\nsubscription_ca = "{cert1.name}"\n',
             encoding="utf-8",
         )
         subprocess.run([str(BIN), "init-admin", str(config), "admin"], input=PASSWORD.encode(), check=True, stdout=subprocess.DEVNULL)
@@ -199,6 +251,9 @@ def run():
                 ]:
                     assert rcode(answer) == 0 and expected_ip in answer, f"{transport} local answer failed"
 
+                check_connection_stop(base, token, packet, dns_port, "dns_tcp")
+                check_connection_stop(base, token, packet, dot_port, "dot")
+                check_tcp_fallback(base, token, dns_port)
                 context = ssl._create_unverified_context()
                 request = urllib.request.Request(
                     f"https://127.0.0.1:{doh_port}/dns-query", data=packet,
@@ -241,7 +296,17 @@ def run():
                 expect_http_error(403, lambda: api(base, "/listeners", api(base, "/listeners", token=token)["settings"], viewer, method="PUT"))
 
                 sub = api(base, "/subscriptions", {"url": f"https://localhost:{list_port}/block.txt"}, token)["id"]
-                assert api(base, f"/subscriptions/{sub}/refresh", token=token, method="POST")["count"] == 1
+                filter_http.started, filter_http.resume = threading.Event(), threading.Event()
+                with ThreadPoolExecutor() as executor:
+                    refresh = executor.submit(api, base, f"/subscriptions/{sub}/refresh", None, token, "POST")
+                    try:
+                        assert filter_http.started.wait(4)
+                        api(base, "/rules", {"kind":"block","domain":"concurrent.example"}, token)
+                    finally:
+                        filter_http.resume.set()
+                    assert refresh.result()["count"] == 1
+                assert any(r["domain"] == "concurrent.example" for r in api(base, "/rules", token=token))
+                assert rcode(udp(query("concurrent.example"), dns_port)) == 3
                 assert rcode(udp(query("ads.subscription.invalid"), dns_port)) == 3
                 assert api(base, "/logs", token=token)[0]["outcome"] == "blocked"
                 assert api(base, "/logs", token=token)[0]["duration_ms"] >= 0
@@ -341,7 +406,7 @@ def listener_run():
         dns_port, admin_port, occupied_port = [port() for _ in range(3)]
         config = directory / "config.toml"
         config.write_text(
-            f'database = "{directory / "rdns.sqlite3"}"\n'
+            'database = "rdns.sqlite3"\n'
             f'admin = "127.0.0.1:{admin_port}"\n'
             'allowed_clients = ["127.0.0.0/8"]\n', encoding="utf-8",
         )

@@ -107,6 +107,14 @@ async fn require(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(unauthorized)?;
+    authorize(token, store, role).await
+}
+
+async fn authorize(
+    token: &str,
+    store: &Store,
+    role: &str,
+) -> Result<Account, (StatusCode, String)> {
     let account = store
         .account_for_token(token)
         .await
@@ -369,6 +377,30 @@ async fn websocket(State(state): State<ApiState>, upgrade: WebSocketUpgrade) -> 
     upgrade.on_upgrade(move |socket| websocket_session(state, socket))
 }
 
+async fn websocket_account(
+    socket: &mut WebSocket,
+    state: &ApiState,
+    token: &str,
+) -> Option<Account> {
+    match authorize(token, &state.engine.store, "viewer").await {
+        Ok(account) => Some(account),
+        Err((status, _)) => {
+            let code = if status == StatusCode::UNAUTHORIZED {
+                1008
+            } else {
+                1011
+            };
+            let _ = socket
+                .send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                    code,
+                    reason: "session unavailable".into(),
+                })))
+                .await;
+            None
+        }
+    }
+}
+
 async fn websocket_session(state: ApiState, mut socket: WebSocket) {
     let auth = tokio::time::timeout(Duration::from_secs(5), socket.next()).await;
     let Some(Ok(WsMessage::Text(text))) = auth.ok().flatten() else {
@@ -383,7 +415,7 @@ async fn websocket_session(state: ApiState, mut socket: WebSocket) {
     let Some(token) = value["token"].as_str() else {
         return;
     };
-    let Ok(Some(account)) = state.engine.store.account_for_token(token).await else {
+    let Some(account) = websocket_account(&mut socket, &state, token).await else {
         return;
     };
     let mut events = state.listeners.subscribe();
@@ -407,17 +439,6 @@ async fn websocket_session(state: ApiState, mut socket: WebSocket) {
     }
     if socket
         .send(WsMessage::Text(
-            json!({"type":"cache","stats":state.engine.cache_stats().await})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .is_err()
-    {
-        return;
-    }
-    if socket
-        .send(WsMessage::Text(
             state
                 .engine
                 .features
@@ -431,25 +452,22 @@ async fn websocket_session(state: ApiState, mut socket: WebSocket) {
     {
         return;
     }
-    let mut tick = tokio::time::interval(Duration::from_secs(3));
     loop {
         tokio::select! {
-            _ = tick.tick() => {
-                let status = json!({"type":"cache","stats":state.engine.cache_stats().await});
-                if socket.send(WsMessage::Text(status.to_string().into())).await.is_err() { return; }
-            }
             event = events.recv() => {
-                if let Ok(event) = event {
-                    let value: Value = serde_json::from_str(&event).unwrap_or_default();
-                    let event = if value["type"] == "features.changed" { state.engine.features.snapshot(account.role == "admin").await.to_string() } else { event };
-                    if socket.send(WsMessage::Text(event.into())).await.is_err() { return; }
-                }
+                let Some(account) = websocket_account(&mut socket, &state, token).await else { return; };
+                // Reconnecting delivers fresh snapshots if a slow subscriber missed an update.
+                let Ok(event) = event else { return; };
+                let value: Value = serde_json::from_str(&event).unwrap_or_default();
+                let event = if value["type"] == "features.changed" { state.engine.features.snapshot(account.role == "admin").await.to_string() } else { event };
+                if socket.send(WsMessage::Text(event.into())).await.is_err() { return; }
             }
             message = socket.next() => {
                 let Some(Ok(WsMessage::Text(text))) = message else { return; };
                 let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
                 if !["listeners.update", "cache.update", "features.update", "gfwlist.refresh", "geoip.refresh"].iter().any(|kind| value["type"] == *kind) { continue; }
                 let request_id = value["request_id"].clone();
+                let Some(account) = websocket_account(&mut socket, &state, token).await else { return; };
                 let result = if account.role == "admin" {
                     if value["type"] == "listeners.update" {
                         match serde_json::from_value::<ListenerSettings>(value["settings"].clone()) {
@@ -537,12 +555,14 @@ async fn add_rule(
     let account = require(&headers, &state.engine.store, "editor").await?;
     let input = Engine::validate_rule(&input)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let id = state
-        .engine
-        .store
-        .add_rule(&input)
-        .await
-        .map_err(internal)?;
+    let id = state.engine.store.add_rule(&input).await.map_err(|error| {
+        match error.as_database_error() {
+            Some(db) if db.is_unique_violation() => {
+                (StatusCode::CONFLICT, "rule already exists".into())
+            }
+            _ => internal(error),
+        }
+    })?;
     state.engine.reload_policy().await.map_err(internal)?;
     state
         .engine

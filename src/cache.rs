@@ -71,7 +71,9 @@ struct CachedEntry {
 pub struct PersistentCache {
     store: Store,
     settings: ArcSwap<CacheSettings>,
+    configuration: tokio::sync::RwLock<()>,
     memory: ArcSwap<Cache<String, Arc<CachedEntry>>>,
+    stats_sequence: AtomicU64,
     memory_hits: AtomicU64,
     disk_hits: AtomicU64,
     misses: AtomicU64,
@@ -84,7 +86,9 @@ impl PersistentCache {
         Ok(Arc::new(Self {
             store,
             memory: ArcSwap::from_pointee(memory_cache(settings.memory_mib)),
+            configuration: Default::default(),
             settings: ArcSwap::from_pointee(settings),
+            stats_sequence: AtomicU64::new(0),
             memory_hits: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -93,21 +97,28 @@ impl PersistentCache {
     pub fn settings(&self) -> CacheSettings {
         (*self.settings.load_full()).clone()
     }
-    pub async fn set_settings(&self, settings: CacheSettings) -> Result<()> {
+    pub async fn set_settings(
+        &self,
+        settings: CacheSettings,
+        publish: impl FnOnce(),
+    ) -> Result<()> {
         settings.validate()?;
+        let _guard = self.configuration.write().await;
         self.store.set_cache_settings(&settings).await?;
         self.memory
             .store(Arc::new(memory_cache(settings.memory_mib)));
         self.settings.store(Arc::new(settings));
+        publish();
         Ok(())
     }
     pub async fn stats(&self) -> serde_json::Value {
         let memory = self.memory.load();
         memory.run_pending_tasks();
         let (disk_entries, disk_bytes) = self.store.cache_stats().await.unwrap_or((0, 0));
-        serde_json::json!({"settings":self.settings(), "memory_bytes":memory.weighted_size(), "memory_entries":memory.entry_count(), "disk_entries":disk_entries, "disk_bytes":disk_bytes, "process_rss_bytes":process_rss_bytes(), "memory_hits":self.memory_hits.load(Ordering::Relaxed), "disk_hits":self.disk_hits.load(Ordering::Relaxed), "misses":self.misses.load(Ordering::Relaxed)})
+        serde_json::json!({"sample_id":self.stats_sequence.fetch_add(1, Ordering::Relaxed) + 1,"settings":self.settings(), "memory_bytes":memory.weighted_size(), "memory_entries":memory.entry_count(), "disk_entries":disk_entries, "disk_bytes":disk_bytes, "process_rss_bytes":process_rss_bytes(), "memory_hits":self.memory_hits.load(Ordering::Relaxed), "disk_hits":self.disk_hits.load(Ordering::Relaxed), "misses":self.misses.load(Ordering::Relaxed)})
     }
     pub async fn get(&self, key: &str, request_id: u16) -> Option<DnsResponse> {
+        let _guard = self.configuration.read().await;
         let now = Utc::now().timestamp();
         let (entry, from_disk) = match self.memory.load().get(key) {
             Some(entry) => (entry, false),
@@ -150,6 +161,7 @@ impl PersistentCache {
         Some(response)
     }
     pub async fn insert(&self, key: &str, response: &DnsResponse) {
+        let _guard = self.configuration.read().await;
         let settings = self.settings();
         let now = Utc::now().timestamp();
         let Some((kind, ttl)) = cache_ttl(response, &settings, now) else {
@@ -447,6 +459,40 @@ mod tests {
         assert!(answer.answers[0].ttl <= 90);
         assert!(restored.get("delegation-key", 23).await.is_some());
         assert_eq!(restored.stats().await["disk_hits"], 2);
+        // Pause an old-generation insert in SQLite after it selected the old TTL.
+        let blocker = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let writer_cache = restored.clone();
+        let original = answer_response.clone();
+        let writer = tokio::spawn(async move { writer_cache.insert("race", &original).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while restored.configuration.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let reconfigure = restored.set_settings(
+            CacheSettings {
+                answer_max_ttl: 2,
+                ..Default::default()
+            },
+            || {},
+        );
+        tokio::pin!(reconfigure);
+        assert!(futures::poll!(&mut reconfigure).is_pending());
+        blocker.rollback().await?;
+        writer.await?;
+        reconfigure.await?;
+        assert!(restored.get("race", 1).await.is_none());
+        assert!(
+            PersistentCache::new(store.clone())
+                .await?
+                .get("race", 2)
+                .await
+                .is_none()
+        );
+        restored.insert("race", &answer_response).await;
+        let (_, inserted, expires) = store.cache_entry("race").await?.unwrap();
+        assert_eq!(expires - inserted, 2);
         store.pool.close().await;
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
