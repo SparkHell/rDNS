@@ -38,6 +38,7 @@ struct Web;
 
 pub fn admin_router(state: ApiState) -> Router {
     Router::new()
+        .merge(crate::portal::admin_routes())
         .route("/api/v1/login", post(login))
         .route("/api/v1/logout", post(logout))
         .route("/api/v1/me", get(me))
@@ -86,7 +87,18 @@ pub fn admin_router(state: ApiState) -> Router {
 
 pub fn doh_router(state: ApiState) -> Router {
     Router::new()
-        .route("/dns-query", get(doh_get).post(doh_post))
+        .route("/{endpoint}", get(doh_get).post(doh_post))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::portal::identify_doh,
+        ))
+        .merge(crate::portal::routes())
+        .route("/portal", get(index))
+        .route("/portal/", get(index))
+        .route(
+            "/assets/{file}",
+            get(|Path(file): Path<String>| async move { serve(&format!("assets/{file}")) }),
+        )
         .with_state(state)
 }
 
@@ -97,7 +109,7 @@ fn internal(error: impl std::fmt::Display) -> (StatusCode, String) {
     tracing::error!(%error, "API failure");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
 }
-async fn require(
+pub(crate) async fn require(
     headers: &HeaderMap,
     store: &Store,
     role: &str,
@@ -121,8 +133,8 @@ async fn authorize(
         .map_err(internal)?
         .ok_or_else(unauthorized)?;
     let allowed = match role {
-        "viewer" => true,
-        "editor" => account.role != "viewer",
+        "viewer" => matches!(account.role.as_str(), "admin" | "editor" | "viewer"),
+        "editor" => matches!(account.role.as_str(), "admin" | "editor"),
         "admin" => account.role == "admin",
         _ => false,
     };
@@ -876,6 +888,7 @@ struct DohQuery {
 }
 async fn doh_get(
     State(state): State<ApiState>,
+    axum::Extension(user): axum::Extension<Option<i64>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(input): Query<DohQuery>,
@@ -886,10 +899,11 @@ async fn doh_get(
     let forwarded = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok());
-    doh_answer(state, peer, forwarded, &wire).await
+    doh_answer(state, peer, user, forwarded, &wire).await
 }
 async fn doh_post(
     State(state): State<ApiState>,
+    axum::Extension(user): axum::Extension<Option<i64>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
@@ -904,11 +918,12 @@ async fn doh_post(
     let forwarded = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok());
-    doh_answer(state, peer, forwarded, &body).await
+    doh_answer(state, peer, user, forwarded, &body).await
 }
 async fn doh_answer(
     state: ApiState,
     peer: SocketAddr,
+    user: Option<i64>,
     forwarded: Option<&str>,
     wire: &[u8],
 ) -> Response {
@@ -924,7 +939,7 @@ async fn doh_answer(
         .client_ip(peer.ip(), forwarded);
     match state
         .engine
-        .answer(wire, SocketAddr::new(ip, peer.port()), "doh")
+        .answer_for(wire, SocketAddr::new(ip, peer.port()), "doh", user)
         .await
     {
         Ok(answer) => (

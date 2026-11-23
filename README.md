@@ -59,6 +59,16 @@ Duplicate allow/block rules and identical forwarding targets return HTTP 409. On
 Remote filter lists accept one domain per line, `0.0.0.0 domain`, `127.0.0.1 domain`, and Adblock `||domain^` entries. Unsupported list rules are ignored. Updates are size limited to 10 MiB and applied only after successful retrieval and parsing. The background refresher runs hourly; manual refresh is available in the console.
 For an internal HTTPS list, set `subscription_ca` to the PEM CA certificate that signed its server certificate. TLS verification remains enabled.
 
+## User portal and personal DoH
+
+Enable the HTTPS DoH listener, then open `/portal` on its public origin. New installations and upgrades start with open registration and the shared `/dns-query` endpoint enabled. In the management console, **用户门户** controls the registration policy (open, approval required, or closed), the public endpoint, providers and users. Closing registration allows existing members to keep signing in. Management accounts and portal accounts use separate sessions and permissions.
+
+Each active member can copy a unique `/dns-<22 characters>` URL and rotate it. The suffix is case-sensitive and consists of uniformly random ASCII letters and digits. A personal URL is a bearer credential for DNS queries; configure reverse-proxy access logs to redact these paths and OAuth callback query strings. Protect the service database and its backups, which contain recoverable personal addresses and provider client secrets. A rotation immediately invalidates the old URL. Disabling a user also revokes their sessions. All DoH requests remain subject to the configured CIDR and region policies.
+
+For external sign-in, configure the public HTTPS origin and register its exact `/portal/callback/<provider-id>` URL shown in the console with the provider. OIDC uses issuer discovery and signed ID tokens. For generic OAuth 2.0, configure the authorization, token and user profile endpoints, scopes, client authentication method, and a stable user ID field (top-level key or JSON Pointer). Providers must support authorization code with S256 PKCE. The portal accepts credentials over HTTPS and loads platform trust roots for enterprise providers. Provider IDs and stable identity mappings identify accounts; email addresses are never used for automatic linking.
+
+Members can inspect their own 24-hour, 7-day or 30-day query history within the configured retention period. Administrators can filter analytics by member and entry point. Pre-upgrade rows remain historical. Rotating a URL preserves its member's history.
+
 ## DoH upstream pools and parallel resolution
 
 In **解析上游**, create named groups containing one or more HTTPS DoH endpoints. Requests rotate among endpoints; failures try other sources and mark the failed source for a 30-second cooldown. Active sources are preferred, while an all-failed group can still be retried. Connections are pooled. Each group has a total query budget; endpoint attempts share that budget so one stalled source cannot consume all retry time.

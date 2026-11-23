@@ -5,6 +5,7 @@ mod config;
 mod features;
 mod geoip;
 mod gfwlist;
+mod portal;
 mod query_log;
 mod resolver;
 mod runtime;

@@ -7,6 +7,7 @@ use std::sync::{
 use tokio::sync::{mpsc, oneshot};
 
 pub struct QueryLogEntry {
+    pub user_id: Option<i64>,
     pub at: String,
     pub client: String,
     pub domain: String,
@@ -52,7 +53,7 @@ impl QueryLog {
                 if count > 0 {
                     let started = std::time::Instant::now();
                     let mut query = QueryBuilder::new(
-                        "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol,duration_ms,country,province,city,upstream) ",
+                        "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol,duration_ms,country,province,city,upstream,portal_user_id,entry) ",
                     );
                     query.push_values(entries, |mut row, e| {
                         row.push_bind(&e.at)
@@ -65,7 +66,15 @@ impl QueryLog {
                             .push_bind(&e.country)
                             .push_bind(&e.province)
                             .push_bind(&e.city)
-                            .push_bind(&e.upstream);
+                            .push_bind(&e.upstream)
+                            .push_bind(e.user_id)
+                            .push_bind(if e.user_id.is_some() {
+                                "personal"
+                            } else if e.protocol == "doh" {
+                                "public"
+                            } else {
+                                e.protocol.as_str()
+                            });
                     });
                     if let Err(error) = query.build().execute(&pool).await {
                         worker_metrics

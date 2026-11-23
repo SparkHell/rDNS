@@ -20,12 +20,14 @@ hickory-proto = "=0.26.3"
 hickory-resolver = { version = "=0.26.3", features = ["recursor", "dnssec-ring", "tokio"] }
 ipnet = { version = "2", features = ["serde"] }
 moka = { version = "0.12", features = ["sync"] }
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
 quinn = "0.11"
 rand = "0.8"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "stream", "socks"] }
 rust-embed = "8"
 rustls = "0.23"
+rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -119,6 +119,7 @@ impl Store {
                     .await?;
             }
         }
+        crate::portal::migrate(&pool).await?;
         Ok(Self {
             query_log: crate::query_log::QueryLog::new(pool.clone()),
             pool,
@@ -551,6 +552,12 @@ impl Store {
             .bind(Utc::now().to_rfc3339())
             .execute(&self.pool)
             .await?;
+        sqlx::query("DELETE FROM portal_sessions WHERE expires<=unixepoch()")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM portal_flows WHERE expires<=unixepoch()")
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM cache_entries WHERE expires_at<=?")
             .bind(Utc::now().timestamp())
             .execute(&self.pool)
@@ -591,6 +598,7 @@ mod tests {
                 qtype: "A".into(),
                 outcome: "local".into(),
                 protocol: "udp".into(),
+                user_id: None,
                 duration_ms: 0.125,
                 country: None,
                 province: None,

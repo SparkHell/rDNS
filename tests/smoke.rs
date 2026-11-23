@@ -77,3 +77,13 @@ fn run_smoke(live: bool, release: bool) {
         .expect("launch local smoke script");
     assert!(result.success(), "local smoke script failed");
 }
+
+#[test]
+fn personal_doh_and_identity_providers() {
+    let result = Command::new("python3")
+        .arg("tests/portal_smoke.py")
+        .env("RDNS_BIN", env!("CARGO_BIN_EXE_rdns"))
+        .status()
+        .expect("launch portal smoke script");
+    assert!(result.success(), "personal DoH smoke failed");
+}

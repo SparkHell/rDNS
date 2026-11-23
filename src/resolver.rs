@@ -206,6 +206,16 @@ impl Engine {
     }
 
     pub async fn answer(&self, wire: &[u8], peer: SocketAddr, protocol: &str) -> Result<Vec<u8>> {
+        self.answer_for(wire, peer, protocol, None).await
+    }
+
+    pub async fn answer_for(
+        &self,
+        wire: &[u8],
+        peer: SocketAddr,
+        protocol: &str,
+        user_id: Option<i64>,
+    ) -> Result<Vec<u8>> {
         let started = Instant::now();
         let request = Message::from_vec(wire).context("invalid DNS message")?;
         let mut response = response(&request, ResponseCode::NoError);
@@ -405,6 +415,7 @@ impl Engine {
             .query_log
             .push(crate::query_log::QueryLogEntry {
                 at: chrono::Utc::now().to_rfc3339(),
+                user_id,
                 client: peer.ip().to_string(),
                 domain,
                 qtype: kind,
