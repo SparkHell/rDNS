@@ -7,7 +7,7 @@ const [base, token, screenshot] = process.argv.slice(2)
 const browser = await chromium.launch({ executablePath: '/bin/chromium', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] })
 try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 })
-  await page.goto(base)
+  await page.goto(base + '/admin')
   await page.evaluate(value => sessionStorage.setItem('rdns-token', value), token)
   await page.reload()
   await page.getByText('从根开始，可信解析。').waitFor()
@@ -17,9 +17,10 @@ try {
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)
   if (overflow) throw new Error('mobile dashboard has horizontal overflow')
   await page.setViewportSize({ width: 1440, height: 900 })
-  await page.getByRole('button', { name: '解析与过滤' }).click()
+  await page.getByRole('button', { name: '解析规则' }).click()
   await page.getByText('internal.example').waitFor()
-  await page.getByRole('button', { name: '监听服务' }).click()
+  await page.getByRole('button', { name: '高级设置', exact: true }).click()
+    await page.getByRole('button', { name: '监听服务' }).click()
   await page.getByText('协议监听').waitFor()
   await page.screenshot({ path: screenshot.replace(/\.png$/, '-listeners.png'), fullPage: true })
   const wsResult = await page.evaluate(token => new Promise((resolve, reject) => {
@@ -45,7 +46,7 @@ try {
     socket.onerror = () => { clearTimeout(timer); reject(new Error('listener WebSocket failed')) }
   }), token)
   if (!wsResult) throw new Error('listener update was not acknowledged')
-  await page.getByRole('button', { name: '缓存' }).click()
+  await page.getByRole('button', { name: '缓存预热' }).click()
   await page.getByText('递归缓存').waitFor()
   await page.getByLabel('热点内存预算（MiB）').waitFor()
   await page.screenshot({ path: screenshot.replace(/\.png$/, '-cache.png'), fullPage: true })
@@ -60,6 +61,7 @@ try {
   const occupied = dgram.createSocket('udp4')
   await new Promise(resolve => occupied.bind(0, '127.0.0.1', resolve))
   try {
+    await page.getByRole('button', { name: '高级设置', exact: true }).click()
     await page.getByRole('button', { name: '监听服务' }).click()
     await page.getByLabel('DNS · UDP 监听地址').fill(`127.0.0.1:${occupied.address().port}`)
     await page.getByRole('button', { name: '保存并应用' }).click()

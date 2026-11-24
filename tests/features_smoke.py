@@ -71,6 +71,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Keep only the question: EDNS follows it on validating requests.
         question = packet[12:p+5]
         self.server.questions[question] += 1
+        fixture = next((name for name in (b'prefetch-fixture', b'coalesce-fixture') if name in question), None)
+        attempt = self.server.questions[question]
+        if fixture == b'prefetch-fixture' and attempt == 2:
+            self.server.prefetch_started.set()
+            assert self.server.release_prefetch.wait(.8)
+        if fixture == b'coalesce-fixture':
+            time.sleep(.18)
         if qtype == 28:
             value = socket.inet_pton(socket.AF_INET6, '2001:db8::1')
         elif qtype == 65:
@@ -79,8 +86,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             value = b'\x02ns\x04test\0'
         else:
             value = socket.inet_aton('198.51.100.21' if self.path == '/one' else '198.51.100.22')
+        if fixture == b'prefetch-fixture':
+            value = socket.inet_aton('192.0.2.90' if attempt == 1 else '192.0.2.91')
+        ttl = 10 if fixture == b'prefetch-fixture' else 2 if b'radar-hot' in question else 60
         answer = packet[:2] + struct.pack('!5H', 0x81a0, 1, 1, 0, 0) + question
-        answer += b'\xc0\x0c' + struct.pack('!HHIH', qtype, 1, 60, len(value)) + value
+        answer += b'\xc0\x0c' + struct.pack('!HHIH', qtype, 1, ttl, len(value)) + value
         self.send_response(200)
         self.send_header('Content-Type', 'application/dns-message')
         self.send_header('Content-Length', str(len(answer)))
@@ -115,7 +125,7 @@ class Proxy(socketserver.BaseRequestHandler):
             header = b''
             while not header.endswith(b'\r\n\r\n'):
                 header += read_exact(stream, 1)
-            assert header.startswith(b'CONNECT localhost:')
+            assert header.startswith((b'CONNECT localhost:', b'CONNECT www.cloudflare.com:443 '))
             self.server.requests.append(header.split(b'\r\n')[0].decode())
             stream.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
         else:
@@ -125,7 +135,7 @@ class Proxy(socketserver.BaseRequestHandler):
             stream.sendall(b'\x05\x00')
             assert read_exact(stream, 4) == b'\x05\x01\x00\x03', 'SOCKS must resolve the domain at the proxy'
             host = read_exact(stream, read_exact(stream, 1)[0]).decode()
-            assert host == 'localhost'
+            assert host in ['localhost','www.cloudflare.com']
             read_exact(stream, 2)
             self.server.requests.append(host)
             stream.sendall(b'\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00')
@@ -141,7 +151,7 @@ class ProxyServer(socketserver.ThreadingTCPServer):
 def run():
     with tempfile.TemporaryDirectory(prefix='rdns-features-') as tmp:
         directory = Path(tmp)
-        cert, key = certificate(directory, 'localhost')
+        cert, key = certificate(directory, 'localhost','DNS:localhost,DNS:www.cloudflare.com')
         dns_port, admin_port, doh_port = port(), port(), port()
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         server.counts = Counter()
@@ -191,6 +201,14 @@ def run():
                     time.sleep(.05)
             else:
                 raise AssertionError('service did not start')
+            for proxy in proxies:
+                address=f'{proxy.kind}://127.0.0.1:{proxy.server_address[1]}'
+                assert api(base,'/proxy/test',{'address':address},token)['elapsed_ms'] >= 0
+                assert 'www.cloudflare.com' in proxy.requests[-1]
+                proxy.requests.clear()
+            assert api(base,'/features',token=token)['settings']['proxy_url'] == ''
+            expect_http_error(400, lambda: api(base,'/proxy/test',{'address':''},token))
+            expect_http_error(502, lambda: api(base,'/proxy/test',{'address':'http://127.0.0.1:1'},token))
             migrated = api(base, '/rules', token=token)
             assert sorted(r['id'] for r in migrated) == [1, 3, 5, 7], migrated
             for rule in migrated:
@@ -213,6 +231,18 @@ def run():
             settings['resolution'].update(mode='doh', group='default', validate_dnssec=False)
             settings['gfwlist'].update(url=base_upstream+'/list', group='special')
             settings['geo'].update(ipv4_url=base_upstream+'/v4', ipv6_url=base_upstream+'/v6')
+            save()
+            # Real stored configuration: the group name has two trailing spaces.
+            settings['groups'][0]['name'] = 'default  '
+            settings['gfwlist'].update(enabled=True,group='default')
+            settings['resolution'].update(mode='recursive',group='default')
+            canonical = save()['settings']
+            assert canonical['groups'][0]['name'] == canonical['gfwlist']['group'] == 'default'
+            with closing(sqlite3.connect(directory/'db.sqlite3')) as db:
+                assert json.loads(db.execute("SELECT value FROM runtime_settings WHERE key='features'").fetchone()[0])['groups'][0]['name'] == 'default'
+            settings['groups'][0]['name'] = 'default'
+            settings['gfwlist'].update(enabled=False,group='special')
+            settings['resolution']['mode'] = 'doh'
             save()
             for i in range(4):
                 answer = udp(query(f'rr{i}.test'), dns_port)
@@ -240,6 +270,56 @@ def run():
                     samples.sort()
                     print(f'{name} UDP milliseconds (500 sequential): P95={samples[474]:.3f} P99={samples[494]:.3f}')
                 return
+            # Raising or lowering background concurrency preserves an already warm cache.
+            snapshot = api(base, '/cache', token=token)
+            changed = {**snapshot['settings'], 'background_concurrency':1, 'refresh_ttl_min_pct':40, 'refresh_ttl_max_pct':50}
+            assert api(base,'/cache',changed,token,'PUT')['settings']['background_concurrency']==1
+            assert api(base, '/cache', token=token)['disk_entries'] >= snapshot['disk_entries']
+            expect_http_error(400, lambda: api(base,'/cache',dict(changed,background_concurrency=0),token,'PUT'))
+            server.prefetch_started, server.release_prefetch = threading.Event(),threading.Event()
+            packet = query('prefetch-fixture.test')
+            old, new = socket.inet_aton('192.0.2.90'),socket.inet_aton('192.0.2.91')
+            inserted=time.monotonic()
+            assert udp(packet,dns_port).endswith(old)
+            assert server.questions[packet[12:]]==1
+            # This instance is configured to refresh between 4 and 5 seconds.
+            time.sleep(max(0,inserted+5.15-time.monotonic()))
+            try:
+                assert udp(packet,dns_port).endswith(old)
+                assert server.prefetch_started.wait(.45), 'late cache hit did not go to the upstream'
+                assert udp(packet,dns_port).endswith(old)
+                assert rcode(udp(query('foreground-while-refreshing.test'),dns_port))==0
+            finally:
+                server.release_prefetch.set()
+            for _ in range(30):
+                if udp(packet,dns_port).endswith(new): break
+                time.sleep(.02)
+            else: raise AssertionError('refresh did not publish fresh DNS data')
+            assert server.questions[packet[12:]]==2
+
+            shared=query('coalesce-fixture.test')
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                assert all(rcode(response)==0 for response in executor.map(lambda _:udp(shared,dns_port), range(10)))
+            assert server.questions[shared[12:]]==1, 'concurrent cache misses did not share a lookup'
+            # Local-only warmup uses actual queries and retains the requested RR type.
+            local_warm = dict(ns=False,radar=False,regions=[],local_hot_enabled=True,
+                              warm_domain_limit=1,local_window_hours=1,local_min_queries=12)
+            local_packet=query('local-favorite.test',65)
+            for _ in range(14):
+                assert rcode(udp(local_packet,dns_port))==0
+            for _ in range(60):
+                if sum(row['domain']=='local-favorite.test' for row in api(base,'/logs',token=token))>=14:break
+                time.sleep(.05)
+            else: raise AssertionError('client query log did not persist')
+            api(base,'/cache/automation',local_warm,token,'PUT')
+            for _ in range(60):
+                candidates=api(base,'/cache',token=token)['automation']['warm_candidates']
+                if candidates and candidates['local_domains']==1:break
+                time.sleep(.05)
+            else: raise AssertionError('local hot data not admitted to warmup')
+            assert candidates['public_domains']==0
+            assert candidates['local_preview']==[{'domain':'local-favorite.test','count':14,'kinds':['HTTPS']}],candidates
+            api(base,'/cache/automation',dict(local_warm,local_hot_enabled=False,warm_domain_limit=1000,local_window_hours=24,local_min_queries=3),token,'PUT')
             https = udp(query('ech.test', 65), dns_port)
             assert rcode(https) == 0 and b'ech' in https, 'HTTPS/ECH record lost'
 
@@ -310,10 +390,25 @@ def run():
 
             settings['gfwlist']['enabled'] = False
             for proxy in proxies:
-                settings['groups'][0] = group('default', ['/two'], f'{proxy.kind}://127.0.0.1:{proxy.server_address[1]}')
+                settings['proxy_url'] = f'{proxy.kind}://127.0.0.1:{proxy.server_address[1]}'
+                settings['groups'][0] = dict(group('default', ['/two']),use_proxy=True)
                 save()
                 assert rcode(udp(query(f'{proxy.kind}.test'), dns_port)) == 0
                 assert proxy.requests, f'{proxy.kind} proxy was bypassed'
+            server.resources['/proxy-ads'] = b'||ads.test^'
+            settings['adguard']['urls'] = [base_upstream+'/proxy-ads']*2
+            settings['gfwlist']['url'] = base_upstream+'/list'
+            previous = settings['gfwlist'].copy()
+            custom = api(base,'/subscriptions',{'url':base_upstream+'/proxy-ads'},token)['id']
+            for enabled in [True,False]:
+                settings['proxy_subscriptions'] = enabled
+                save()
+                for route,payload in [('adguard',{}),('gfwlist',{}),('geoip',{'ip_version':4}),('geoip',{'ip_version':6}),(f'subscriptions/{custom}',{})]:
+                    count = len(proxy.requests)
+                    api(base,'/'+route+'/refresh',payload,token)
+                    assert (len(proxy.requests)>count) == enabled, (route,payload,enabled)
+            api(base,f'/subscriptions/{custom}',token=token,method='DELETE')
+            settings['gfwlist'].update(previous)
             settings['groups'][0] = group('default', ['/fail', '/two'])
             save()
             assert rcode(udp(query('failover.test'), dns_port)) == 0
@@ -412,16 +507,42 @@ def run():
                 except OSError: pass
                 time.sleep(.05)
             else: raise AssertionError('settings were not persisted')
-            for _ in range(100):
-                if ('DNS startup warmup finished' in (directory/'server.log').read_text()
-                        and server.questions[hot[12:]] == 2 and server.questions[seed[12:]] == 1):
-                    break
+            automation = api(base, '/cache', token=token)['automation']
+            assert automation['settings'] == {'ns': False, 'radar': False, 'global_top_1000': False, 'regions': [], 'local_hot_enabled':False, 'warm_domain_limit':1000,'local_window_hours':24,'local_min_queries':3}
+            assert server.questions[hot[12:]] == 1 and server.questions[seed[12:]] == 0
+            options = dict(ns=False, radar=False, regions=['TW','US'])
+            def configure(options, actor=token): return api(base, '/cache/automation', options, actor, 'PUT')['automation']
+            expect_http_error(403, lambda: configure(options, viewer))
+            expect_http_error(400, lambda: configure(dict(options,ns=True)))
+            expect_http_error(400, lambda: configure(dict(options,radar=True)))
+            assert configure(dict(options,token='local-test-token'))['token_configured']
+            with closing(sqlite3.connect(directory/'db.sqlite3')) as db, db:
+                for region in options['regions']:
+                    db.execute('INSERT INTO radar_rankings(region,domains,attempted_at) VALUES(?,?,?)',
+                               (region,json.dumps(['radar-hot.test']),int(time.time())))
+                snapshot = dict(version=1,hosts={'radar-hot.test':['cdn.radar-hot.test']},updated_at=int(time.time()),attempted_at=int(time.time()),error=None)
+                db.execute("INSERT INTO runtime_settings(key,value) VALUES('umbrella_hosts',?)",(json.dumps(snapshot),))
+            before_logs = api(base, '/stats', token=token)['total']
+            result = configure(dict(options,radar=True))
+            assert 'local-test-token' not in json.dumps(result)
+            for _ in range(120):
+                if all(server.questions[query(name,kind)[12:]] >= 2 for kind in [1,28] for name in ['radar-hot.test','cdn.radar-hot.test']): break
                 time.sleep(.05)
-            else: raise AssertionError('startup lookups did not reach the DoH upstream')
-            for packet in [hot, seed]:
-                before = server.questions[packet[12:]]
-                assert rcode(udp(packet, dns_port)) == 0
-                assert server.questions[packet[12:]] == before, 'first client query missed warmed cache'
+            else: raise AssertionError('saved regional rankings did not warm A and AAAA at TTL expiry')
+            assert api(base, '/stats', token=token)['total'] == before_logs
+            assert not configure(dict(options,token=''))['token_configured']
+            settings['adguard'].update(enabled=True,urls=[base_upstream+'/ads',base_upstream+'/hosts'])
+            server.resources.update({'/ads':b'||ad.test^\n@@||ok.ad.test^','/hosts':b'0.0.0.0 tracker.test'})
+            save()
+            api(base, '/adguard/refresh', {}, token)
+            assert rcode(udp(query('child.ad.test'), dns_port)) == 3
+            assert rcode(udp(query('ok.ad.test'), dns_port)) == 0
+            assert rcode(udp(query('tracker.test'), dns_port)) == 3
+            server.resources['/hosts'] = b'invalid'
+            expect_http_error(502, lambda: api(base,'/adguard/refresh',{},token))
+            assert rcode(udp(query('tracker.test'), dns_port)) == 3
+            settings['adguard']['enabled'] = False
+            save()
             assert status()['gfwlist']['count'] == old_count
             assert api(base, '/geoip/lookup', {'ip':'8.8.8.8'}, token)['location']['country_code'] == 'CN'
             # The scheduler must refresh a due source on startup without a manual request.

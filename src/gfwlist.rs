@@ -8,17 +8,23 @@ use std::collections::HashSet;
 #[serde(default, deny_unknown_fields)]
 pub struct GfwSettings {
     pub enabled: bool,
+    #[serde(skip_serializing)]
+    pub use_proxy: bool,
     pub url: String,
     pub update_hours: u64,
     pub group: String,
+    #[serde(skip_serializing)]
+    pub proxy: String,
 }
 impl Default for GfwSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            use_proxy: false,
             url: "https://cdn.jsdelivr.net/gh/gfwlist/gfwlist@master/gfwlist.txt".into(),
             update_hours: 6,
             group: "default".into(),
+            proxy: String::new(),
         }
     }
 }

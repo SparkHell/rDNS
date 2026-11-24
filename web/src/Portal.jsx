@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import './portal.css'
 
 async function request(path, { method = 'GET', body, token } = {}) {
@@ -270,8 +270,20 @@ export function Portal() {
     [options, setOptions] = useState(null),
     [error, setError] = useState(''),
     [busy, setBusy] = useState(false)
-  const [signup, setSignup] = useState(false),
-    [copied, setCopied] = useState(false)
+  const [method, setMethod] = useState('password')
+  const [copied, setCopied] = useState(false)
+  const [iosQr, setIosQr] = useState(null)
+  useEffect(() => {
+    if (!iosQr) return
+    const timer = setTimeout(() => setIosQr(null), iosQr.expires_in * 1000)
+    return () => clearTimeout(timer)
+  }, [iosQr])
+  function showIosQr() {
+    action(async () => {
+      setIosQr(null)
+      setIosQr(await request(memberAPI + '/ios-qr', { method: 'POST' }))
+    })
+  }
   async function load() {
     const [o, u] = await Promise.all([
       request(memberAPI + '/options'),
@@ -283,6 +295,7 @@ export function Portal() {
     setOptions(o)
     setUser(u)
     setCopied(false)
+    setIosQr(null)
   }
   useEffect(() => {
     document.title = 'rDns · 用户门户'
@@ -298,6 +311,14 @@ export function Portal() {
     } finally {
       setBusy(false)
     }
+  }
+  const passwordEnabled = options?.password_login !== false
+  const registerEnabled = passwordEnabled && options?.registration !== 'closed'
+  const signup = method === 'register' && registerEnabled
+  const emailSelected = options?.email && (method === 'email' || !passwordEnabled)
+  function selectMethod(next) {
+    setMethod(next)
+    setError('')
   }
   const address = user?.path ? (user.base || location.origin) + user.path : ''
   return (
@@ -328,7 +349,12 @@ export function Portal() {
       ) : !user ? (
         <section className="panel portal-login">
           <h1>{signup ? '注册账户' : '登录用户门户'}</h1>
-          <form
+          <div className="portal-methods">
+            {passwordEnabled && <button type="button" aria-pressed={!signup && !emailSelected} onClick={()=>selectMethod('password')}>账号登录</button>}
+            {options.email && <button type="button" aria-pressed={Boolean(emailSelected)} onClick={()=>selectMethod('email')}>邮箱验证码登录</button>}
+            {registerEnabled && <button type="button" aria-pressed={signup} onClick={()=>selectMethod('register')}>注册新账号</button>}
+          </div>
+          {passwordEnabled && !emailSelected && <form
             className="login-form"
             onSubmit={(e) => {
               e.preventDefault()
@@ -355,19 +381,9 @@ export function Portal() {
             <button disabled={busy} className="btn primary">
               {signup ? '创建账户' : '登录'}
             </button>
-          </form>
-          {options.registration !== 'closed' && (
-            <button
-              className="text-button blue"
-              onClick={() => {
-                setSignup(!signup)
-                setError('')
-              }}
-            >
-              {signup ? '已有账号，去登录' : '注册新账号'}
-            </button>
-          )}
-          {options.email && <EmailLogin busy={busy} action={action} load={load} />}
+          </form>}
+          {!passwordEnabled && !options.email && options.providers.length === 0 && <p>管理员暂未启用门户登录方式。</p>}
+          {emailSelected && <EmailLogin busy={busy} action={action} load={load} />}
           {options.providers.map((p) => (
             <a className="btn tertiary" key={p.id} href={'/portal/auth/' + p.id}>
               使用 {p.label} 登录
@@ -400,6 +416,9 @@ export function Portal() {
                   <a className="btn tertiary" href={memberAPI + '/rdns.mobileconfig'}>
                     下载 iOS 描述文件
                   </a>
+                  <button type="button" className="btn tertiary" disabled={busy} onClick={showIosQr}>
+                    {iosQr ? '重新生成 iOS 二维码' : '扫码安装 iOS 描述文件'}
+                  </button>
                   <button
                     disabled={busy}
                     className="btn tertiary"
@@ -414,6 +433,15 @@ export function Portal() {
                     更换地址
                   </button>
                 </div>
+                {iosQr && <section className="ios-profile-qr" aria-label="iOS 描述文件二维码">
+                  <img src={iosQr.image} width="240" height="240" alt="用 iPhone 相机扫描以下载 iOS 描述文件"/>
+                  <div>
+                    <h3>用 iPhone 相机扫码</h3>
+                    <p>打开扫码链接并允许下载，然后前往「设置 → 已下载描述文件 → 安装」。</p>
+                    <p>二维码 5 分钟内有效，下载后失效。</p>
+                    <a href={iosQr.url} className="text-button blue">打开扫码下载链接</a>
+                  </div>
+                </section>}
                 <p>在 iPhone 的“设置”中安装下载的描述文件。更换专属地址后，请重新下载并安装。</p>
               </>
             ) : (
@@ -433,6 +461,7 @@ export function Portal() {
 }
 
 const providerDefaults = {
+  enabled: true,
   id: '',
   label: '',
   kind: 'oidc',
@@ -448,10 +477,11 @@ const providerDefaults = {
 }
 function MailSettings({ mail, update }) {
   return <fieldset>
-    <legend>邮箱验证码登录</legend>
+    <legend>邮箱验证码</legend>
     <label className="portal-check"><input type="checkbox" checked={mail.enabled}
       onChange={(e) => update({ enabled: e.target.checked, port: mail.port || 465 })} />启用邮箱登录</label>
-    {mail.enabled && <div className="portal-fields">
+    {mail.enabled && <><div className="portal-fields"><label>允许登录的邮箱后缀<input required value={mail.domains || ''} placeholder="example.com" onChange={e=>update({domains:e.target.value})}/><small>填写域名，多个用逗号或空格分隔。只接受精确匹配的邮箱。</small></label></div>
+      <details className="smtp-settings" open={!mail.host || undefined}><summary>SMTP 发信设置</summary><div className="portal-fields">
       <label>SMTP 加密方式<select value={mail.starttls ? 'starttls' : 'tls'}
         onChange={(e) => update({ starttls: e.target.value === 'starttls', port: e.target.value === 'starttls' ? 587 : 465 })}>
         <option value="tls">隐式 TLS</option><option value="starttls">STARTTLS</option>
@@ -459,13 +489,12 @@ function MailSettings({ mail, update }) {
       {[
         ['host', 'SMTP 主机', 'text'], ['port', '端口', 'number'], ['sender', '发件邮箱', 'email'],
         ['username', 'SMTP 用户名', 'text'], ['password', 'SMTP 密码', 'password'],
-        ['domains', '允许的邮箱域名（精确匹配，多个用空格或英文逗号分隔）', 'text'],
       ].map(([key, label, type]) => <label key={key}>{label}
         <input type={type} value={mail[key] || ''} required={!['username','password'].includes(key)}
-          placeholder={key === 'password' ? '已保存的密码留空沿用' : key === 'domains' ? 'example.com' : ''}
+          placeholder={key === 'password' ? '已保存的密码留空沿用' : ''}
           onChange={(e) => update({ [key]: key === 'port' ? Number(e.target.value) : e.target.value })} />
       </label>)}
-    </div>}
+    </div></details></>}
   </fieldset>
 }
 
@@ -487,16 +516,11 @@ function ProviderForm({ base, provider, update, remove }) {
   ]
   return (
     <fieldset className="portal-provider">
-      <legend>{provider.label || '身份提供方'}</legend>
+      <legend>{provider.kind === 'oidc' ? 'OpenID Connect' : 'OAuth 2.0'}{provider.label && ' · '+provider.label}</legend>
+      <label className="portal-check"><input type="checkbox" checked={provider.enabled} onChange={e=>update({enabled:e.target.checked})}/>允许通过此提供方登录</label>
+      <details open={!provider.id || undefined}><summary>提供方连接设置</summary>
       {base && provider.id && <p>登录回调地址 <code>{base.replace(/\/$/,'')}/portal/callback/{provider.id}</code></p>}
       <div className="portal-fields">
-        <label>
-          协议
-          <select value={provider.kind} onChange={(e) => update({ kind: e.target.value })}>
-            <option value="oidc">OpenID Connect</option>
-            <option value="oauth">OAuth 2.0</option>
-          </select>
-        </label>
         {fields.map(([k, label]) => (
           <label key={k}>
             {label}
@@ -523,9 +547,13 @@ function ProviderForm({ base, provider, update, remove }) {
       </div>
       <button type="button" className="text-button danger" onClick={remove}>
         移除此提供方
-      </button>
+      </button></details>
     </fieldset>
   )
+}
+function loginMethodLabel(user) {
+  if (user.email_login) return '邮箱验证码'
+  return user.external ? '第三方' : '本地'
 }
 export function PortalAdmin({ token }) {
   const [cfg, setCfg] = useState(null),
@@ -533,6 +561,21 @@ export function PortalAdmin({ token }) {
     [error, setError] = useState(''),
     [notice, setNotice] = useState(''),
     [busy, setBusy] = useState(false)
+  const [search, setSearch] = useState('')
+  const [filter, setFilter] = useState('')
+  const [editor, setEditor] = useState(null)
+  const nameInput = useRef(null)
+  useEffect(() => {
+    if (editor) nameInput.current?.focus()
+  }, [editor])
+  const [userPage, setUserPage] = useState(1)
+  const term = search.trim().toLowerCase()
+  const matches = users.filter(user => (!filter || user.status === filter)
+    && (!term || user.name.toLowerCase().includes(term) || String(user.id) === term))
+  const pageSize = 25
+  const pages = Math.max(1, Math.ceil(matches.length / pageSize))
+  const currentPage = Math.min(userPage, pages)
+  const visibleUsers = matches.slice((currentPage - 1) * pageSize, currentPage * pageSize)
   const req = (path, opts = {}) => request(adminAPI + path, { ...opts, token })
   useEffect(() => {
     Promise.all([req('/settings'), req('/users')])
@@ -562,6 +605,28 @@ export function PortalAdmin({ token }) {
       setUsers(await req('/users'))
     })
   }
+  function saveUser(event) {
+    event.preventDefault()
+    const { username, password } = Object.fromEntries(new FormData(event.currentTarget))
+    run(async () => {
+      await req(editor.id ? '/users/' + editor.id : '/users', {
+        method: editor.id ? 'PUT' : 'POST',
+        body: { username, ...(password ? { password } : {}) },
+      })
+      setEditor(null)
+      setUsers(await req('/users'))
+    })
+  }
+
+  function removeUser(user) {
+    if (!confirm(`删除「${user.name}」？该用户的登录会话和个人 DoH 地址将立即失效。历史查询记录按现有保留周期处理。`)) return
+    run(async () => {
+      await req('/users/' + user.id, { method: 'DELETE' })
+      setEditor(current => current?.id === user.id ? null : current)
+      setUsers(await req('/users'))
+    })
+  }
+
   return (
     <div className="portal-admin">
       <ErrorMessage message={error} />
@@ -570,10 +635,74 @@ export function PortalAdmin({ token }) {
           {notice}
         </p>
       )}
+      <section className="panel portal-user-list">
+        <header className="panel-head">
+          <h2>门户用户</h2>
+          <div className="portal-buttons portal-user-actions">
+            <button type="button" disabled={busy} className="btn tertiary" onClick={() => run(async () => setUsers(await req('/users')))}>刷新用户</button>
+            <button type="button" disabled={busy} className="btn primary" onClick={() => setEditor({})}>新增用户</button>
+          </div>
+        </header>
+        {editor && <form key={editor.id ?? 'new'} className="portal-user-editor" onSubmit={saveUser}>
+          <h3>{editor.id ? `编辑用户 · ${editor.name}` : '新增门户用户'}</h3>
+          <fieldset className="portal-fields" disabled={busy}>
+            <label>{editor.external ? '显示名称' : '用户名'}<input ref={nameInput} name="username" defaultValue={editor.name ?? ''} minLength={3} maxLength={128} required autoComplete="off"/></label>
+            {!editor.external && <label>{editor.id ? '新密码（可选）' : '初始密码'}<input name="password" type="password" maxLength={1024} required={!editor.id} autoComplete="new-password"/></label>}
+          </fieldset>
+          {editor.id && !editor.external && <p>留空沿用当前密码。重设密码后，用户需重新登录门户。</p>}
+          <div className="portal-buttons">
+            <button disabled={busy} className="btn primary">{editor.id ? '保存修改' : '创建用户'}</button>
+            <button type="button" disabled={busy} className="btn tertiary" onClick={()=>setEditor(null)}>取消</button>
+          </div>
+        </form>}
+        <div className="portal-filters portal-user-toolbar">
+          <label>查找用户<input type="search" value={search} placeholder="输入用户名或用户 ID" onChange={e=>{setSearch(e.target.value);setUserPage(1)}}/></label>
+          <label>状态<select value={filter} onChange={e=>{setFilter(e.target.value);setUserPage(1)}}>
+            <option value="">全部状态</option>
+            {Object.entries(states).map(([key,name])=><option key={key} value={key}>{name}</option>)}
+          </select></label>
+          <span className="muted" role="status">{matches.length} 位用户</span>
+        </div>
+        <Table
+          labels={['用户 ID', '用户名', '登录方式', '状态', '操作']}
+          empty={term || filter ? '没有符合条件的用户' : '暂无门户用户'}
+          rows={visibleUsers.map((u) => [
+            u.id,
+            <div className="portal-user-name"><span>{u.name}</span><small>#{u.id} · {loginMethodLabel(u)}</small></div>,
+            loginMethodLabel(u),
+            states[u.status],
+            <div className="portal-buttons portal-user-actions">
+              <button type="button" className="text-button blue" disabled={busy} onClick={()=>setEditor(u)}>编辑</button>
+              {(u.status === 'active'
+                ? [
+                    ['rotate', '重置地址'],
+                    ['disable', '停用'],
+                  ]
+                : u.status === 'pending'
+                  ? [
+                      ['activate', '批准'],
+                      ['disable', '停用'],
+                    ]
+                  : [['activate', '重新开通']]
+              ).map(([k, label]) => (
+                <button key={k} disabled={busy} className="text-button blue" onClick={() => changeUser(u, k)}>
+                  {label}
+                </button>
+              ))}
+              <button type="button" className="text-button danger" disabled={busy} onClick={()=>removeUser(u)}>删除</button>
+            </div>,
+          ])}
+        />
+        {pages > 1 && <nav className="portal-pagination" aria-label="门户用户分页">
+          <button type="button" disabled={currentPage===1} onClick={()=>setUserPage(currentPage-1)}>上一页</button>
+          <span>{currentPage} / {pages} 页</span>
+          <button type="button" disabled={currentPage===pages} onClick={()=>setUserPage(currentPage+1)}>下一页</button>
+        </nav>}
+      </section>
       {cfg && (
         <section className="panel">
           <header className="panel-head">
-            <h2>注册与身份提供方</h2>
+            <h2>门户注册与登录</h2>
           </header>
           <form
             className="portal-settings"
@@ -586,6 +715,7 @@ export function PortalAdmin({ token }) {
             }}
           >
             <fieldset disabled={busy}>
+              <section className="portal-config-block"><h3>注册与访问</h3>
               <div className="portal-fields">
                 <label>
                   注册策略
@@ -616,6 +746,9 @@ export function PortalAdmin({ token }) {
                 />
                 启用公共 /dns-query
               </label>
+              </section>
+              <section className="portal-config-block"><h3>允许的登录方式</h3>
+              <label className="portal-check"><input type="checkbox" checked={cfg.password_login} onChange={e=>setCfg({...cfg,password_login:e.target.checked})}/>账号密码登录与注册</label>
               {cfg.email && <MailSettings mail={cfg.email} update={(changes) => setCfg({ ...cfg, email: { ...cfg.email, ...changes } })} />}
               {cfg.providers.map((p, i) => (
                 <ProviderForm
@@ -632,58 +765,18 @@ export function PortalAdmin({ token }) {
                 />
               ))}
               <div className="portal-buttons">
-                <button
-                  type="button"
-                  className="btn tertiary"
-                  onClick={() => setCfg({ ...cfg, providers: [...cfg.providers, { ...providerDefaults }] })}
-                >
-                  添加身份提供方
-                </button>
+                {['oauth','oidc'].map(kind=><button key={kind} type="button" className="btn tertiary"
+                  onClick={()=>setCfg({...cfg,providers:[...cfg.providers,{...providerDefaults,kind}]})}>
+                  {kind==='oauth'?'添加 OAuth 2.0':'添加 OpenID Connect'}
+                </button>)}
+              </div></section>
+              <div className="portal-buttons">
                 <button className="btn primary">保存并应用</button>
               </div>
             </fieldset>
           </form>
         </section>
       )}
-      <section className="panel">
-        <header className="panel-head">
-          <h2>门户用户</h2>
-          <button
-            disabled={busy}
-            className="btn tertiary"
-            onClick={() => run(async () => setUsers(await req('/users')))}
-          >
-            刷新用户
-          </button>
-        </header>
-        <Table
-          labels={['用户 ID', '用户名', '登录方式', '状态', '操作']}
-          rows={users.map((u) => [
-            u.id,
-            u.name,
-            u.external ? '第三方' : '本地',
-            states[u.status],
-            <div className="portal-buttons">
-              {(u.status === 'active'
-                ? [
-                    ['rotate', '重置地址'],
-                    ['disable', '停用'],
-                  ]
-                : u.status === 'pending'
-                  ? [
-                      ['activate', '批准'],
-                      ['disable', '停用'],
-                    ]
-                  : [['activate', '重新开通']]
-              ).map(([k, label]) => (
-                <button key={k} disabled={busy} className="text-button blue" onClick={() => changeUser(u, k)}>
-                  {label}
-                </button>
-              ))}
-            </div>,
-          ])}
-        />
-      </section>
       <Analytics token={token} users={users} />
     </div>
   )

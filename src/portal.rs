@@ -69,6 +69,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         "INSERT OR IGNORE INTO portal_settings(id) VALUES(1)",
         "CREATE TABLE IF NOT EXISTS portal_users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, password TEXT, identity TEXT UNIQUE, status TEXT NOT NULL, credential TEXT COLLATE BINARY UNIQUE)",
         "CREATE UNIQUE INDEX IF NOT EXISTS portal_local_name ON portal_users(name) WHERE identity IS NULL",
+        "CREATE TABLE IF NOT EXISTS portal_profile_tickets(user_id INTEGER PRIMARY KEY REFERENCES portal_users(id) ON DELETE CASCADE,hash TEXT UNIQUE NOT NULL,origin TEXT NOT NULL,expires INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS portal_sessions(hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES portal_users(id),expires INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS portal_mail(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL)",
         "INSERT OR IGNORE INTO portal_mail VALUES(1,'{}')",
@@ -76,6 +77,19 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS portal_flows(state TEXT PRIMARY KEY,browser TEXT NOT NULL,provider TEXT NOT NULL,revision TEXT NOT NULL,verifier TEXT NOT NULL,nonce TEXT NOT NULL,expires INTEGER NOT NULL)",
     ] {
         sqlx::query(sql).execute(&mut *tx).await?;
+    }
+    if sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pragma_table_info('portal_settings') WHERE name='password_login'",
+    )
+    .fetch_one(&mut *tx)
+    .await?
+        == 0
+    {
+        sqlx::query(
+            "ALTER TABLE portal_settings ADD COLUMN password_login INTEGER NOT NULL DEFAULT 1",
+        )
+        .execute(&mut *tx)
+        .await?;
     }
     let cols = sqlx::query("PRAGMA table_info(query_log)")
         .fetch_all(&mut *tx)
@@ -105,6 +119,11 @@ pub fn routes() -> Router<ApiState> {
         .route("/portal/api/login", post(login))
         .route("/portal/api/logout", post(logout))
         .route("/portal/api/rdns.mobileconfig", get(mobileconfig::download))
+        .route("/portal/api/ios-qr", post(mobileconfig::create_qr))
+        .route(
+            "/portal/install/{ticket}/rdns.mobileconfig",
+            get(mobileconfig::download_qr).head(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+        )
         .route("/portal/api/me", get(me))
         .route("/portal/api/rotate", post(rotate))
         .route("/portal/api/analytics", get(reporting::personal))
@@ -123,8 +142,11 @@ pub fn routes() -> Router<ApiState> {
 pub fn admin_routes() -> Router<ApiState> {
     Router::new()
         .route("/api/v1/portal/settings", get(settings).put(configure))
-        .route("/api/v1/portal/users", get(users))
-        .route("/api/v1/portal/users/{id}", post(manage))
+        .route("/api/v1/portal/users", get(users).post(add_user))
+        .route(
+            "/api/v1/portal/users/{id}",
+            post(manage).put(edit_user).delete(delete_user),
+        )
         .route("/api/v1/portal/analytics", get(reporting::admin))
 }
 pub async fn identify_doh(State(s): State<ApiState>, mut req: Request, next: Next) -> Response {
@@ -136,7 +158,7 @@ pub async fn identify_doh(State(s): State<ApiState>, mut req: Request, next: Nex
             .await
             .map(|on| on.then_some(None))
     } else if let Some(key) = path
-        .strip_prefix("/dns-")
+        .strip_prefix("/dns/")
         .filter(|k| k.len() == 22 && k.bytes().all(|b| b.is_ascii_alphanumeric()))
     {
         sqlx::query_scalar::<_, i64>(
@@ -162,6 +184,8 @@ pub async fn identify_doh(State(s): State<ApiState>, mut req: Request, next: Nex
 struct Settings {
     #[serde(default)]
     email: Option<email::Config>,
+    #[serde(default)]
+    password_login: Option<bool>,
     registration: String,
     public: bool,
     base: String,
@@ -174,6 +198,7 @@ async fn load(pool: &SqlitePool) -> Result<Settings> {
         .map_err(internal)?;
     Ok(Settings {
         email: Some(email::config(pool).await?),
+        password_login: Some(row.get("password_login")),
         registration: row.get("registration"),
         public: row.get("public"),
         base: row.get("base"),
@@ -183,7 +208,7 @@ async fn load(pool: &SqlitePool) -> Result<Settings> {
 async fn options(State(s): State<ApiState>) -> Reply {
     let cfg = load(&s.engine.store.pool).await?;
     Ok(Json(
-        json!({"email":cfg.email.is_some_and(|c| c.enabled),"registration":cfg.registration,"providers":cfg.providers.iter().map(|p|json!({"id":p.id,"label":p.label})).collect::<Vec<_>>()}),
+        json!({"password_login":cfg.password_login,"email":cfg.email.is_some_and(|c| c.enabled),"registration":cfg.registration,"providers":cfg.providers.iter().filter(|p|p.enabled).map(|p|json!({"id":p.id,"label":p.label})).collect::<Vec<_>>()}),
     ))
 }
 async fn administrator(s: &ApiState, h: &HeaderMap) -> Result<String> {
@@ -259,7 +284,8 @@ async fn configure(
             p.secret = last.secret.clone();
         }
     }
-    sqlx::query("UPDATE portal_settings SET registration=?,public=?,base=?,providers=? WHERE id=1")
+    sqlx::query("UPDATE portal_settings SET password_login=COALESCE(?,password_login),registration=?,public=?,base=?,providers=? WHERE id=1")
+        .bind(cfg.password_login)
         .bind(&cfg.registration)
         .bind(cfg.public)
         .bind(&cfg.base)
@@ -284,7 +310,14 @@ async fn allocate(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<()> {
             .execute(&mut **tx)
             .await
         {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                sqlx::query("DELETE FROM portal_profile_tickets WHERE user_id=?")
+                    .bind(id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(internal)?;
+                return Ok(());
+            }
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => continue,
             Err(e) => return Err(internal(e)),
         }
@@ -305,6 +338,15 @@ async fn create(
         "approval" => "pending",
         _ => return Err((StatusCode::FORBIDDEN, "注册已关闭".into())),
     };
+    insert_user(tx, name, password, identity, status).await
+}
+async fn insert_user(
+    tx: &mut Transaction<'_, Sqlite>,
+    name: &str,
+    password: Option<String>,
+    identity: Option<&str>,
+    status: &str,
+) -> Result<i64> {
     let id = sqlx::query("INSERT INTO portal_users(name,password,identity,status) VALUES(?,?,?,?)")
         .bind(name)
         .bind(password)
@@ -312,10 +354,7 @@ async fn create(
         .bind(status)
         .execute(&mut **tx)
         .await
-        .map_err(|e| match e.as_database_error() {
-            Some(d) if d.is_unique_violation() => (StatusCode::CONFLICT, "用户名已被使用".into()),
-            _ => internal(e),
-        })?
+        .map_err(user_write_error)?
         .last_insert_rowid();
     if status == "active" {
         allocate(tx, id).await?;
@@ -335,21 +374,51 @@ async fn session(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<String> {
 async fn authenticate(s: &ApiState, h: &HeaderMap) -> Result<i64> {
     sqlx::query_scalar("SELECT u.id FROM portal_sessions p JOIN portal_users u ON u.id=p.user_id WHERE hash=? AND expires>unixepoch() AND status!='disabled'").bind(digest(cookie(h,SESSION).ok_or_else(denied)?)).fetch_optional(&s.engine.store.pool).await.map_err(internal)?.ok_or_else(denied)
 }
-async fn register(State(s): State<ApiState>, Json(c): Json<Credentials>) -> Result<Response> {
-    let name = c.username.trim();
-    if !(3..=128).contains(&name.len()) || c.password.is_empty() || c.password.len() > 1024 {
-        return Err(bad("用户名须为 3–128 字节，密码须为 1–1024 字节"));
+async fn require_password_login<'a>(db: impl sqlx::Executor<'a, Database = Sqlite>) -> Result<()> {
+    if !sqlx::query_scalar::<_, bool>("SELECT password_login FROM portal_settings WHERE id=1")
+        .fetch_one(db)
+        .await
+        .map_err(internal)?
+    {
+        return Err((StatusCode::FORBIDDEN, "门户已关闭账号密码登录".into()));
     }
+    Ok(())
+}
+async fn hash_portal_password(password: String) -> Result<String> {
     let slot = password_slot()?;
-    let hash = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let _slot = slot;
         Argon2::default()
-            .hash_password(c.password.as_bytes(), &SaltString::generate(&mut OsRng))
+            .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
             .map(|v| v.to_string())
             .map_err(internal)
     })
     .await
-    .map_err(internal)??;
+    .map_err(internal)?
+}
+
+fn user_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if !(3..=128).contains(&name.len()) {
+        return Err(bad("用户名须为 3–128 字节"));
+    }
+    Ok(name)
+}
+
+fn user_write_error(error: sqlx::Error) -> Error {
+    match error.as_database_error() {
+        Some(e) if e.is_unique_violation() => (StatusCode::CONFLICT, "用户名已被使用".into()),
+        _ => internal(error),
+    }
+}
+
+async fn register(State(s): State<ApiState>, Json(c): Json<Credentials>) -> Result<Response> {
+    require_password_login(&s.engine.store.pool).await?;
+    let name = c.username.trim();
+    if !(3..=128).contains(&name.len()) || c.password.is_empty() || c.password.len() > 1024 {
+        return Err(bad("用户名须为 3–128 字节，密码须为 1–1024 字节"));
+    }
+    let hash = hash_portal_password(c.password).await?;
     let mut tx = s
         .engine
         .store
@@ -357,14 +426,17 @@ async fn register(State(s): State<ApiState>, Json(c): Json<Credentials>) -> Resu
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(internal)?;
+    require_password_login(&mut *tx).await?;
     let id = create(&mut tx, name, Some(hash), None).await?;
     let cookie = session(&mut tx, id).await?;
     tx.commit().await.map_err(internal)?;
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({"ok":true}))).into_response())
 }
 async fn login(State(s): State<ApiState>, Json(c): Json<Credentials>) -> Result<Response> {
+    require_password_login(&s.engine.store.pool).await?;
     let row=sqlx::query("SELECT id,password FROM portal_users WHERE identity IS NULL AND name=? AND status!='disabled'").bind(c.username.trim()).fetch_optional(&s.engine.store.pool).await.map_err(internal)?.ok_or_else(denied)?;
     let hash: String = row.get("password");
+    let verified_hash = hash.clone();
     let slot = password_slot()?;
     let ok = tokio::task::spawn_blocking(move || {
         let _slot = slot;
@@ -379,8 +451,25 @@ async fn login(State(s): State<ApiState>, Json(c): Json<Credentials>) -> Result<
     if !ok {
         return Err(denied());
     }
-    let mut tx = s.engine.store.pool.begin().await.map_err(internal)?;
-    let cookie = session(&mut tx, row.get("id")).await?;
+    let mut tx = s
+        .engine
+        .store
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(internal)?;
+    require_password_login(&mut *tx).await?;
+    let id: i64 = row.get("id");
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT password FROM portal_users WHERE id=? AND status!='disabled'")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal)?;
+    if current.as_deref() != Some(verified_hash.as_str()) {
+        return Err(denied());
+    }
+    let cookie = session(&mut tx, id).await?;
     tx.commit().await.map_err(internal)?;
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({"ok":true}))).into_response())
 }
@@ -403,7 +492,7 @@ async fn me(State(s): State<ApiState>, h: HeaderMap) -> Reply {
     let id = authenticate(&s, &h).await?;
     let row=sqlx::query("SELECT name,status,credential,base FROM portal_users,portal_settings WHERE portal_users.id=?").bind(id).fetch_one(&s.engine.store.pool).await.map_err(internal)?;
     Ok(Json(
-        json!({"id":id,"name":row.get::<String,_>("name"),"status":row.get::<String,_>("status"),"base":row.get::<String,_>("base"),"path":row.get::<Option<String>,_>("credential").map(|c|format!("/dns-{c}"))}),
+        json!({"id":id,"name":row.get::<String,_>("name"),"status":row.get::<String,_>("status"),"base":row.get::<String,_>("base"),"path":row.get::<Option<String>,_>("credential").map(|c|format!("/dns/{c}"))}),
     ))
 }
 async fn rotate(State(s): State<ApiState>, h: HeaderMap, Json(_): Json<Value>) -> Reply {
@@ -413,13 +502,127 @@ async fn rotate(State(s): State<ApiState>, h: HeaderMap, Json(_): Json<Value>) -
 async fn users(State(s): State<ApiState>, h: HeaderMap) -> Reply {
     administrator(&s, &h).await?;
     let rows = sqlx::query(
-        "SELECT id,name,status,identity IS NOT NULL AS external FROM portal_users ORDER BY id DESC",
+        "SELECT id,name,status,identity IS NOT NULL AS external, COALESCE(identity LIKE 'email:%',0) AS email_login FROM portal_users ORDER BY id DESC",
     )
     .fetch_all(&s.engine.store.pool)
     .await
     .map_err(internal)?;
-    Ok(Json(json!(rows.iter().map(|r|json!({"id":r.get::<i64,_>("id"),"name":r.get::<String,_>("name"),"status":r.get::<String,_>("status"),"external":r.get::<bool,_>("external")})).collect::<Vec<_>>())))
+    Ok(Json(json!(rows.iter().map(|r|json!({"id":r.get::<i64,_>("id"),"name":r.get::<String,_>("name"),"status":r.get::<String,_>("status"),"external":r.get::<bool,_>("external"),"email_login":r.get::<bool,_>("email_login")})).collect::<Vec<_>>())))
 }
+async fn add_user(State(s): State<ApiState>, h: HeaderMap, Json(c): Json<Credentials>) -> Reply {
+    let actor = administrator(&s, &h).await?;
+    let name = user_name(&c.username)?;
+    if c.password.is_empty() || c.password.len() > 1024 {
+        return Err(bad("密码须为 1–1024 字节"));
+    }
+    let hash = hash_portal_password(c.password).await?;
+    let mut tx = s
+        .engine
+        .store
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(internal)?;
+    let id = insert_user(&mut tx, name, Some(hash), None, "active").await?;
+    audit(&mut tx, &actor, "portal.user.create", &id.to_string()).await?;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(json!({"id":id})))
+}
+
+#[derive(Deserialize)]
+struct UserEdit {
+    username: String,
+    password: Option<String>,
+}
+
+async fn edit_user(
+    State(s): State<ApiState>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<UserEdit>,
+) -> Reply {
+    let actor = administrator(&s, &h).await?;
+    let name = user_name(&input.username)?;
+    let password = input.password.filter(|password| !password.is_empty());
+    if password
+        .as_ref()
+        .is_some_and(|password| password.len() > 1024)
+    {
+        return Err(bad("密码须为 1–1024 字节"));
+    }
+    let hash = match password {
+        Some(password) => Some(hash_portal_password(password).await?),
+        None => None,
+    };
+    let mut tx = s
+        .engine
+        .store
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(internal)?;
+    let external: bool =
+        sqlx::query_scalar("SELECT identity IS NOT NULL FROM portal_users WHERE id=?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal)?
+            .ok_or((StatusCode::NOT_FOUND, "用户不存在".into()))?;
+    if external && hash.is_some() {
+        return Err(bad("只有账号密码登录的用户可以重设密码"));
+    }
+    sqlx::query("UPDATE portal_users SET name=?, password=COALESCE(?,password) WHERE id=?")
+        .bind(name)
+        .bind(&hash)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(user_write_error)?;
+    if hash.is_some() {
+        revoke_user_sessions(&mut tx, id).await?;
+    }
+    audit(&mut tx, &actor, "portal.user.update", &id.to_string()).await?;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn delete_user(State(s): State<ApiState>, h: HeaderMap, Path(id): Path<i64>) -> Reply {
+    let actor = administrator(&s, &h).await?;
+    let mut tx = s
+        .engine
+        .store
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(internal)?;
+    revoke_user_sessions(&mut tx, id).await?;
+    let result = sqlx::query("DELETE FROM portal_users WHERE id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    if result.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "用户不存在".into()));
+    }
+    audit(&mut tx, &actor, "portal.user.delete", &id.to_string()).await?;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn revoke_user_sessions(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM portal_profile_tickets WHERE user_id=?")
+        .bind(id)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+    sqlx::query("DELETE FROM portal_sessions WHERE user_id=?")
+        .bind(id)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct Action {
     action: String,
@@ -462,11 +665,7 @@ async fn change(s: &ApiState, id: i64, action: &str, actor: &str) -> Reply {
                 .execute(&mut *tx)
                 .await
                 .map_err(internal)?;
-            sqlx::query("DELETE FROM portal_sessions WHERE user_id=?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(internal)?;
+            revoke_user_sessions(&mut tx, id).await?;
         }
         "rotate" if status == "active" => allocate(&mut tx, id).await?,
         _ => return Err(bad("当前状态不允许此操作")),

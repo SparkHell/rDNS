@@ -23,37 +23,112 @@ pub struct GeoSettings {
     pub ipv4_url: String,
     pub ipv6_url: String,
     pub update_hours: u64,
+    #[serde(skip_serializing)]
+    pub use_proxy: bool,
+    #[serde(skip_serializing)]
     pub proxy: String,
 }
 impl Default for GeoSettings {
     fn default() -> Self {
-        Self { enabled: true, ipv4_path: "data/geoip/ip2region_v4.xdb".into(), ipv6_path: "data/geoip/ip2region_v6.xdb".into(), ipv4_url: "https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb".into(), ipv6_url: "https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v6.xdb".into(), update_hours: 0, proxy: String::new() }
+        Self { enabled: true, ipv4_path: "data/geoip/ip2region_v4.xdb".into(), ipv6_path: "data/geoip/ip2region_v6.xdb".into(), ipv4_url: "https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb".into(), ipv6_url: "https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v6.xdb".into(), update_hours: 0, use_proxy:false, proxy: String::new() }
     }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FeatureSettings {
+    pub proxy_url: Option<String>,
+    pub proxy_subscriptions: Option<bool>,
     pub access: AccessSettings,
     pub resolution: ResolutionSettings,
     pub groups: Vec<GroupSettings>,
     pub geo: GeoSettings,
     pub gfwlist: GfwSettings,
+    pub adguard: crate::adguard::Settings,
 }
 
 impl FeatureSettings {
-    fn list_source(&self) -> (&str, &str, &str, bool) {
-        let group = &self.gfwlist.group;
-        let proxy = self
+    fn migrate_proxy(&mut self) {
+        self.migrate_proxy_address();
+        let enabled = *self.proxy_subscriptions.get_or_insert({
+            self.geo.use_proxy
+                || self.gfwlist.use_proxy
+                || self.adguard.use_proxy
+                || !self.geo.proxy.is_empty()
+                || !self.gfwlist.proxy.is_empty()
+        });
+        if enabled
+            && self.proxy_url.as_deref().unwrap_or_default().is_empty()
+            && let Some(url) = [&self.geo.proxy, &self.gfwlist.proxy]
+                .into_iter()
+                .find(|s| !s.is_empty())
+        {
+            self.proxy_url = Some(url.clone());
+        }
+        self.geo.proxy.clear();
+        self.gfwlist.proxy.clear();
+        self.geo.use_proxy = false;
+        self.gfwlist.use_proxy = false;
+        self.adguard.use_proxy = false;
+    }
+
+    fn migrate_proxy_address(&mut self) {
+        if self.proxy_url.is_some() {
+            return;
+        }
+        // Multiple distinct legacy addresses keep their routes until edited.
+        let global = self
             .groups
             .iter()
-            .find(|g| &g.name == group)
-            .map_or("", |g| g.proxy.as_str());
-        (&self.gfwlist.url, group, proxy, self.gfwlist.enabled)
+            .map(|g| &g.proxy)
+            .chain([&self.geo.proxy])
+            .find(|url| !url.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(group) = self.groups.iter().find(|g| g.name == self.gfwlist.group) {
+            self.gfwlist.proxy.clone_from(&group.proxy);
+        }
+        let migrate = |legacy: &mut String, enabled: &mut bool| {
+            if !legacy.is_empty() {
+                *enabled = true;
+                if *legacy == global {
+                    legacy.clear();
+                }
+            }
+        };
+        for group in &mut self.groups {
+            migrate(&mut group.proxy, &mut group.use_proxy);
+        }
+        migrate(&mut self.geo.proxy, &mut self.geo.use_proxy);
+        migrate(&mut self.gfwlist.proxy, &mut self.gfwlist.use_proxy);
+        self.proxy_url = Some(global);
+    }
+
+    fn proxy_for<'a>(&'a self, enabled: bool, legacy: &'a str) -> &'a str {
+        if !legacy.is_empty() {
+            legacy
+        } else if enabled {
+            self.proxy_url.as_deref().unwrap_or_default()
+        } else {
+            ""
+        }
+    }
+    fn list_source(&self) -> (&str, &str, &str, bool) {
+        (
+            &self.gfwlist.url,
+            &self.gfwlist.group,
+            self.subscription_proxy(),
+            self.gfwlist.enabled,
+        )
+    }
+    pub(crate) fn subscription_proxy(&self) -> &str {
+        self.proxy_for(self.proxy_subscriptions.unwrap_or(false), "")
     }
 }
 
 pub struct FeatureRuntime {
+    pub cache_revision: u64,
+    ad_revision: u64,
     list_revision: u64,
     geo_revision: u64,
     pub settings: FeatureSettings,
@@ -65,6 +140,9 @@ pub struct FeatureRuntime {
 pub struct Features {
     pub current: ArcSwap<FeatureRuntime>,
     pub list: ArcSwap<GfwList>,
+    pub ads: ArcSwap<crate::adguard::Rules>,
+    ad_refresh: Mutex<()>,
+    pub subscription_updates: tokio::sync::watch::Sender<()>,
     config: Config,
     store: Store,
     cache: Arc<PersistentCache>,
@@ -101,12 +179,60 @@ impl Features {
             }
         };
         let runtime = Self::compile(&config, settings, cache.clone(), None)?;
-        let saved = store.setting::<String>("gfwlist_data").await?;
-        let list = saved
+        let resources = std::env::current_exe()?.with_file_name("resources");
+        for version in [4, 6] {
+            let path = runtime.geo.database_path(version)?;
+            let seed = resources
+                .join("geoip")
+                .join(format!("ip2region_v{version}.xdb"));
+            if !path.exists() && seed.is_file() {
+                let result = tokio::fs::read(&seed)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|bytes| {
+                        let prepared = runtime.geo.prepare_database(version, bytes)?;
+                        runtime.geo.install_prepared(version, prepared)
+                    });
+                if let Err(error) = result {
+                    tracing::warn!(version,%error,"could not install packaged GeoIP data");
+                }
+            }
+        }
+        let list = store
+            .setting::<String>("gfwlist_data")
+            .await?
             .as_deref()
             .and_then(|text| GfwList::parse(text).ok())
-            .unwrap_or(GfwList::parse(include_str!("../resources/gfwlist.txt"))?);
+            .or_else(|| {
+                std::fs::read_to_string(resources.join("gfwlist.txt"))
+                    .ok()
+                    .and_then(|text| GfwList::parse(&text).ok())
+            });
+        let list = match list {
+            Some(list) => list,
+            None => GfwList::parse(include_str!("../resources/gfwlist.txt"))?,
+        };
+        let ads = match store.setting("adguard_data").await? {
+            Some(rules) => rules,
+            None => {
+                let mut rules = crate::adguard::Rules::default();
+                let result = (|| -> Result<()> {
+                    for name in ["adguard-dns.txt", "adaway.txt"] {
+                        rules.add(&std::fs::read(resources.join(name))?)?;
+                    }
+                    Ok(())
+                })();
+                if result.is_ok() {
+                    rules
+                } else {
+                    Default::default()
+                }
+            }
+        };
         Ok(Arc::new(Self {
+            ads: ArcSwap::from_pointee(ads),
+            ad_refresh: Default::default(),
+            subscription_updates: tokio::sync::watch::channel(()).0,
             current: ArcSwap::from_pointee(runtime),
             list: ArcSwap::from_pointee(list),
             config,
@@ -124,6 +250,24 @@ impl Features {
         cache: Arc<PersistentCache>,
         previous: Option<&FeatureRuntime>,
     ) -> Result<FeatureRuntime> {
+        for group in &mut settings.groups {
+            group.name = group.name.trim().to_owned();
+        }
+        settings.resolution.group = settings.resolution.group.trim().to_owned();
+        settings.gfwlist.group = settings.gfwlist.group.trim().to_owned();
+        settings.migrate_proxy();
+        let global = settings.proxy_url.as_deref().unwrap_or_default();
+        let _ = upstream::http_client(config, global)?;
+        let needs_global = settings
+            .groups
+            .iter()
+            .any(|g| g.use_proxy && g.proxy.is_empty())
+            || settings.proxy_subscriptions.unwrap_or(false);
+        ensure!(
+            !global.is_empty() || !needs_global,
+            "请先在解析上游填写全局代理地址"
+        );
+        settings.adguard.validate()?;
         let access = AccessPolicy::compile(settings.access.clone())?;
         settings.access = access.settings.clone();
         let r = &settings.resolution;
@@ -135,23 +279,33 @@ impl Features {
         let mut groups = HashMap::new();
         for group in &settings.groups {
             ensure!(!groups.contains_key(&group.name), "上游组名称不能重复");
+            let proxy = settings.proxy_for(group.use_proxy, &group.proxy);
             let reusable = previous
-                .filter(|runtime| runtime.settings.groups.contains(group))
+                .filter(|runtime| {
+                    runtime.settings.groups.contains(group)
+                        && runtime.settings.proxy_for(group.use_proxy, &group.proxy) == proxy
+                })
                 .and_then(|runtime| runtime.groups.get(&group.name));
             let pool = match reusable {
                 Some(pool) => pool.clone(),
-                None => DohGroup::build(config, group, cache.clone())?,
+                None => {
+                    let mut effective = group.clone();
+                    effective.proxy = proxy.to_owned();
+                    DohGroup::build(config, &effective, cache.clone())?
+                }
             };
             groups.insert(group.name.clone(), pool);
         }
         ensure!(
-            r.mode == ResolveMode::Recursive || groups.contains_key(&r.group),
-            "请选择有效的默认 DoH 上游组"
+            !settings.gfwlist.enabled || groups.contains_key(&settings.gfwlist.group),
+            "GFWList 分流上游组「{}」未配置，请在解析规则 → 订阅源中选择有效的组",
+            settings.gfwlist.group
         );
         ensure!(
-            !settings.gfwlist.enabled
-                || (groups.contains_key(&settings.gfwlist.group) && groups.contains_key(&r.group)),
-            "GFWList 必须指定有效的 DoH 上游组"
+            (r.mode == ResolveMode::Recursive && !settings.gfwlist.enabled)
+                || groups.contains_key(&r.group),
+            "默认 DoH 上游组「{}」未配置，请在高级设置 → 解析上游中选择有效的组",
+            r.group
         );
         upstream::validate_https(&settings.gfwlist.url)?;
         ensure!(
@@ -171,7 +325,6 @@ impl Features {
         );
         upstream::validate_https(&geo_settings.ipv4_url)?;
         upstream::validate_https(&geo_settings.ipv6_url)?;
-        let _ = upstream::http_client(config, &geo_settings.proxy)?;
         ensure!(
             settings.access.region_mode == RegionMode::Any || geo_settings.enabled,
             "启用地区访问规则时必须启用 GeoIP"
@@ -200,10 +353,18 @@ impl Features {
                     reusable_geo.is_none()
                         || source.ipv4_url != geo_settings.ipv4_url
                         || source.ipv6_url != geo_settings.ipv6_url
-                        || source.proxy != geo_settings.proxy,
+                        || old.settings.subscription_proxy() != settings.subscription_proxy(),
                 )
         });
         Ok(FeatureRuntime {
+            cache_revision: previous.map_or(0, |old| old.cache_revision + 1),
+            ad_revision: previous.map_or(0, |p| {
+                p.ad_revision
+                    + u64::from(
+                        p.settings.adguard != settings.adguard
+                            || p.settings.subscription_proxy() != settings.subscription_proxy(),
+                    )
+            }),
             list_revision,
             geo_revision,
             settings,
@@ -213,7 +374,7 @@ impl Features {
         })
     }
 
-    pub async fn apply(&self, settings: FeatureSettings) -> Result<()> {
+    pub async fn apply(self: &Arc<Self>, settings: FeatureSettings) -> Result<()> {
         let _guard = self.write.lock().await;
         let runtime = Self::compile(
             &self.config,
@@ -222,7 +383,15 @@ impl Features {
             Some(&self.current.load()),
         )?;
         self.store.set_features(&runtime.settings).await?;
+        let refresh_ads = runtime.settings.adguard.enabled
+            && self.current.load().settings.adguard != runtime.settings.adguard;
         self.current.store(Arc::new(runtime));
+        if refresh_ads {
+            let features = self.clone();
+            tokio::spawn(async move {
+                let _ = features.refresh_ads().await;
+            });
+        }
         Ok(())
     }
 
@@ -243,7 +412,57 @@ impl Features {
         } else {
             vec![]
         };
-        json!({"type":"features", "settings":settings, "geo":current.geo.status(), "groups":groups, "gfwlist":{"count":list.count,"skipped":list.skipped,"meta":self.store.setting::<Value>("gfwlist_meta").await.ok().flatten()}, "geo_meta":self.store.setting::<Value>("geo_meta").await.ok().flatten()})
+        json!({"type":"features", "settings":settings, "geo":current.geo.status(), "groups":groups, "gfwlist":{"count":list.count,"skipped":list.skipped,"meta":self.store.setting::<Value>("gfwlist_meta").await.ok().flatten()}, "adguard":{"count":self.ads.load().count(),"meta":self.store.setting::<Value>("adguard_meta").await.ok().flatten()}, "geo_meta":self.store.setting::<Value>("geo_meta").await.ok().flatten()})
+    }
+
+    pub async fn refresh_ads(&self) -> Result<()> {
+        let _refresh = self.ad_refresh.lock().await;
+        let current = self.current.load_full();
+        let settings = &current.settings.adguard;
+        let result = async {
+            let mut rules = crate::adguard::Rules::default();
+            for url in &settings.urls {
+                rules.add(
+                    &upstream::download(
+                        &self.config,
+                        url,
+                        current.settings.subscription_proxy(),
+                        20 * 1024 * 1024,
+                    )
+                    .await?,
+                )?;
+            }
+            Ok::<_, anyhow::Error>(rules)
+        }
+        .await;
+        let _guard = self.write.lock().await;
+        ensure!(
+            self.current.load().ad_revision == current.ad_revision,
+            "AdGuard 来源已变更"
+        );
+        let mut meta = self
+            .store
+            .setting::<Value>("adguard_meta")
+            .await?
+            .unwrap_or_else(|| json!({}));
+        meta["attempted_at"] = json!(chrono::Utc::now().timestamp());
+        match result {
+            Ok(rules) => {
+                self.store.set_setting("adguard_data", &rules).await?;
+                self.ads.store(Arc::new(rules));
+                meta["updated_at"] = meta["attempted_at"].clone();
+                meta["error"] = Value::Null;
+            }
+            Err(error) => {
+                meta["error"] = json!("更新失败，已保留上一份规则");
+                self.store.set_setting("adguard_meta", &meta).await?;
+                self.subscription_updates.send_replace(());
+                return Err(error);
+            }
+        }
+        self.store.set_setting("adguard_meta", &meta).await?;
+        self.subscription_updates.send_replace(());
+        Ok(())
     }
 
     pub async fn refresh_list(&self) -> Result<usize> {
@@ -280,6 +499,7 @@ impl Features {
             .unwrap_or_default();
         let meta = json!({"attempted_at":chrono::Utc::now().timestamp(),"updated_at":if result.is_ok(){json!(chrono::Utc::now().timestamp())}else{previous["updated_at"].clone()},"error":result.as_ref().err().map(|_| "更新失败，继续使用上一份有效名单")});
         self.store.set_setting("gfwlist_meta", &meta).await?;
+        self.subscription_updates.send_replace(());
         result
     }
 
@@ -294,8 +514,14 @@ impl Features {
             &settings.ipv6_url
         };
         let prepared = async {
-            let bytes =
-                upstream::download(&self.config, url, &settings.proxy, 80 * 1024 * 1024).await?;
+            let bytes = upstream::download_with_timeout(
+                &self.config,
+                url,
+                current.settings.subscription_proxy(),
+                80 * 1024 * 1024,
+                std::time::Duration::from_secs(300),
+            )
+            .await?;
             let geo = current.geo.clone();
             tokio::task::spawn_blocking(move || geo.prepare_database(version, bytes)).await?
         }
@@ -313,8 +539,25 @@ impl Features {
             .unwrap_or_else(|| json!({}));
         let key = version.to_string();
         let previous = meta[&key]["updated_at"].clone();
-        meta[&key] = json!({"attempted_at":chrono::Utc::now().timestamp(),"updated_at":if result.is_ok(){json!(chrono::Utc::now().timestamp())}else{previous},"error":result.as_ref().err().map(|_| "更新失败，继续使用上一份有效数据库")});
+        let error = result.as_ref().err().map(|error| {
+            if let Some(http) = error.downcast_ref::<reqwest::Error>() {
+                if let Some(status) = http.status() {
+                    return format!("下载失败，HTTP {status}");
+                }
+                if http.is_timeout() {
+                    return "下载超时，请重试或检查代理配置".to_owned();
+                }
+                return "下载连接失败，请检查来源地址、网络及代理配置".to_owned();
+            }
+            // Filesystem paths and arbitrary endpoint URLs stay out of viewer snapshots.
+            if error.downcast_ref::<std::io::Error>().is_some() {
+                return "无法写入数据库，请检查目录权限与可用空间".to_owned();
+            }
+            "数据库读取或校验失败，请检查下载内容和 IP 版本".to_owned()
+        });
+        meta[&key] = json!({"attempted_at":chrono::Utc::now().timestamp(),"updated_at":if result.is_ok(){json!(chrono::Utc::now().timestamp())}else{previous},"error":error});
         self.store.set_setting("geo_meta", &meta).await?;
+        self.subscription_updates.send_replace(());
         result
     }
 
@@ -324,6 +567,20 @@ impl Features {
         let due = |last: &Value, hours: u64| {
             hours > 0 && now - last["attempted_at"].as_i64().unwrap_or(0) >= hours as i64 * 3600
         };
+        if settings.adguard.enabled
+            && due(
+                &self
+                    .store
+                    .setting::<Value>("adguard_meta")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                settings.adguard.update_hours,
+            )
+        {
+            let _ = self.refresh_ads().await;
+        }
         let meta = self
             .store
             .setting::<Value>("gfwlist_meta")
@@ -352,5 +609,33 @@ impl Features {
                 tracing::warn!(version, "GeoIP refresh failed; retaining active database");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn migrate_legacy_proxy_routes() -> Result<()> {
+        let mut settings: FeatureSettings = serde_json::from_value(json!({
+            "groups":[{"name":"default","proxy":"http://old-a.test:8080"},
+                      {"name":"special","proxy":"socks5://old-b.test:1080"}],
+            "geo":{"proxy":"http://old-a.test:8080"},"gfwlist":{"group":"special"}
+        }))?;
+        settings.migrate_proxy();
+        assert_eq!(
+            settings.proxy_url.as_deref(),
+            Some("http://old-a.test:8080")
+        );
+        assert_eq!(settings.subscription_proxy(), "http://old-a.test:8080");
+        assert_eq!(settings.list_source().2, "http://old-a.test:8080");
+        assert!(settings.groups[0].use_proxy && settings.groups[0].proxy.is_empty());
+        settings.proxy_url = Some("http://new.test:8080".into());
+        assert_eq!(settings.subscription_proxy(), "http://new.test:8080");
+        assert_eq!(settings.list_source().2, "http://new.test:8080");
+        settings.proxy_subscriptions = Some(false);
+        assert_eq!(settings.subscription_proxy(), "");
+        Ok(())
     }
 }

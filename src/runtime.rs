@@ -82,6 +82,7 @@ enum Bound {
     Udp(UdpSocket),
     Tcp(TcpListener),
     Doh(std::net::TcpListener),
+    DohHttp(TcpListener),
     Dot(TcpListener),
     Doq(quinn::Endpoint),
 }
@@ -147,6 +148,10 @@ impl ListenerManager {
         desired: ListenerSettings,
         persist: bool,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !state.engine.config.doh_on_admin || !desired.doh.enabled,
+            "DoH is already served on the admin port via doh_on_admin"
+        );
         let mut current = self.current.lock().await;
         for kind in Kind::ALL {
             if current
@@ -183,6 +188,15 @@ impl ListenerManager {
                 Kind::Tcp => Bound::Tcp(TcpListener::bind(address).await.with_context(|| {
                     format!("{} {} 端口不可用（可能已被占用）", kind.name(), address)
                 })?),
+                Kind::Doh if state.engine.config.doh_http => {
+                    anyhow::ensure!(
+                        address.ip().is_loopback(),
+                        "HTTP DoH behind a reverse proxy requires a loopback address"
+                    );
+                    Bound::DohHttp(TcpListener::bind(address).await.with_context(|| {
+                        format!("{} {} 端口不可用（可能已被占用）", kind.name(), address)
+                    })?)
+                }
                 Kind::Doh => {
                     state.tls.doh_config().await?;
                     let socket = std::net::TcpListener::bind(address).with_context(|| {
@@ -239,6 +253,13 @@ impl ListenerManager {
                             transport::dot(app.engine.clone(), app.tls.clone(), socket).await
                         }
                         Bound::Doq(endpoint) => transport::doq(app.engine.clone(), endpoint).await,
+                        Bound::DohHttp(socket) => axum::serve(
+                            socket,
+                            api::doh_router(app.clone())
+                                .into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                        .await
+                        .map_err(Into::into),
                         Bound::Doh(socket) => {
                             match app.tls.doh_config().await.and_then(|config| {
                                 axum_server::from_tcp_rustls(socket, config).map_err(Into::into)

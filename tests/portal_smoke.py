@@ -179,21 +179,54 @@ private_key = "localhost.key"
         token=admin_login()
         def admin(path, body=None, method=None):
             return api(base,'/portal/'+path,body,token,method)
+        created=admin('users',{'username':'managed-user','password':'initial-test-password'})['id']
+        managed=call('/portal/api/login',dict(username='managed-user',password='initial-test-password'))[1]
+        path=profile(managed)['path']
+        admin(f'users/{created}',{'username':'managed-renamed','password':'new-test-password'},'PUT')
+        call('/portal/api/me',cookie=managed,status=401)
+        call('/portal/api/login',dict(username='managed-renamed',password='initial-test-password'),status=401)
+        managed=call('/portal/api/login',dict(username='managed-renamed',password='new-test-password'))[1]
+        assert profile(managed)['path']==path
+        admin(f'users/{created}',method='DELETE')
+        call('/portal/api/me',cookie=managed,status=401)
+        call(path,query('example.test'),status=404)
+        assert all(u['id']!=created for u in admin('users'))
         cfg=admin('settings')
         assert cfg['registration']=='open' and cfg['public']
         api(base,'/rules',dict(kind='local',domain='portal.test',record_type='A',value='192.0.2.27',ttl=60),token)
         a,b=member('alice'),member('bob')
         alice,bob=profile(a),profile(b)
-        assert alice['path']!=bob['path'] and re.fullmatch('/dns-[a-zA-Z0-9]{22}',alice['path'])
+        assert alice['path']!=bob['path'] and re.fullmatch('/dns/[a-zA-Z0-9]{22}',alice['path'])
         call(mobile, status=401)
         original = mobile_profile(a, public + alice['path'])
         assert mobile_profile(b, public + bob['path']) != original
+        qr_endpoint='/portal/api/ios-qr'
+        call(qr_endpoint,{},status=401)
+        def ticket(cookie):
+            data=call(qr_endpoint,{},cookie)[0]
+            assert data['image'].startswith('data:image/svg+xml;base64,')
+            assert data['expires_in']==300
+            assert data['url'].startswith(public+'/portal/install/')
+            return urlsplit(data['url']).path
+        previous=ticket(a)
+        download=ticket(a)
+        call(previous,status=404)
+        call(download,status=405,method='HEAD')
+        descriptor=plistlib.loads(call(download)[0])
+        assert descriptor['PayloadUUID']==original
+        assert descriptor['PayloadContent'][0]['DNSSettings']['ServerURL']==public+alice['path']
+        call(download,status=404)
+        expired=ticket(a)
+        db.execute('UPDATE portal_profile_tickets SET expires=unixepoch()-1 WHERE user_id=?',(alice['id'],))
+        db.commit()
+        call(expired,status=404)
+        before_rotate=ticket(a)
         wire=query('portal.test')
         check=lambda data: rcode(data)==0 and data.endswith(bytes([192,0,2,27]))
         assert check(call(alice['path']+'?dns='+b64(wire))[0])
         assert check(call(bob['path'],wire)[0])
         assert check(call('/dns-query',wire)[0])
-        call('/dns-'+alice['path'][5:].swapcase(),wire,status=404)
+        call('/dns/'+alice['path'][5:].swapcase(),wire,status=404)
         for cookie, other in [(a,bob),(b,alice)]:
             report=call('/portal/api/analytics?user='+str(other['id']),cookie=cookie)[0]
             assert report['total']==1 and report['logs'][0]['user']!=other['id']
@@ -222,7 +255,12 @@ private_key = "localhost.key"
             assert ready.wait(3)
             call('/portal/api/rotate',{},a)
             poll.result(timeout=5)
+        call(before_rotate,status=404)
         new=profile(a)['path']
+        call('/dns-'+alice['path'][5:],wire,status=404)
+        legacy = '/dns-' + new[5:]
+        call(legacy,wire,status=404)
+        call(legacy+'?dns='+b64(wire),status=404)
         assert mobile_profile(a, public + new) == original
         call(alice['path'],wire,status=404)
         assert check(call(new,wire)[0])
@@ -285,6 +323,18 @@ private_key = "localhost.key"
         cfg['registration']='open'
         admin('settings',cfg,'PUT')
         assert all(p['secret']=='' for p in admin('settings')['providers'])
+        cfg['password_login']=False
+        cfg['providers'][0]['enabled']=False
+        admin('settings',cfg,'PUT')
+        opts=call('/portal/api/options')[0]
+        assert not opts['password_login'] and opts['email'] and [p['id'] for p in opts['providers']]==['two']
+        member('password-off',403)
+        call('/portal/api/login',dict(username='alice',password='test-password'),status=403)
+        call('/portal/auth/one',status=404)
+        assert profile(flow('two'))['id']
+        cfg['password_login']=True
+        cfg['providers'][0]['enabled']=True
+        admin('settings',cfg,'PUT')
         first=profile(flow('one'))
         second=profile(flow('two'))
         assert first['id']!=second['id'] and first['name']==second['name']
@@ -315,7 +365,9 @@ private_key = "localhost.key"
         call('/dns-query',wire,status=404)
         assert all(new not in str(row) for row in api(base,'/audit',token=token))
         if os.environ.get('RDNS_PORTAL_UI'):
-            subprocess.run(['node',str(Path(__file__).with_name('portal-ui.mjs')),public,base],env={**os.environ,'RDNS_TEST_ADMIN_TOKEN':token},check=True,timeout=60)
+            cfg['registration']='open'
+            admin('settings',cfg,'PUT')
+            subprocess.run(['node',str(Path(__file__).with_name('portal-ui.mjs')),public,base],env={**os.environ,'RDNS_TEST_ADMIN_TOKEN':token,'RDNS_TEST_ADMIN_PASSWORD':PASSWORD},check=True,timeout=60)
         server_log.flush()
         for credential in (alice['path'],bob['path'],new):
             assert credential[5:] not in (directory/'server.log').read_text()

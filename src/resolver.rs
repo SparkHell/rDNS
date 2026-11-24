@@ -1,3 +1,5 @@
+mod prefetch;
+mod umbrella;
 mod warmup;
 use crate::{
     cache::{CacheSettings, CachedProvider, PersistentCache},
@@ -30,6 +32,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
 };
+pub use warmup::CacheJobInput;
 
 #[derive(Clone, Default)]
 struct Policy {
@@ -46,8 +49,11 @@ pub struct Engine {
     policy_reload: tokio::sync::Mutex<()>,
     pub features: Arc<Features>,
     recursor: ArcSwap<Recursor<CachedProvider>>,
+    prefetch: prefetch::Prefetch,
     cache: Arc<PersistentCache>,
     roots: Vec<IpAddr>,
+    jobs: tokio::sync::Mutex<warmup::Jobs>,
+    warm_candidates: ArcSwap<serde_json::Value>,
 }
 
 impl Engine {
@@ -100,22 +106,47 @@ impl Engine {
             policy: ArcSwap::from_pointee(Policy::default()),
             features,
             recursor: ArcSwap::from_pointee(recursor),
+            prefetch: prefetch::Prefetch::new(&cache.settings()),
             cache,
             roots,
+            jobs: Default::default(),
+            warm_candidates: Default::default(),
         });
         engine.reload_policy().await?;
         Ok(engine)
     }
 
     pub async fn cache_stats(&self) -> serde_json::Value {
-        self.cache.stats().await
+        let mut stats = self.cache.stats().await;
+        let (entries, bytes) = self.prefetch.stats();
+        stats["memory_entries"] = (stats["memory_entries"].as_u64().unwrap_or(0) + entries).into();
+        stats["memory_bytes"] = (stats["memory_bytes"].as_u64().unwrap_or(0) + bytes).into();
+        stats["memory_hits"] = (stats["memory_hits"].as_u64().unwrap_or(0)
+            + self
+                .prefetch
+                .hits
+                .load(std::sync::atomic::Ordering::Relaxed))
+        .into();
+        stats["background_active"] = self.cache.background_active().into();
+        stats["background_recommended"] = crate::cache::recommended_background_concurrency().into();
+        stats["automation"] = self.job_status().await;
+        stats
     }
 
     pub async fn update_cache_settings(&self, settings: CacheSettings) -> Result<()> {
+        let _guard = self.jobs.lock().await;
         settings.validate()?;
-        let recursor = build_recursor_with_settings(&self.roots, &self.cache, &settings)?;
+        let recursor = settings
+            .requires_reset(&self.cache.settings())
+            .then(|| build_recursor_with_settings(&self.roots, &self.cache, &settings))
+            .transpose()?;
         self.cache
-            .set_settings(settings, || self.recursor.store(Arc::new(recursor)))
+            .set_settings(settings.clone(), || {
+                if let Some(recursor) = recursor {
+                    self.recursor.store(Arc::new(recursor));
+                    self.prefetch.reset(&settings);
+                }
+            })
             .await?;
         Ok(())
     }
@@ -206,12 +237,17 @@ impl Engine {
         Ok(result)
     }
 
-    pub async fn answer(&self, wire: &[u8], peer: SocketAddr, protocol: &str) -> Result<Vec<u8>> {
+    pub async fn answer(
+        self: &Arc<Self>,
+        wire: &[u8],
+        peer: SocketAddr,
+        protocol: &str,
+    ) -> Result<Vec<u8>> {
         self.answer_for(wire, peer, protocol, None).await
     }
 
     pub async fn answer_for(
-        &self,
+        self: &Arc<Self>,
         wire: &[u8],
         peer: SocketAddr,
         protocol: &str,
@@ -266,8 +302,7 @@ impl Engine {
             }
             response.metadata.authoritative = true;
             outcome = "local";
-        } else if !matches_domain(&policy.allow, &domain) && matches_domain(&policy.block, &domain)
-        {
+        } else if self.is_blocked(&policy, &runtime, &domain) {
             response.metadata.response_code = ResponseCode::NXDomain;
             outcome = "blocked";
         } else if let Some((_, upstream)) = policy
@@ -275,6 +310,7 @@ impl Engine {
             .iter()
             .find(|(suffix, _)| domain == *suffix || domain.ends_with(&format!(".{suffix}")))
         {
+            let _foreground = self.begin_foreground(true);
             let budget = Duration::from_millis(runtime.settings.resolution.timeout_ms);
             match tokio::time::timeout(budget, forward(wire, *upstream)).await {
                 Err(_) => {
@@ -295,8 +331,13 @@ impl Engine {
                 }
             }
         } else {
-            match self.routed_lookup(&runtime, &request, &domain).await {
-                Ok(Ok(mut answer)) => {
+            match self
+                .cache_lookup(&runtime, &request, &domain, true)
+                .await
+                .as_ref()
+            {
+                Ok(Ok(answer)) => {
+                    let mut answer = answer.clone();
                     selected_upstream = answer.upstream.clone();
                     let do_bit = request
                         .edns
@@ -317,7 +358,7 @@ impl Engine {
                 }
                 Ok(Err(error)) => {
                     response.metadata.response_code = ResponseCode::ServFail;
-                    outcome = if error == LookupFailure::Bogus {
+                    outcome = if *error == LookupFailure::Bogus {
                         "dnssec_bogus"
                     } else {
                         "error"
@@ -354,14 +395,24 @@ impl Engine {
         }
         Ok(wire)
     }
+    fn is_blocked(
+        &self,
+        policy: &Policy,
+        runtime: &crate::features::FeatureRuntime,
+        domain: &str,
+    ) -> bool {
+        !matches_domain(&policy.allow, domain)
+            && (matches_domain(&policy.block, domain)
+                || (runtime.settings.adguard.enabled && self.features.ads.load().blocks(domain)))
+    }
+
     async fn routed_lookup(
         &self,
         runtime: &crate::features::FeatureRuntime,
         request: &Message,
-        domain: &str,
+        gfw: bool,
     ) -> Result<Result<Resolved, LookupFailure>, tokio::time::error::Elapsed> {
         let settings = &runtime.settings;
-        let gfw = settings.gfwlist.enabled && self.features.list.load().matches(domain);
         let group_name = if gfw {
             &settings.gfwlist.group
         } else {
@@ -448,7 +499,17 @@ impl Engine {
     async fn recursive_lookup(&self, request: &Message) -> Result<Resolved, LookupFailure> {
         let query = request.queries[0].clone();
         let do_bit = request.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok);
-        let recursor = self.recursor.load_full();
+        let recursor = if crate::cache::bypass_cache(request) {
+            match build_recursor(&self.roots, &self.cache) {
+                Ok(recursor) => Arc::new(recursor),
+                Err(error) => {
+                    tracing::debug!(%error, "could not prepare recursive refresh");
+                    return Err(LookupFailure::Unavailable);
+                }
+            }
+        } else {
+            self.recursor.load_full()
+        };
         match recursor
             .resolve(query.clone(), Instant::now(), do_bit)
             .await
@@ -504,6 +565,7 @@ impl Engine {
     }
 }
 
+#[derive(Clone)]
 struct Resolved {
     message: Message,
     outcome: &'static str,
@@ -622,7 +684,7 @@ fn build_recursor_with_settings(
         DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
         None,
         options,
-        CachedProvider::new(cache.clone()),
+        CachedProvider::new(cache.clone(), roots),
     )
     .context("starting validating recursor")
 }
@@ -693,7 +755,7 @@ pub(crate) fn normalize_domain(domain: &str) -> Result<String> {
     Ok(domain)
 }
 
-fn matches_domain(set: &HashSet<String>, domain: &str) -> bool {
+pub(crate) fn matches_domain(set: &HashSet<String>, domain: &str) -> bool {
     let mut remaining = domain;
     loop {
         if set.contains(remaining) {

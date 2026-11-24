@@ -10,6 +10,8 @@ use reqwest::{Client, Url};
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub(super) struct Provider {
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
     pub id: String,
     pub label: String,
     kind: String,
@@ -22,6 +24,9 @@ pub(super) struct Provider {
     scope: String,
     user_id: String,
     auth_method: String,
+}
+fn enabled_by_default() -> bool {
+    true
 }
 pub(super) fn https(value: &str) -> Result<Url> {
     let url = Url::parse(value).map_err(|_| bad("无效的 HTTPS 地址"))?;
@@ -129,7 +134,7 @@ pub(super) async fn start(State(s): State<ApiState>, Path(id): Path<String>) -> 
     let p = cfg
         .providers
         .iter()
-        .find(|p| p.id == id)
+        .find(|p| p.enabled && p.id == id)
         .ok_or((StatusCode::NOT_FOUND, "未知提供方".into()))?;
     let mut url = if p.kind == "oidc" {
         https(
@@ -214,7 +219,8 @@ pub(super) async fn callback(
         .providers
         .iter()
         .find(|p| {
-            p.id == flow.get::<String, _>("provider")
+            p.enabled
+                && p.id == flow.get::<String, _>("provider")
                 && p.revision(&cfg.base) == flow.get::<String, _>("revision")
         })
         .ok_or_else(denied)?;
@@ -331,7 +337,7 @@ pub(super) async fn callback(
         serde_json::from_str(current.get("providers")).map_err(internal)?;
     if !providers
         .iter()
-        .any(|v| v.revision(current.get("base")) == flow.get::<String, _>("revision"))
+        .any(|v| v.enabled && v.revision(current.get("base")) == flow.get::<String, _>("revision"))
     {
         return Err(denied());
     }

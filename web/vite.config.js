@@ -4,5 +4,8 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  server: { proxy: { '/api': 'http://127.0.0.1:3000' } },
+  server: { proxy: {
+    '/api': 'http://127.0.0.1:3000',
+    '^/portal/(api|auth|callback|install)/': 'http://127.0.0.1:3000',
+  } },
 })

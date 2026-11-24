@@ -10,11 +10,16 @@ use std::{
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
-    pub warmup: Warmup,
+    #[serde(rename = "warmup")]
+    _legacy_warmup: Option<toml::Value>,
     pub database: PathBuf,
     pub dns_udp: Option<SocketAddr>,
     pub dns_tcp: Option<SocketAddr>,
     pub doh: Option<SocketAddr>,
+    #[serde(default)]
+    pub doh_http: bool,
+    #[serde(default)]
+    pub doh_on_admin: bool,
     pub dot: Option<SocketAddr>,
     pub doq: Option<SocketAddr>,
     pub admin: SocketAddr,
@@ -29,32 +34,6 @@ pub struct Config {
     pub query_log_days: i64,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Warmup {
-    pub enabled: bool,
-    pub history_limit: usize,
-    pub domains: Vec<String>,
-}
-
-impl Default for Warmup {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            history_limit: 32,
-            domains: [
-                "www.baidu.com",
-                "www.qq.com",
-                "www.apple.com",
-                "www.microsoft.com",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-        }
-    }
-}
-
 fn default_log_days() -> i64 {
     7
 }
@@ -64,13 +43,6 @@ impl Config {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut config: Self = toml::from_str(&raw).context("parsing configuration")?;
-        anyhow::ensure!(
-            config.warmup.history_limit <= 256 && config.warmup.domains.len() <= 256,
-            "warmup history_limit and seed domain count must each be at most 256"
-        );
-        for domain in &mut config.warmup.domains {
-            *domain = crate::resolver::normalize_domain(domain).context("invalid warmup domain")?;
-        }
         let absolute = std::env::current_dir()?.join(path);
         let base = absolute.parent().unwrap_or_else(|| Path::new("."));
         if config.database.is_relative() {
@@ -108,6 +80,10 @@ impl Config {
         anyhow::ensure!(
             config.admin.ip().is_loopback() || config.allow_remote_admin,
             "non-loopback admin HTTP requires allow_remote_admin=true"
+        );
+        anyhow::ensure!(
+            !config.doh_on_admin || (config.admin.ip().is_loopback() && config.doh.is_none()),
+            "doh_on_admin requires a loopback admin address and no separate doh address"
         );
         Ok(config)
     }

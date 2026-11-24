@@ -37,11 +37,18 @@ type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 struct Web;
 
 pub fn admin_router(state: ApiState) -> Router {
-    Router::new()
+    let router = if state.engine.config.doh_on_admin {
+        doh_queries(&state)
+    } else {
+        Router::new()
+    };
+    router
         .merge(crate::portal::admin_routes())
+        .merge(portal_pages())
         .route("/api/v1/login", post(login))
         .route("/api/v1/logout", post(logout))
         .route("/api/v1/me", get(me))
+        .route("/api/v1/me/password", post(change_password))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/logs", get(logs))
         .route("/api/v1/clients", get(clients).put(update_clients))
@@ -50,7 +57,17 @@ pub fn admin_router(state: ApiState) -> Router {
             get(listener_status).put(update_listeners),
         )
         .route("/api/v1/cache", get(cache_status).put(update_cache))
+        .route(
+            "/api/v1/cache/automation",
+            axum::routing::put(update_cache_jobs),
+        )
+        .route(
+            "/api/v1/cache/automation/{kind}/refresh",
+            post(refresh_cache_job),
+        )
+        .route("/api/v1/adguard/refresh", post(refresh_ads))
         .route("/api/v1/features", get(feature_status).put(update_features))
+        .route("/api/v1/proxy/test", post(test_proxy))
         .route("/api/v1/gfwlist/refresh", post(refresh_gfwlist))
         .route("/api/v1/geoip/refresh", post(refresh_geoip))
         .route("/api/v1/geoip/lookup", post(lookup_geoip))
@@ -80,26 +97,41 @@ pub fn admin_router(state: ApiState) -> Router {
             get(certificate_paths).put(update_certificate_paths),
         )
         .route("/api/v1/certificates/reload", post(reload_certificate))
-        .route("/", get(index))
+        .route("/admin", get(index))
+        .route("/admin/", get(index))
         .route("/{*path}", get(asset))
         .with_state(state)
 }
 
 pub fn doh_router(state: ApiState) -> Router {
-    Router::new()
-        .route("/{endpoint}", get(doh_get).post(doh_post))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::portal::identify_doh,
-        ))
-        .merge(crate::portal::routes())
-        .route("/portal", get(index))
-        .route("/portal/", get(index))
+    doh_queries(&state)
+        .merge(portal_pages())
         .route(
             "/assets/{file}",
             get(|Path(file): Path<String>| async move { serve(&format!("assets/{file}")) }),
         )
         .with_state(state)
+}
+
+fn doh_queries(state: &ApiState) -> Router<ApiState> {
+    Router::new()
+        .route("/dns-query", get(doh_get).post(doh_post))
+        .route("/dns/{credential}", get(doh_get).post(doh_post))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::portal::identify_doh,
+        ))
+}
+
+fn portal_pages() -> Router<ApiState> {
+    Router::new()
+        .merge(crate::portal::routes())
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::temporary("/portal") }),
+        )
+        .route("/portal", get(index))
+        .route("/portal/", get(index))
 }
 
 fn unauthorized() -> (StatusCode, String) {
@@ -171,6 +203,40 @@ async fn login(State(state): State<ApiState>, Json(input): Json<Credentials>) ->
             Err(unauthorized())
         }
     }
+}
+
+#[derive(Deserialize)]
+struct PasswordChange {
+    current_password: String,
+    new_password: String,
+}
+
+async fn change_password(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<PasswordChange>,
+) -> ApiResult {
+    let store = &state.engine.store;
+    let account = require(&headers, store, "admin").await?;
+    if input.new_password.is_empty() || input.new_password == input.current_password {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "请输入与当前密码不同的新密码".into(),
+        ));
+    }
+    if !store
+        .change_password(&account, input.current_password, input.new_password)
+        .await
+        .map_err(internal)?
+    {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "当前密码不正确，或密码刚刚被更改".into(),
+        ));
+    }
+    state.listeners.publish(json!({"type":"session.check"}));
+    Ok(Json(json!({"ok":true})))
 }
 
 async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
@@ -266,12 +332,64 @@ async fn update_features(
     Ok(Json(state.engine.features.snapshot(true).await))
 }
 
+#[derive(Deserialize)]
+struct ProxyTestInput {
+    address: String,
+}
+
+async fn test_proxy(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<ProxyTestInput>,
+) -> ApiResult {
+    require(&headers, &state.engine.store, "admin").await?;
+    let address = input.address.trim();
+    if address.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "请输入代理地址".into()));
+    }
+    let client = crate::upstream::http_client(&state.engine.config, address)
+        .and_then(|builder| {
+            Ok(builder
+                .timeout(std::time::Duration::from_secs(12))
+                .build()?)
+        })
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "代理地址无效或客户端初始化失败".into(),
+            )
+        })?;
+    let start = std::time::Instant::now();
+    let response = client
+        .get("https://www.cloudflare.com/cdn-cgi/trace")
+        .send()
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                if error.is_timeout() {
+                    "代理测试超时"
+                } else {
+                    "代理测试失败，请检查地址、凭据和网络连接"
+                }
+                .into(),
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("代理测试目标返回 HTTP {}", response.status().as_u16()),
+        ));
+    }
+    Ok(Json(json!({"elapsed_ms":start.elapsed().as_millis()})))
+}
+
 async fn refresh_gfwlist(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
     let account = require(&headers, &state.engine.store, "admin").await?;
     state.engine.features.refresh_list().await.map_err(|_| {
         (
             StatusCode::BAD_GATEWAY,
-            "GFWList 更新失败，已保留原有名单，请检查来源地址和上游组代理".into(),
+            "GFWList 更新失败，已保留原有名单，请检查来源地址和下载代理".into(),
         )
     })?;
     state
@@ -302,7 +420,7 @@ async fn refresh_geoip(
         .map_err(|_| {
             (
                 StatusCode::BAD_GATEWAY,
-                "GeoIP 更新失败，已保留原有数据库，请检查地址、代理与数据库格式".into(),
+                "GeoIP 更新失败，可检查该数据库的错误信息后重试".into(),
             )
         })?;
     state
@@ -335,6 +453,66 @@ async fn lookup_geoip(
     Ok(Json(
         json!({"ip":input.ip,"location":location,"allowed":decision.is_ok(),"reason":decision.err()}),
     ))
+}
+
+async fn update_cache_jobs(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::resolver::CacheJobInput>,
+) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "admin").await?;
+    state
+        .engine
+        .set_cache_jobs(input)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    state
+        .engine
+        .store
+        .audit(&account.username, "cache.automation.update", "applied")
+        .await
+        .map_err(internal)?;
+    let stats = state.engine.cache_stats().await;
+    state
+        .listeners
+        .publish(json!({"type":"cache","stats":stats}));
+    Ok(Json(stats))
+}
+async fn refresh_cache_job(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(kind): Path<String>,
+) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "admin").await?;
+    state
+        .engine
+        .refresh_cache_job(&kind)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    state
+        .engine
+        .store
+        .audit(&account.username, "cache.automation.refresh", &kind)
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({"queued":true})))
+}
+async fn refresh_ads(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "admin").await?;
+    state.engine.features.refresh_ads().await.map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "AdGuard 更新失败，请检查来源地址和规则格式".to_owned(),
+        )
+    })?;
+    state
+        .engine
+        .store
+        .audit(&account.username, "adguard.refresh", "updated")
+        .await
+        .map_err(internal)?;
+    state.listeners.publish(json!({"type":"features.changed"}));
+    Ok(Json(state.engine.features.snapshot(true).await))
 }
 
 async fn update_cache(
@@ -966,7 +1144,12 @@ fn serve(path: &str) -> Response {
     }
     let path = if Web::get(path).is_some() {
         path
-    } else if path.contains('.') {
+    } else if path.contains('.')
+        || path.starts_with("api/")
+        || path.starts_with("portal/")
+        || path.starts_with("dns/")
+        || path.starts_with("dns-")
+    {
         return StatusCode::NOT_FOUND.into_response();
     } else {
         "index.html"
@@ -997,14 +1180,11 @@ fn serve(path: &str) -> Response {
 
 pub async fn fetch_subscription(engine: &Engine, id: i64, url: &str) -> anyhow::Result<usize> {
     anyhow::ensure!(url.starts_with("https://"), "HTTPS URL required");
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20));
-    if let Some(path) = &engine.config.subscription_ca {
-        let pem = tokio::fs::read(path).await?;
-        builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
-    }
-    let client = builder.build()?;
+    let runtime = engine.features.current.load_full();
+    let client =
+        crate::upstream::http_client(&engine.config, runtime.settings.subscription_proxy())?
+            .timeout(Duration::from_secs(20))
+            .build()?;
     let response = client.get(url).send().await?.error_for_status()?;
     let mut stream = response.bytes_stream();
     let mut data = Vec::new();

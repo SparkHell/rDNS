@@ -1,4 +1,5 @@
 mod access;
+mod adguard;
 mod api;
 mod cache;
 mod config;
@@ -8,6 +9,7 @@ mod gfwlist;
 mod portal;
 mod query_log;
 mod resolver;
+mod root_zone;
 mod runtime;
 mod service;
 mod store;
@@ -30,24 +32,46 @@ async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("installing rustls ring crypto provider"))?;
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let mut instance = String::new();
+    if args.get(1).is_some_and(|arg| arg == "--instance") {
+        anyhow::ensure!(
+            args.len() >= 5,
+            "--instance <name> requires a service command"
+        );
+        instance = args.remove(2);
+        args.remove(1);
+        anyhow::ensure!(
+            args.iter().skip(1).any(|arg| arg == "service"),
+            "--instance requires a service command"
+        );
+    }
+    const USAGE: &str = "rdns [config.toml] | rdns service install [config.toml] | rdns --config <config.toml> service install | rdns [--instance <name>] service <start|stop|restart|status|enable|disable|uninstall> | rdns init-admin <config.toml> <username>";
     let (config_path, init_user) = match args.as_slice() {
         [_] => (PathBuf::from("config.toml"), None),
+        [_, flag] if matches!(flag.as_str(), "--help" | "-h") => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        [_, flag, path, command, action]
+            if flag == "--config" && command == "service" && action == "install" =>
+        {
+            return service::install(&PathBuf::from(path), &instance);
+        }
         [_, path] => (PathBuf::from(path), None),
         [_, command, action] if command == "service" && action == "install" => {
-            service::install(&PathBuf::from("config.toml"))?;
+            service::install(&PathBuf::from("config.toml"), &instance)?;
             return Ok(());
         }
         [_, command, action, path] if command == "service" && action == "install" => {
-            service::install(&PathBuf::from(path))?;
+            service::install(&PathBuf::from(path), &instance)?;
             return Ok(());
         }
+        [_, command, action] if command == "service" => return service::manage(action, &instance),
         [_, command, path, user] if command == "init-admin" => {
             (PathBuf::from(path), Some(user.as_str()))
         }
-        _ => anyhow::bail!(
-            "usage: rdns [config.toml] | rdns service install [config.toml] | rdns init-admin <config.toml> <username> (password on stdin)"
-        ),
+        _ => anyhow::bail!("{USAGE}"),
     };
     let config = config::Config::load(&config_path)?;
     let store = store::Store::open(&config.database).await?;
@@ -86,10 +110,14 @@ async fn main() -> Result<()> {
     listeners.apply(state.clone(), initial, false).await?;
     tracing::info!(admin=%config.admin, "rDns starting");
 
-    if config.warmup.enabled {
-        tokio::spawn(engine.clone().warmup());
-    }
+    engine.start_cache_jobs().await?;
 
+    let mut changes = engine.features.subscription_updates.subscribe();
+    let publish_subscriptions = async {
+        while changes.changed().await.is_ok() {
+            listeners.publish(serde_json::json!({"type":"features.changed"}));
+        }
+    };
     let maintenance_engine = engine.clone();
     let maintenance = async move {
         let mut last_subscriptions = tokio::time::Instant::now();
@@ -131,10 +159,14 @@ async fn main() -> Result<()> {
         tokio::signal::ctrl_c().await?;
         Ok::<(), std::io::Error>(())
     };
-    let admin = axum::serve(admin_listener, api::admin_router(state));
+    let admin = axum::serve(
+        admin_listener,
+        api::admin_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    );
     tokio::select! {
         result = admin => result.context("admin listener")?,
         _ = publish_stats => {},
+        _ = publish_subscriptions => {},
         result = maintenance => result?,
         result = shutdown => result?,
     }

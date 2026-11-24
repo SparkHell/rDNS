@@ -19,6 +19,14 @@ with `base64 --decode resources/gfwlist.txt`.
 `src/geoip.rs` adapts the offline XDB v3 reader from the adjacent MirrorProxy
 repository, whose algorithm is adapted from the official ip2region Rust
 binding: https://github.com/lionsoul2014/ip2region, Apache-2.0 OR MIT.
-The reader retains that provenance in its source header. XDB database files
-are downloaded separately and retain the upstream data's terms; they are not
-committed or embedded into rDns.
+The reader retains that provenance in its source header. Release archives include the upstream IPv4 and IPv6 XDB files from the
+`data/` directory and the upstream license. The databases are separate files
+and retain their upstream terms.
+
+## AdGuard DNS Filter and AdAway
+
+Release archives include the two published lists from the
+[AdGuard Host Lists Registry](https://github.com/AdguardTeam/HostlistsRegistry)
+and the Registry and AdAway license notices. The raw lists retain their
+embedded source and license notices. rDns reads supported DNS rules from the
+files at startup when SQLite has no previously downloaded AdGuard rules.

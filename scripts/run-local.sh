@@ -61,8 +61,8 @@ fi
 
 printf 'Management HTTP listening on %s:3000 (user: admin)\n' "$authority"
 case "$bind_host" in
-  0.0.0.0|::) printf 'Console: open http://<server-IP>:3000 in your browser.\n' ;;
-  *) printf 'Console: http://%s:3000\n' "$authority" ;;
+  0.0.0.0|::) printf 'Console: open http://<server-IP>:3000/admin in your browser.\n' ;;
+  *) printf 'Portal: http://%s:3000/ · Console: http://%s:3000/admin\n' "$authority" "$authority" ;;
 esac
 printf 'DNS listeners start disabled. In 监听服务, set DNS UDP to 127.0.0.1:1053 and enable it.\n'
 printf 'Then query: dig @127.0.0.1 -p 1053 cloudflare.com A +dnssec\n'

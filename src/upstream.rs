@@ -28,6 +28,8 @@ pub struct DohServer {
 pub struct GroupSettings {
     pub name: String,
     pub servers: Vec<DohServer>,
+    pub use_proxy: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub proxy: String,
     pub timeout_ms: u64,
 }
@@ -36,6 +38,7 @@ impl Default for GroupSettings {
         Self {
             name: "default".into(),
             servers: vec![],
+            use_proxy: false,
             proxy: String::new(),
             timeout_ms: 3000,
         }
@@ -114,9 +117,20 @@ pub fn http_client(config: &Config, proxy: &str) -> Result<reqwest::ClientBuilde
 }
 
 pub async fn download(config: &Config, url: &str, proxy: &str, limit: usize) -> Result<Vec<u8>> {
+    download_with_timeout(config, url, proxy, limit, Duration::from_secs(60)).await
+}
+
+pub async fn download_with_timeout(
+    config: &Config,
+    url: &str,
+    proxy: &str,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     validate_https(url)?;
     let response = http_client(config, proxy)?
-        .timeout(Duration::from_secs(60))
+        .read_timeout(Duration::from_secs(60))
+        .timeout(timeout)
         .build()?
         .get(url)
         .send()
@@ -127,7 +141,7 @@ pub async fn download(config: &Config, url: &str, proxy: &str, limit: usize) -> 
     bounded_body(response, limit).await
 }
 
-async fn bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+pub(crate) async fn bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     ensure!(
         response.content_length().is_none_or(|n| n <= limit as u64),
         "response exceeds size limit"
@@ -235,7 +249,8 @@ impl DohGroup {
             self.cache_namespace,
             hex::encode(Sha256::digest(&wire))
         );
-        if let Some(answer) = self.cache.get(&key, id).await {
+        let bypass = crate::cache::bypass_cache(&message);
+        if !bypass && let Some(answer) = self.cache.get(&key, id).await {
             return Ok(answer);
         }
         let start = self.next.fetch_add(1, Ordering::Relaxed) as usize % self.endpoints.len();
@@ -304,7 +319,9 @@ impl DohGroup {
             };
             if let Ok(Ok(answer)) = tokio::time::timeout(attempt_timeout, attempt).await {
                 endpoint.cooldown_until.store(0, Ordering::Relaxed);
-                self.cache.insert(&key, &answer).await;
+                if !bypass {
+                    self.cache.insert(&key, &answer).await;
+                }
                 return Ok(answer);
             }
             endpoint.failures.fetch_add(1, Ordering::Relaxed);

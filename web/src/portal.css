@@ -158,3 +158,64 @@
     font-size: 18px;
   }
 }
+
+.portal-config-block {padding:0 0 18px;margin:0 0 20px;border-bottom:1px solid #43464d}
+.portal-config-block h3 {font-size:15px;margin:0 0 16px}
+.portal-config-block fieldset {min-width:0}
+.portal-config-block legend {font-weight:600}
+.smtp-settings {margin-top:14px}
+.smtp-settings summary,.portal-provider summary {cursor:pointer;color:#c3cbd7;font-size:13px}
+.smtp-settings[open] summary,.portal-provider details[open] summary {margin-bottom:14px}
+
+.portal-methods {display:flex;flex-wrap:wrap;gap:6px}
+.portal-methods:empty {display:none}
+.portal-methods button {border:1px solid #515764;border-radius:6px;padding:8px 10px;color:#dce2e8;background:transparent;cursor:pointer}
+.portal-methods button[aria-pressed=true] {border-color:#00ab62;background:#20372c;color:white}
+
+.portal-user-toolbar {border-bottom:1px solid #43464d}
+.portal-user-toolbar label:first-child {flex:1;min-width:min(100%, 16rem);max-width:36rem}
+.portal-user-toolbar input {
+  min-width:0;
+  border:1px solid #515764;
+  border-radius:8px;
+  background:#212327;
+  color:#f0f2f5;
+  padding:9px 11px;
+}
+.portal-user-editor {padding:18px 22px;border-bottom:1px solid #43464d}
+.portal-user-editor h3 {margin:0 0 16px;font-size:15px}
+.portal-user-editor fieldset {border:0;margin:0;padding:0;min-width:0}
+.portal-user-editor p {margin:10px 0;color:#c3cbd7;font-size:13px}
+.portal-user-editor .portal-buttons {margin-top:16px}
+.portal-user-actions {gap:8px 12px}
+.portal-user-actions .text-button {min-height:40px;white-space:nowrap}
+
+.portal-user-name {overflow-wrap:anywhere;white-space:normal}
+.portal-user-name small {display:none;color:#b6bdc9}
+
+@media (max-width:680px) {
+  .portal-user-name small {display:block;margin-top:4px}
+  .portal-user-list :is(th,td):is(:first-child,:nth-child(3)) {display:none}
+  .portal-user-list :is(th,td) {padding:10px 8px}
+  .portal-user-list .table-wrap table {table-layout:fixed}
+  .portal-user-list th:nth-child(2) {width:38%}
+  .portal-user-list th:nth-child(4) {width:19%}
+  .portal-user-list td .portal-user-actions {gap:0 5px}
+  .portal-user-list .table-wrap td.empty {display:table-cell}
+  .portal-admin .panel-head:has(.portal-user-actions) {flex-wrap:wrap}
+  .portal-user-toolbar label:first-child {flex-basis:100%}
+}
+
+.ios-profile-qr {
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:20px;
+  padding:18px 0;
+  border-top:1px solid #454850;
+}
+.ios-profile-qr img {display:block;width:min(240px,100%);height:auto;background:#fff}
+.ios-profile-qr div {flex:1;min-width:min(100%,15rem)}
+.ios-profile-qr h3 {margin:0 0 8px;font-size:16px}
+.ios-profile-qr p {margin:0 0 8px;color:#c3cbd7}
+.ios-profile-qr a {display:inline-block;padding-left:0}

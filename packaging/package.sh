@@ -18,7 +18,9 @@ trap 'rm -rf "$staging"' EXIT
 cp "$binary" "$staging/rdns"
 cp config.example.toml README.md LICENSE THIRD-PARTY.md "$staging/"
 mkdir -p "$staging/resources"
-cp resources/gfwlist.txt resources/gfwlist-LICENSE.txt "$staging/resources/"
+bash packaging/fetch-data.sh "$staging/resources"
+cp resources/gfwlist-LICENSE.txt "$staging/resources/"
+(cd "$staging/resources" && sha256sum geoip/*.xdb gfwlist.txt adguard-dns.txt adaway.txt > SHA256SUMS)
 cp packaging/rdns.service "$staging/"
 archive="release/rdns-${version}-${target}.tar.gz"
 tar -C "$staging" -czf "$archive" .

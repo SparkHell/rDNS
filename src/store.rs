@@ -80,6 +80,8 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS listener_settings (id INTEGER PRIMARY KEY CHECK(id=1), settings TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS cache_settings (id INTEGER PRIMARY KEY CHECK(id=1), settings TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS runtime_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS radar_rankings (region TEXT PRIMARY KEY, domains TEXT NOT NULL DEFAULT '[]', ranking_date TEXT, updated_at INTEGER, attempted_at INTEGER NOT NULL, error TEXT)",
+            "CREATE TABLE IF NOT EXISTS root_delegations (id INTEGER PRIMARY KEY CHECK(id=1), serial INTEGER NOT NULL, zone TEXT NOT NULL, checked_at INTEGER NOT NULL, etag TEXT)",
             "CREATE TABLE IF NOT EXISTS cache_entries (cache_key TEXT PRIMARY KEY, response BLOB NOT NULL, inserted_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, kind TEXT NOT NULL, byte_size INTEGER NOT NULL)",
             "CREATE INDEX IF NOT EXISTS idx_cache_entries_expiry ON cache_entries(expires_at)",
             "CREATE INDEX IF NOT EXISTS idx_query_log_at ON query_log(at DESC)",
@@ -189,13 +191,15 @@ impl Store {
             .transpose()
     }
 
-    pub async fn set_cache_settings(&self, settings: &CacheSettings) -> Result<()> {
+    pub async fn set_cache_settings(&self, settings: &CacheSettings, reset: bool) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO cache_settings(id,settings) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET settings=excluded.settings")
             .bind(serde_json::to_string(settings)?).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM cache_entries")
-            .execute(&mut *tx)
-            .await?;
+        if reset {
+            sqlx::query("DELETE FROM cache_entries")
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -254,11 +258,7 @@ impl Store {
             "username must have at least 3 characters"
         );
         anyhow::ensure!(!password.is_empty(), "password cannot be empty");
-        let salt = SaltString::generate(&mut OsRng);
-        let hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-            .to_string();
+        let hash = password_hash(password)?;
         sqlx::query("INSERT INTO accounts(username,role,password_hash) VALUES(?,?,?)")
             .bind(username)
             .bind(role)
@@ -314,11 +314,7 @@ impl Store {
             return Ok(None);
         };
         let hash: String = row.get("password_hash");
-        let parsed = PasswordHash::new(&hash).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        if Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_err()
-        {
+        if !password_matches(password, &hash)? {
             return Ok(None);
         }
         let mut bytes = [0u8; 32];
@@ -326,13 +322,68 @@ impl Store {
         let token = hex::encode(bytes);
         let token_hash = hash_token(&token);
         let expires = (Utc::now() + chrono::Duration::hours(12)).to_rfc3339();
-        sqlx::query("INSERT INTO sessions(token_hash,account_id,expires_at) VALUES(?,?,?)")
-            .bind(token_hash)
-            .bind(row.get::<i64, _>("id"))
-            .bind(expires)
-            .execute(&self.pool)
+        let inserted = sqlx::query(
+            "INSERT INTO sessions(token_hash,account_id,expires_at)
+            SELECT ?,id,? FROM accounts WHERE id=? AND password_hash=?",
+        )
+        .bind(token_hash)
+        .bind(expires)
+        .bind(row.get::<i64, _>("id"))
+        .bind(hash)
+        .execute(&self.pool)
+        .await?;
+        Ok((inserted.rows_affected() == 1).then_some(token))
+    }
+
+    pub async fn change_password(
+        &self,
+        account: &Account,
+        current: String,
+        new: String,
+    ) -> Result<bool> {
+        let Some(hash) =
+            sqlx::query_scalar::<_, String>("SELECT password_hash FROM accounts WHERE id=?")
+                .bind(account.id)
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(false);
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            if password_matches(&current, &hash)? {
+                Ok(Some((hash, password_hash(&new)?)))
+            } else {
+                Ok::<_, anyhow::Error>(None)
+            }
+        })
+        .await??;
+        let Some((old_hash, new_hash)) = result else {
+            return Ok(false);
+        };
+        let mut tx = self.pool.begin().await?;
+        let updated =
+            sqlx::query("UPDATE accounts SET password_hash=? WHERE id=? AND password_hash=?")
+                .bind(new_hash)
+                .bind(account.id)
+                .bind(old_hash)
+                .execute(&mut *tx)
+                .await?;
+        if updated.rows_affected() != 1 {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM sessions WHERE account_id=?")
+            .bind(account.id)
+            .execute(&mut *tx)
             .await?;
-        Ok(Some(token))
+        sqlx::query("INSERT INTO audit(at,actor,action,detail) VALUES(?,?,?,?)")
+            .bind(Utc::now().to_rfc3339())
+            .bind(&account.username)
+            .bind("account.password.change")
+            .bind("sessions revoked")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn account_for_token(&self, token: &str) -> Result<Option<Account>> {
@@ -552,6 +603,9 @@ impl Store {
             .bind(Utc::now().to_rfc3339())
             .execute(&self.pool)
             .await?;
+        sqlx::query("DELETE FROM portal_profile_tickets WHERE expires<=unixepoch()")
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM portal_sessions WHERE expires<=unixepoch()")
             .execute(&self.pool)
             .await?;
@@ -564,6 +618,20 @@ impl Store {
             .await?;
         Ok(())
     }
+}
+
+fn password_hash(password: &str) -> Result<String> {
+    Argon2::default()
+        .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+        .map(|hash| hash.to_string())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+fn password_matches(password: &str, hash: &str) -> Result<bool> {
+    let parsed = PasswordHash::new(hash).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
 }
 
 fn hash_token(token: &str) -> String {

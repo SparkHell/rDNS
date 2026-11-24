@@ -32,11 +32,11 @@ def port():
         return sock.getsockname()[1]
 
 
-def certificate(directory, name):
+def certificate(directory, name, dns_names="DNS:localhost"):
     cert, key = directory / f"{name}.crt", directory / f"{name}.key"
     subprocess.run(
         ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-         "-subj", f"/CN={name}", "-addext", "subjectAltName=DNS:localhost",
+         "-subj", f"/CN={name}", "-addext", f"subjectAltName={dns_names}",
          "-addext", "basicConstraints=critical,CA:FALSE", "-addext", "extendedKeyUsage=serverAuth",
          "-keyout", str(key), "-out", str(cert)],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -430,6 +430,11 @@ def listener_run():
                 assert initial["settings"]["dns_udp"]["address"] == "0.0.0.0:53"
                 cache = api(base, "/cache", token=token)
                 assert cache["settings"]["memory_mib"] == 64
+                jobs = cache["automation"]["settings"]
+                assert jobs == dict(ns=False,radar=False,global_top_1000=False,regions=[],local_hot_enabled=False,warm_domain_limit=1000,local_window_hours=24,local_min_queries=3)
+                enabled = api(base, "/cache/automation", dict(jobs,ns=True), token, method="PUT")["automation"]
+                assert enabled["root"]["count"] > 1000
+                assert api(base, "/cache/automation", jobs, token, method="PUT")["automation"]["root"] is None
                 cache_settings = {**cache["settings"], "memory_mib":8, "ns_max_ttl":3600}
                 assert api(base, "/cache", cache_settings, token, method="PUT")["settings"] == cache_settings
                 expect_http_error(409, lambda: api(base, "/listeners", {

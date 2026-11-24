@@ -2,9 +2,25 @@ use crate::config::Config;
 use anyhow::{Context, Result};
 use std::{fs, path::Path, process::Command};
 
-const UNIT_PATH: &str = "/etc/systemd/system/rdns.service";
+const UNIT_DIR: &str = "/etc/systemd/system";
 
-pub fn install(config_path: &Path) -> Result<()> {
+fn unit_name(instance: &str) -> Result<String> {
+    anyhow::ensure!(
+        instance.len() <= 64
+            && instance
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "invalid instance name"
+    );
+    Ok(if instance.is_empty() {
+        "rdns.service".into()
+    } else {
+        format!("rdns-{instance}.service")
+    })
+}
+
+pub fn install(config_path: &Path, instance: &str) -> Result<()> {
+    let name = unit_name(instance)?;
     anyhow::ensure!(
         cfg!(target_os = "linux"),
         "systemd service installation requires Linux"
@@ -50,28 +66,54 @@ pub fn install(config_path: &Path) -> Result<()> {
     }
     ensure_writable_by_service(data_dir)?;
     let unit = unit_text(&binary, &config_path, data_dir)?;
-    let unit_path = Path::new(UNIT_PATH);
+    let unit_path = Path::new(UNIT_DIR).join(&name);
     if unit_path.exists() {
-        let existing = fs::read_to_string(unit_path)?;
+        let existing = fs::read_to_string(&unit_path)?;
         anyhow::ensure!(
             existing.starts_with("# Managed by rDns\n"),
             "{} exists and is not managed by rDns",
-            UNIT_PATH
+            unit_path.display()
         );
     }
-    let was_active = service_active()?;
-    fs::write(unit_path, unit).with_context(|| format!("writing {UNIT_PATH}"))?;
+    let was_active = service_active(&name)?;
+    fs::write(&unit_path, unit).with_context(|| format!("writing {}", unit_path.display()))?;
     command("systemctl", &["daemon-reload"])?;
-    command("systemctl", &["enable", "--now", "rdns.service"])?;
+    command("systemctl", &["enable", "--now", &name])?;
     if was_active {
-        command("systemctl", &["restart", "rdns.service"])?;
+        command("systemctl", &["restart", &name])?;
     }
-    command("systemctl", &["is-active", "--quiet", "rdns.service"])?;
+    command("systemctl", &["is-active", "--quiet", &name])?;
     println!(
-        "Installed and started rdns.service using {}",
+        "Installed and started {name} using {}",
         config_path.display()
     );
     Ok(())
+}
+
+pub fn manage(action: &str, instance: &str) -> Result<()> {
+    let name = unit_name(instance)?;
+    let unit = name.as_str();
+    match action {
+        "status" => command("systemctl", &["--no-pager", "status", unit]),
+        "start" | "stop" | "restart" | "enable" | "disable" => {
+            command("systemctl", &[action, unit])?;
+            println!("systemctl {action} {unit} succeeded");
+            Ok(())
+        }
+        "uninstall" => {
+            let path = Path::new(UNIT_DIR).join(unit);
+            anyhow::ensure!(
+                fs::read_to_string(&path)?.starts_with("# Managed by rDns\n"),
+                "refusing to remove an unmanaged unit"
+            );
+            command("systemctl", &["disable", "--now", unit])?;
+            fs::remove_file(path)?;
+            command("systemctl", &["daemon-reload"])?;
+            println!("Removed {unit}");
+            Ok(())
+        }
+        _ => anyhow::bail!("unknown service action {action}; use rdns --help"),
+    }
 }
 
 fn unit_text(binary: &Path, config: &Path, data_dir: &Path) -> Result<String> {
@@ -104,9 +146,9 @@ fn user_exists(user: &str) -> Result<bool> {
         .success())
 }
 
-fn service_active() -> Result<bool> {
+fn service_active(name: &str) -> Result<bool> {
     Ok(Command::new("systemctl")
-        .args(["is-active", "--quiet", "rdns.service"])
+        .args(["is-active", "--quiet", name])
         .status()?
         .success())
 }
