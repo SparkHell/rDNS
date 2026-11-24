@@ -1,4 +1,7 @@
 """Exercise the HTTPS portal against a temporary database and local identity provider."""
+import plistlib
+import socketserver
+import email
 import base64
 import hashlib
 import http.client
@@ -72,12 +75,31 @@ class Identity(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class Mailbox(socketserver.StreamRequestHandler):
+    def handle(self):
+        self.wfile.write(b'220 localhost ready\r\n')
+        while line := self.rfile.readline():
+            verb = line.split()[0].upper()
+            if verb == b'DATA':
+                self.wfile.write(b'354 send message\r\n')
+                raw = b''.join(iter(self.rfile.readline, b'.\r\n'))
+                body = email.message_from_bytes(raw).get_payload(decode=True)
+                self.server.code = re.search(rb'\b[0-9]{8}\b', body)[0].decode()
+            elif verb == b'QUIT':
+                self.wfile.write(b'221 bye\r\n')
+                return
+            self.wfile.write(b'250 OK\r\n')
+
+
 def run(directory):
     cert, key = certificate(directory, 'localhost')
     idp = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Identity)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
     idp.socket = ctx.wrap_socket(idp.socket, server_side=True)
+    smtp = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Mailbox)
+    smtp.socket = ctx.wrap_socket(smtp.socket, server_side=True)
+    threading.Thread(target=smtp.serve_forever, daemon=True).start()
     issuer = idp.base = f'https://localhost:{idp.server_port}'
     idp.grants, idp.key, idp.overrides, idp.corrupt = {}, key, {}, False
     modulus = subprocess.check_output(['openssl','rsa','-in',key,'-noout','-modulus']).decode().strip().split('=')[1]
@@ -117,6 +139,10 @@ private_key = "localhost.key"
                         'Content-Type':'application/dns-message' if raw else 'application/json'})
             res=con.getresponse()
             data=res.read()
+            if path == '/portal/api/rdns.mobileconfig' and status == 200:
+                assert res.getheader('Content-Type') == 'application/x-apple-aspen-config'
+                assert 'rdns.mobileconfig' in res.getheader('Content-Disposition')
+                assert res.getheader('Cache-Control') == 'no-store'
             assert res.status==status,(res.status,status,data[:100])
             return (json.loads(data) if res.getheader('Content-Type','').startswith('application/json') else data,
                     res.getheader('Set-Cookie','').split(';')[0],res.getheader('Location'))
@@ -126,6 +152,14 @@ private_key = "localhost.key"
         return call('/portal/api/register',dict(username=name,password='test-password'),status=status)[1]
     def profile(cookie):
         return call('/portal/api/me',cookie=cookie)[0]
+    mobile = '/portal/api/rdns.mobileconfig'
+    def mobile_profile(cookie, address):
+        doc = plistlib.loads(call(mobile, cookie=cookie)[0])
+        payload, = doc['PayloadContent']
+        assert doc['PayloadType'] == 'Configuration'
+        assert payload['PayloadType'] == 'com.apple.dnsSettings.managed'
+        assert payload['DNSSettings'] == dict(DNSProtocol='HTTPS', ServerURL=address)
+        return doc['PayloadUUID']
     def flow(provider, status=303):
         _,flow_cookie,location=call('/portal/auth/'+provider,status=303)
         auth=parse_qs(urlsplit(location).query)
@@ -151,6 +185,9 @@ private_key = "localhost.key"
         a,b=member('alice'),member('bob')
         alice,bob=profile(a),profile(b)
         assert alice['path']!=bob['path'] and re.fullmatch('/dns-[a-zA-Z0-9]{22}',alice['path'])
+        call(mobile, status=401)
+        original = mobile_profile(a, public + alice['path'])
+        assert mobile_profile(b, public + bob['path']) != original
         wire=query('portal.test')
         check=lambda data: rcode(data)==0 and data.endswith(bytes([192,0,2,27]))
         assert check(call(alice['path']+'?dns='+b64(wire))[0])
@@ -186,6 +223,7 @@ private_key = "localhost.key"
             call('/portal/api/rotate',{},a)
             poll.result(timeout=5)
         new=profile(a)['path']
+        assert mobile_profile(a, public + new) == original
         call(alice['path'],wire,status=404)
         assert check(call(new,wire)[0])
         assert call('/portal/api/analytics',cookie=a)[0]['total']>=2
@@ -193,15 +231,49 @@ private_key = "localhost.key"
             assert check(call(new,wire)[0])
         more=call('/portal/api/analytics?days=30&page=2',cookie=a)[0]
         assert more['logs'] and more['retention']==7 and more['trend'] and more['domains'][0]['domain']=='portal.test'
+        send, verify = '/portal/api/email/send', '/portal/api/email/login'
+        address = {'email': 'reader@Example.Test'}
+        call(send, address, status=403)
+        cfg['email'] = dict(enabled=True, host='localhost', port=smtp.server_address[1],
+                            sender='portal@example.test', domains='example.test')
+        cfg['registration'] = 'approval'
+        admin('settings', cfg, 'PUT')
+        call(send, {'email': 'reader@sub.example.test'}, status=403)
+        call(send, address)
+        call(send, address, status=429)
+        call(verify, dict(**address, code='invalid'), status=401)
+        _, mail_cookie, _ = call(verify, dict(**address, code=smtp.code))
+        assert profile(mail_cookie)['status'] == 'pending'
+        call(verify, dict(**address, code=smtp.code), status=401)
+        exhausted = {'email': 'attempts@example.test'}
+        call(send, exhausted)
+        for _ in range(5):
+            call(verify, dict(**exhausted, code='invalid'), status=401)
+        call(verify, dict(**exhausted, code=smtp.code), status=401)
+        revoked = {'email': 'revoked@example.test'}
+        call(send, revoked)
+        cfg['email']['domains'] = 'other.test'
+        admin('settings', cfg, 'PUT')
+        call(verify, dict(**revoked, code=smtp.code), status=403)
+        cfg['email']['domains'] = 'example.test'
+        admin('settings', cfg, 'PUT')
+        call(verify, dict(**revoked, code=smtp.code), status=401)
         cfg.update(base=public,registration='approval',public=False)
         admin('settings',cfg,'PUT')
         call('/dns-query',wire,status=404)
+        cfg['base'] = 'https://resolver.example.test:8443'
+        admin('settings', cfg, 'PUT')
+        mobile_profile(a, cfg['base'] + new)
+        cfg['base'] = public
+        admin('settings', cfg, 'PUT')
         pending=member('pending')
+        call(mobile, cookie=pending, status=403)
         assert profile(pending)['path'] is None
         admin('users/'+str(profile(pending)['id']),{'action':'activate'})
         assert check(call(profile(pending)['path'],wire)[0])
         admin('users/'+str(bob['id']),{'action':'disable'})
         call('/portal/api/me',cookie=b,status=401)
+        call(mobile,cookie=b,status=401)
         call(bob['path'],wire,status=404)
         cfg['registration']='closed'
         admin('settings',cfg,'PUT')
@@ -250,6 +322,7 @@ private_key = "localhost.key"
         print('PASS: portal policies, OAuth/OIDC validation, isolation, DoH ownership and restart')
     finally:
         server.terminate();server.wait(timeout=10)
+        smtp.shutdown();smtp.server_close()
         idp.shutdown();idp.server_close();db.close();server_log.close()
 
 

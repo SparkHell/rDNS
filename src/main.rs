@@ -86,6 +86,10 @@ async fn main() -> Result<()> {
     listeners.apply(state.clone(), initial, false).await?;
     tracing::info!(admin=%config.admin, "rDns starting");
 
+    if config.warmup.enabled {
+        tokio::spawn(engine.clone().warmup());
+    }
+
     let maintenance_engine = engine.clone();
     let maintenance = async move {
         let mut last_subscriptions = tokio::time::Instant::now();

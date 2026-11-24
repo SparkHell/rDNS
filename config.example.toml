@@ -19,3 +19,9 @@ allowed_clients = ["127.0.0.0/8", "::1/128"]
 # Optional override for the bundled InterNIC root hints.
 # root_hints = "/etc/rdns/named.root"
 query_log_days = 7
+
+# Startup cache warmup runs once in the background. Seeds are queried for A and AAAA.
+[warmup]
+enabled = true
+history_limit = 32
+domains = ["www.baidu.com", "www.qq.com", "www.apple.com", "www.microsoft.com"]

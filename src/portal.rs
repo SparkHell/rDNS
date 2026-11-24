@@ -1,4 +1,6 @@
+mod email;
 mod federation;
+mod mobileconfig;
 mod reporting;
 
 use crate::api::{ApiState, require};
@@ -68,6 +70,9 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS portal_users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, password TEXT, identity TEXT UNIQUE, status TEXT NOT NULL, credential TEXT COLLATE BINARY UNIQUE)",
         "CREATE UNIQUE INDEX IF NOT EXISTS portal_local_name ON portal_users(name) WHERE identity IS NULL",
         "CREATE TABLE IF NOT EXISTS portal_sessions(hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES portal_users(id),expires INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS portal_mail(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL)",
+        "INSERT OR IGNORE INTO portal_mail VALUES(1,'{}')",
+        "CREATE TABLE IF NOT EXISTS portal_codes(address TEXT PRIMARY KEY, hash TEXT NOT NULL, sent INTEGER NOT NULL, attempts INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS portal_flows(state TEXT PRIMARY KEY,browser TEXT NOT NULL,provider TEXT NOT NULL,revision TEXT NOT NULL,verifier TEXT NOT NULL,nonce TEXT NOT NULL,expires INTEGER NOT NULL)",
     ] {
         sqlx::query(sql).execute(&mut *tx).await?;
@@ -94,9 +99,12 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/portal/api/options", get(options))
+        .route("/portal/api/email/send", post(email::send))
+        .route("/portal/api/email/login", post(email::login))
         .route("/portal/api/register", post(register))
         .route("/portal/api/login", post(login))
         .route("/portal/api/logout", post(logout))
+        .route("/portal/api/rdns.mobileconfig", get(mobileconfig::download))
         .route("/portal/api/me", get(me))
         .route("/portal/api/rotate", post(rotate))
         .route("/portal/api/analytics", get(reporting::personal))
@@ -152,6 +160,8 @@ pub async fn identify_doh(State(s): State<ApiState>, mut req: Request, next: Nex
 }
 #[derive(Deserialize, Serialize, Clone)]
 struct Settings {
+    #[serde(default)]
+    email: Option<email::Config>,
     registration: String,
     public: bool,
     base: String,
@@ -163,6 +173,7 @@ async fn load(pool: &SqlitePool) -> Result<Settings> {
         .await
         .map_err(internal)?;
     Ok(Settings {
+        email: Some(email::config(pool).await?),
         registration: row.get("registration"),
         public: row.get("public"),
         base: row.get("base"),
@@ -172,7 +183,7 @@ async fn load(pool: &SqlitePool) -> Result<Settings> {
 async fn options(State(s): State<ApiState>) -> Reply {
     let cfg = load(&s.engine.store.pool).await?;
     Ok(Json(
-        json!({"registration":cfg.registration,"providers":cfg.providers.iter().map(|p|json!({"id":p.id,"label":p.label})).collect::<Vec<_>>()}),
+        json!({"email":cfg.email.is_some_and(|c| c.enabled),"registration":cfg.registration,"providers":cfg.providers.iter().map(|p|json!({"id":p.id,"label":p.label})).collect::<Vec<_>>()}),
     ))
 }
 async fn administrator(s: &ApiState, h: &HeaderMap) -> Result<String> {
@@ -181,6 +192,9 @@ async fn administrator(s: &ApiState, h: &HeaderMap) -> Result<String> {
 async fn settings(State(s): State<ApiState>, h: HeaderMap) -> Reply {
     administrator(&s, &h).await?;
     let mut cfg = load(&s.engine.store.pool).await?;
+    if let Some(c) = &mut cfg.email {
+        c.password.clear();
+    }
     for p in &mut cfg.providers {
         p.secret.clear();
     }
@@ -225,6 +239,9 @@ async fn configure(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(internal)?;
+    if let Some(mail) = cfg.email.take() {
+        email::save(&mut tx, mail).await?;
+    }
     let raw: String = sqlx::query_scalar("SELECT providers FROM portal_settings WHERE id=1")
         .fetch_one(&mut *tx)
         .await

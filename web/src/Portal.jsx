@@ -235,6 +235,36 @@ function Analytics({ token, users = [] }) {
   )
 }
 
+function EmailLogin({ busy, action, load }) {
+  const [email, setEmail] = useState('')
+  const [sent, setSent] = useState(false)
+  const [code, setCode] = useState('')
+  async function send() {
+    await request(memberAPI + '/email/send', { method: 'POST', body: { email } })
+    setCode('')
+    setSent(true)
+  }
+  return (
+    <form className="login-form" onSubmit={(e) => {
+      e.preventDefault()
+      action(sent ? async () => {
+        await request(memberAPI + '/email/login', { method: 'POST', body: { email, code } })
+        await load()
+      } : send)
+    }}>
+      <label>登录邮箱<input type="email" required autoComplete="email" disabled={busy}
+        value={email} onChange={(e) => { setEmail(e.target.value); setSent(false); setCode('') }} /></label>
+      {sent && <>
+        <p role="status">验证码已发送，10 分钟内有效。</p>
+        <label>验证码<input required inputMode="numeric" autoComplete="one-time-code"
+          pattern="[0-9]{8}" maxLength={8} value={code} onChange={(e) => setCode(e.target.value)} /></label>
+        <button className="btn tertiary" type="button" disabled={busy} onClick={() => action(send)}>重新发送</button>
+      </>}
+      <button className="btn primary" disabled={busy}>{sent ? '使用验证码登录' : '发送邮箱验证码'}</button>
+    </form>
+  )
+}
+
 export function Portal() {
   const [user, setUser] = useState(null),
     [options, setOptions] = useState(null),
@@ -337,6 +367,7 @@ export function Portal() {
               {signup ? '已有账号，去登录' : '注册新账号'}
             </button>
           )}
+          {options.email && <EmailLogin busy={busy} action={action} load={load} />}
           {options.providers.map((p) => (
             <a className="btn tertiary" key={p.id} href={'/portal/auth/' + p.id}>
               使用 {p.label} 登录
@@ -366,6 +397,9 @@ export function Portal() {
                   >
                     {copied ? '已复制' : '复制地址'}
                   </button>
+                  <a className="btn tertiary" href={memberAPI + '/rdns.mobileconfig'}>
+                    下载 iOS 描述文件
+                  </a>
                   <button
                     disabled={busy}
                     className="btn tertiary"
@@ -380,6 +414,7 @@ export function Portal() {
                     更换地址
                   </button>
                 </div>
+                <p>在 iPhone 的“设置”中安装下载的描述文件。更换专属地址后，请重新下载并安装。</p>
               </>
             ) : (
               <>
@@ -411,6 +446,29 @@ const providerDefaults = {
   scope: '',
   auth_method: 'basic',
 }
+function MailSettings({ mail, update }) {
+  return <fieldset>
+    <legend>邮箱验证码登录</legend>
+    <label className="portal-check"><input type="checkbox" checked={mail.enabled}
+      onChange={(e) => update({ enabled: e.target.checked, port: mail.port || 465 })} />启用邮箱登录</label>
+    {mail.enabled && <div className="portal-fields">
+      <label>SMTP 加密方式<select value={mail.starttls ? 'starttls' : 'tls'}
+        onChange={(e) => update({ starttls: e.target.value === 'starttls', port: e.target.value === 'starttls' ? 587 : 465 })}>
+        <option value="tls">隐式 TLS</option><option value="starttls">STARTTLS</option>
+      </select></label>
+      {[
+        ['host', 'SMTP 主机', 'text'], ['port', '端口', 'number'], ['sender', '发件邮箱', 'email'],
+        ['username', 'SMTP 用户名', 'text'], ['password', 'SMTP 密码', 'password'],
+        ['domains', '允许的邮箱域名（精确匹配，多个用空格或英文逗号分隔）', 'text'],
+      ].map(([key, label, type]) => <label key={key}>{label}
+        <input type={type} value={mail[key] || ''} required={!['username','password'].includes(key)}
+          placeholder={key === 'password' ? '已保存的密码留空沿用' : key === 'domains' ? 'example.com' : ''}
+          onChange={(e) => update({ [key]: key === 'port' ? Number(e.target.value) : e.target.value })} />
+      </label>)}
+    </div>}
+  </fieldset>
+}
+
 function ProviderForm({ base, provider, update, remove }) {
   const fields = [
     ['id', '提供方 ID'],
@@ -558,6 +616,7 @@ export function PortalAdmin({ token }) {
                 />
                 启用公共 /dns-query
               </label>
+              {cfg.email && <MailSettings mail={cfg.email} update={(changes) => setCfg({ ...cfg, email: { ...cfg.email, ...changes } })} />}
               {cfg.providers.map((p, i) => (
                 <ProviderForm
                   key={i}

@@ -70,7 +70,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         qtype = struct.unpack_from('!H', packet, p + 1)[0]
         # Keep only the question: EDNS follows it on validating requests.
         question = packet[12:p+5]
-        if qtype == 65:
+        self.server.questions[question] += 1
+        if qtype == 28:
+            value = socket.inet_pton(socket.AF_INET6, '2001:db8::1')
+        elif qtype == 65:
             value = b'\0\1\0' + struct.pack('!HH', 5, 5) + b'\0\3ech'
         elif qtype == 2:
             value = b'\x02ns\x04test\0'
@@ -142,6 +145,7 @@ def run():
         dns_port, admin_port, doh_port = port(), port(), port()
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         server.counts = Counter()
+        server.questions = Counter()
         server.resources = {'/list': base64.b64encode(b'[AutoProxy 0.2.9]\n||blocked.target.test\n@@||safe.blocked.target.test\n'), '/v4': xdb(4), '/v6': xdb(6)}
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert, key)
@@ -166,6 +170,8 @@ def run():
             f'certificate="{cert.name}"\nprivate_key="{key.name}"\nsubscription_ca="{cert.name}"\n'
             'allowed_clients=["127.0.0.0/8"]\nroot_hints="named.root"\n'
         )
+        with config.open('a') as f:
+            f.write('[warmup]\nenabled=false\nhistory_limit=1\ndomains=["startup.test"]\n')
         # Seed the previous rules schema, including nullable duplicate keys.
         with closing(sqlite3.connect(directory / 'db.sqlite3')) as db, db:
             db.execute('CREATE TABLE rules (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, domain TEXT NOT NULL, record_type TEXT, value TEXT, ttl INTEGER, UNIQUE(kind,domain,record_type,value))')
@@ -388,7 +394,17 @@ def run():
             viewer = api(base, '/login', {'username':'viewer','password':'x'})['token']
             expect_http_error(403, lambda: api(base, '/features', settings, viewer, 'PUT'))
             assert 'groups' not in api(base, '/features', token=viewer)['settings']
+            hot = query('recent-hot.test', 65)
+            seed = query('startup.test')
+            for _ in range(12):
+                assert rcode(udp(hot, dns_port)) == 0
+            assert not server.questions[seed[12:]]
             process.terminate(); process.wait(timeout=5)
+            config.write_text(config.read_text().replace('enabled=false', 'enabled=true'))
+            with closing(sqlite3.connect(directory/'db.sqlite3')) as db, db:
+                db.execute('DELETE FROM cache_entries')
+                # Limit history to a controlled sample even during optional latency runs.
+                db.execute("DELETE FROM query_log WHERE domain != 'recent-hot.test'")
             process = subprocess.Popen([str(BIN), str(config)], stdout=output, stderr=output)
             for _ in range(100):
                 try:
@@ -396,6 +412,16 @@ def run():
                 except OSError: pass
                 time.sleep(.05)
             else: raise AssertionError('settings were not persisted')
+            for _ in range(100):
+                if ('DNS startup warmup finished' in (directory/'server.log').read_text()
+                        and server.questions[hot[12:]] == 2 and server.questions[seed[12:]] == 1):
+                    break
+                time.sleep(.05)
+            else: raise AssertionError('startup lookups did not reach the DoH upstream')
+            for packet in [hot, seed]:
+                before = server.questions[packet[12:]]
+                assert rcode(udp(packet, dns_port)) == 0
+                assert server.questions[packet[12:]] == before, 'first client query missed warmed cache'
             assert status()['gfwlist']['count'] == old_count
             assert api(base, '/geoip/lookup', {'ip':'8.8.8.8'}, token)['location']['country_code'] == 'CN'
             # The scheduler must refresh a due source on startup without a manual request.

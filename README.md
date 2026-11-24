@@ -14,7 +14,7 @@ Requirements: Rust toolchain, Node.js 20+, npm, and C build tools for `ring`/SQL
 
 The script installs the locked web dependencies, builds `web/dist`, then builds `target/release/rdns` using `Cargo.lock`. `cargo build` alone requires an existing `web/dist` directory because the frontend is embedded at compile time.
 
-For hands-on local use, run `./scripts/run-local.sh`. It builds the app, asks you to set the initial `admin` password, creates a local test certificate, and starts only the loopback management panel. Open `http://127.0.0.1:3000`, set DNS UDP to `127.0.0.1:1053` and enable it in **监听服务**, then query `dig @127.0.0.1 -p 1053 cloudflare.com A +dnssec`. Use Ctrl+C to stop; subsequent starts keep the local database and password. The local instance uses `data/local` for its files.
+For hands-on local use, run `./scripts/run-local.sh`. It builds the app, asks you to set the initial `admin` password, creates a local test certificate, and starts only the loopback management panel. Open `http://127.0.0.1:3000`, set DNS UDP to `127.0.0.1:1053` and enable it in **监听服务**, then query `dig @127.0.0.1 -p 1053 cloudflare.com A +dnssec`. Use Ctrl+C to stop; subsequent starts keep the local database and password. The local instance uses `data/local` for its files. To bind the management panel on every IPv4 interface, run `./scripts/run-local.sh --host 0.0.0.0` and open `http://<server-IP>:3000`. You can also pass a specific interface IP. This option exposes plain HTTP and is intended for trusted networks. DNS listener addresses and client access are configured separately in the console.
 Run `./packaging/package.sh` after the release build to create an architecture-labelled tarball and `SHA256SUMS`. CI builds and packages on native Linux x86_64 and ARM64 runners.
 Pushes to `main` and the nightly schedule update one rolling `nightly` pre-release with both architecture archives and a combined checksum file. Tags matching `v*` publish an independent formal release for that tag. Pull requests run checks without publishing.
 
@@ -40,6 +40,8 @@ Existing TOML listener addresses are enabled on first upgrade, preserving the cu
 
 Authoritative NS/Glue referrals and DNS answers are persisted as upstream responses in SQLite. Cached recursive responses and DoH responses in local-validation mode are replayed through Hickory's DNSSEC validation; the database is never treated as a validated answer by itself. DoH groups have separate cache namespaces, including endpoint and proxy configuration, and honor HTTP Age. A byte-weighted LRU cache keeps hot responses in memory with a default 64 MiB payload budget. The cache page shows its current weighted size, SQLite entry count/bytes, hits, and the process RSS (which includes Hickory and other runtime memory).
 
+At startup, a background task preloads the 32 most frequent eligible hostname and record-type pairs in the latest 10,000 query log rows, plus A and AAAA records for four starter hostnames. In the TOML `[warmup]` section, set `domains` to your own exact hostnames, `history_limit` to adjust the history sample result count, or `enabled = false` to disable preloading. The task runs two lookups at a time through the configured resolver and leaves client analytics untouched. Cache lifetimes still follow DNS TTLs.
+
 The defaults follow Unbound's TTL limits: positive answers and NS/Glue are capped at 86,400 seconds, negative responses at 3,600 seconds, with no artificial minimum. Every cache entry expires at the earliest of its authoritative TTL, configured limit, and any DNSSEC signature expiration. These limits and the memory budget are configurable in the panel and apply without restarting; changing them clears old cache entries.
 
 ## DNS behavior
@@ -64,6 +66,8 @@ For an internal HTTPS list, set `subscription_ca` to the PEM CA certificate that
 Enable the HTTPS DoH listener, then open `/portal` on its public origin. New installations and upgrades start with open registration and the shared `/dns-query` endpoint enabled. In the management console, **用户门户** controls the registration policy (open, approval required, or closed), the public endpoint, providers and users. Closing registration allows existing members to keep signing in. Management accounts and portal accounts use separate sessions and permissions.
 
 Each active member can copy a unique `/dns-<22 characters>` URL and rotate it. The suffix is case-sensitive and consists of uniformly random ASCII letters and digits. A personal URL is a bearer credential for DNS queries; configure reverse-proxy access logs to redact these paths and OAuth callback query strings. Protect the service database and its backups, which contain recoverable personal addresses and provider client secrets. A rotation immediately invalidates the old URL. Disabling a user also revokes their sessions. All DoH requests remain subject to the configured CIDR and region policies.
+
+For email sign-in, open **用户门户 → 邮箱验证码登录**, enable the option and enter the SMTP host, port, TLS mode, sender address and allowed mailbox domains. Supply credentials if the relay requires authentication. Separate domains with commas or spaces and list each permitted subdomain explicitly. The portal checks the domain at both delivery and login. Codes expire after ten minutes, allow five attempts and can be used once. First-time email users follow the current registration policy.
 
 For external sign-in, configure the public HTTPS origin and register its exact `/portal/callback/<provider-id>` URL shown in the console with the provider. OIDC uses issuer discovery and signed ID tokens. For generic OAuth 2.0, configure the authorization, token and user profile endpoints, scopes, client authentication method, and a stable user ID field (top-level key or JSON Pointer). Providers must support authorization code with S256 PKCE. The portal accepts credentials over HTTPS and loads platform trust roots for enterprise providers. Provider IDs and stable identity mappings identify accounts; email addresses are never used for automatic linking.
 
@@ -105,7 +109,7 @@ Configuration pages save through the HTTP API. Their WebSocket reconnects automa
 
 ## Management API
 
-All endpoints below are under `/api/v1`. Login returns a bearer token valid for 12 hours. The console stores it in session storage. Management HTTP binds to loopback; expose it remotely only through HTTPS.
+All endpoints below are under `/api/v1`. Login returns a bearer token valid for 12 hours. The console stores it in session storage. Management HTTP defaults to loopback; expose it remotely only through HTTPS.
 
 Query logs include `duration_ms`: server processing time from decoding the request through encoding its response, including lookup/cache/filter work, excluding TLS handshakes, network transit and writing the log to SQLite. Historical rows recorded before this field was added return `null` and display `—` in the console.
 

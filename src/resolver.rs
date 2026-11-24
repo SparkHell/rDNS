@@ -1,3 +1,4 @@
+mod warmup;
 use crate::{
     cache::{CacheSettings, CachedProvider, PersistentCache},
     config::Config,
@@ -294,89 +295,9 @@ impl Engine {
                 }
             }
         } else {
-            let settings = &runtime.settings;
-            let gfw = settings.gfwlist.enabled && self.features.list.load().matches(&domain);
-            let group_name = if gfw {
-                &settings.gfwlist.group
-            } else {
-                &settings.resolution.group
-            };
-            let group = runtime.groups.get(group_name).cloned();
-            let mode = if gfw {
-                ResolveMode::Doh
-            } else {
-                settings.resolution.mode.clone()
-            };
-            let lookup = async {
-                match mode {
-                    ResolveMode::Recursive => self.recursive_lookup(&request).await,
-                    ResolveMode::Doh => {
-                        let primary = group
-                            .context("missing upstream group")
-                            .map_err(|_| LookupFailure::Unavailable)?;
-                        let reserve_fallback = gfw && group_name != &settings.resolution.group;
-                        let budget = if reserve_fallback {
-                            primary
-                                .timeout()
-                                .min(Duration::from_millis(settings.resolution.timeout_ms / 2))
-                        } else {
-                            primary.timeout()
-                        };
-                        let result = tokio::time::timeout(
-                            budget,
-                            doh_lookup(
-                                primary,
-                                request.clone(),
-                                settings.resolution.validate_dnssec,
-                            ),
-                        )
-                        .await
-                        .unwrap_or(Err(LookupFailure::Unavailable));
-                        if gfw
-                            && matches!(result, Err(LookupFailure::Unavailable))
-                            && group_name != &settings.resolution.group
-                        {
-                            let fallback = runtime
-                                .groups
-                                .get(&settings.resolution.group)
-                                .cloned()
-                                .ok_or(LookupFailure::Unavailable)?;
-                            let mut answer = doh_lookup(
-                                fallback,
-                                request.clone(),
-                                settings.resolution.validate_dnssec,
-                            )
-                            .await?;
-                            answer.outcome = "gfw_fallback_doh";
-                            Ok(answer)
-                        } else {
-                            result
-                        }
-                    }
-                    ResolveMode::Parallel => {
-                        let doh = group
-                            .context("missing upstream group")
-                            .map_err(|_| LookupFailure::Unavailable)?;
-                        prefer_recursive(
-                            self.recursive_lookup(&request),
-                            doh_lookup(doh, request.clone(), settings.resolution.validate_dnssec),
-                            Duration::from_millis(settings.resolution.priority_ms),
-                        )
-                        .await
-                    }
-                }
-            };
-            match tokio::time::timeout(
-                Duration::from_millis(settings.resolution.timeout_ms),
-                lookup,
-            )
-            .await
-            {
+            match self.routed_lookup(&runtime, &request, &domain).await {
                 Ok(Ok(mut answer)) => {
                     selected_upstream = answer.upstream.clone();
-                    if gfw && answer.outcome == "doh" {
-                        answer.outcome = "gfw_doh";
-                    }
                     let do_bit = request
                         .edns
                         .as_ref()
@@ -432,6 +353,97 @@ impl Engine {
             tracing::warn!(%error, "query log write failed");
         }
         Ok(wire)
+    }
+    async fn routed_lookup(
+        &self,
+        runtime: &crate::features::FeatureRuntime,
+        request: &Message,
+        domain: &str,
+    ) -> Result<Result<Resolved, LookupFailure>, tokio::time::error::Elapsed> {
+        let settings = &runtime.settings;
+        let gfw = settings.gfwlist.enabled && self.features.list.load().matches(domain);
+        let group_name = if gfw {
+            &settings.gfwlist.group
+        } else {
+            &settings.resolution.group
+        };
+        let group = runtime.groups.get(group_name).cloned();
+        let mode = if gfw {
+            ResolveMode::Doh
+        } else {
+            settings.resolution.mode.clone()
+        };
+        let lookup = async {
+            match mode {
+                ResolveMode::Recursive => self.recursive_lookup(request).await,
+                ResolveMode::Doh => {
+                    let primary = group
+                        .context("missing upstream group")
+                        .map_err(|_| LookupFailure::Unavailable)?;
+                    let reserve_fallback = gfw && group_name != &settings.resolution.group;
+                    let budget = if reserve_fallback {
+                        primary
+                            .timeout()
+                            .min(Duration::from_millis(settings.resolution.timeout_ms / 2))
+                    } else {
+                        primary.timeout()
+                    };
+                    let result = tokio::time::timeout(
+                        budget,
+                        doh_lookup(
+                            primary,
+                            request.clone(),
+                            settings.resolution.validate_dnssec,
+                        ),
+                    )
+                    .await
+                    .unwrap_or(Err(LookupFailure::Unavailable));
+                    if gfw
+                        && matches!(result, Err(LookupFailure::Unavailable))
+                        && group_name != &settings.resolution.group
+                    {
+                        let fallback = runtime
+                            .groups
+                            .get(&settings.resolution.group)
+                            .cloned()
+                            .ok_or(LookupFailure::Unavailable)?;
+                        let mut answer = doh_lookup(
+                            fallback,
+                            request.clone(),
+                            settings.resolution.validate_dnssec,
+                        )
+                        .await?;
+                        answer.outcome = "gfw_fallback_doh";
+                        Ok(answer)
+                    } else {
+                        result
+                    }
+                }
+                ResolveMode::Parallel => {
+                    let doh = group
+                        .context("missing upstream group")
+                        .map_err(|_| LookupFailure::Unavailable)?;
+                    prefer_recursive(
+                        self.recursive_lookup(request),
+                        doh_lookup(doh, request.clone(), settings.resolution.validate_dnssec),
+                        Duration::from_millis(settings.resolution.priority_ms),
+                    )
+                    .await
+                }
+            }
+        };
+        let mut result = tokio::time::timeout(
+            Duration::from_millis(settings.resolution.timeout_ms),
+            lookup,
+        )
+        .await?;
+        if let Ok(answer) = &mut result
+            && gfw
+            && answer.outcome == "doh"
+        {
+            answer.outcome = "gfw_doh";
+        }
+        Ok(result)
     }
     async fn recursive_lookup(&self, request: &Message) -> Result<Resolved, LookupFailure> {
         let query = request.queries[0].clone();
@@ -671,7 +683,7 @@ fn parse_root_hints(text: &str) -> Result<Vec<IpAddr>> {
     Ok(addresses)
 }
 
-fn normalize_domain(domain: &str) -> Result<String> {
+pub(crate) fn normalize_domain(domain: &str) -> Result<String> {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     anyhow::ensure!(
         !domain.is_empty() && domain.len() <= 253 && !domain.contains('*'),
