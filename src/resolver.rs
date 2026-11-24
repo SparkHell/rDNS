@@ -23,7 +23,7 @@ use hickory_resolver::{
     recursor::{DnssecConfig, DnssecPolicy, Recursor, RecursorOptions},
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
@@ -34,12 +34,64 @@ use tokio::{
 };
 pub use warmup::CacheJobInput;
 
-#[derive(Clone, Default)]
+#[derive(Default)]
+struct DomainFilter {
+    suffixes: HashSet<String>,
+    wildcards: HashSet<String>,
+}
+
+impl DomainFilter {
+    fn insert(&mut self, name: String) {
+        if let Some(suffix) = name.strip_prefix("*.") {
+            self.wildcards.insert(suffix.to_owned());
+        } else {
+            self.suffixes.insert(name);
+        }
+    }
+
+    fn matches(&self, domain: &str) -> bool {
+        matches_domain(&self.suffixes, domain)
+            || (!self.wildcards.is_empty()
+                && domain
+                    .split_once('.')
+                    .is_some_and(|(_, suffix)| matches_domain(&self.wildcards, suffix)))
+    }
+}
+
+#[derive(Default)]
 struct Policy {
-    local: Vec<Rule>,
-    allow: HashSet<String>,
-    block: HashSet<String>,
+    local: HashMap<String, Vec<Rule>>,
+    wild_local: HashMap<String, Vec<Rule>>,
+    allow: DomainFilter,
+    block: DomainFilter,
     forward: Vec<(String, SocketAddr)>,
+}
+
+impl Policy {
+    fn local_records(&self, domain: &str) -> Option<&[Rule]> {
+        if let Some(records) = self.local.get(domain) {
+            return Some(records);
+        }
+        let mut name = domain;
+        while let Some((_, suffix)) = name.split_once('.') {
+            if let Some(records) = self.wild_local.get(suffix) {
+                return Some(records);
+            }
+            name = suffix;
+        }
+        None
+    }
+
+    fn forward_target(&self, domain: &str) -> Option<SocketAddr> {
+        self.forward.iter().find_map(|(pattern, target)| {
+            let wildcard = pattern.strip_prefix("*.");
+            let suffix = wildcard.unwrap_or(pattern);
+            let subdomain = domain
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.'));
+            (subdomain || (wildcard.is_none() && domain == suffix)).then_some(*target)
+        })
+    }
 }
 
 pub struct Engine {
@@ -164,7 +216,21 @@ impl Engine {
         let mut policy = Policy::default();
         for rule in rules {
             match rule.kind.as_str() {
-                "local" => policy.local.push(rule),
+                "local" => {
+                    if let Some(suffix) = rule.domain.strip_prefix("*.") {
+                        policy
+                            .wild_local
+                            .entry(suffix.to_owned())
+                            .or_default()
+                            .push(rule);
+                    } else {
+                        policy
+                            .local
+                            .entry(rule.domain.clone())
+                            .or_default()
+                            .push(rule);
+                    }
+                }
                 "allow" => {
                     policy.allow.insert(rule.domain);
                 }
@@ -179,22 +245,31 @@ impl Engine {
                 _ => {}
             }
         }
-        policy.block.extend(domains);
-        policy
-            .forward
-            .sort_by_key(|(domain, _)| std::cmp::Reverse(domain.len()));
+        policy.block.suffixes.extend(domains);
+        policy.forward.sort_by_key(|(domain, _)| {
+            let wildcard = domain.strip_prefix("*.");
+            std::cmp::Reverse((wildcard.unwrap_or(domain).len(), wildcard.is_some()))
+        });
         self.policy.store(Arc::new(policy));
         Ok(())
     }
 
     pub fn validate_rule(input: &RuleInput) -> Result<RuleInput> {
-        let domain = normalize_domain(&input.domain)?;
+        let domain = input.domain.trim();
+        let normalized = match domain.strip_prefix("*.") {
+            Some(suffix) if !suffix.starts_with(char::is_whitespace) => {
+                normalize_domain(suffix).map(|suffix| format!("*.{suffix}"))
+            }
+            _ => normalize_domain(domain),
+        }
+        .map_err(|_| anyhow::anyhow!("请填写有效域名，通配符只支持 *.example.com 这种格式"))?;
+        anyhow::ensure!(normalized.len() <= 253, "规则域名过长");
         anyhow::ensure!(
             ["local", "allow", "block", "forward"].contains(&input.kind.as_str()),
             "invalid rule kind"
         );
         let mut result = input.clone();
-        result.domain = domain;
+        result.domain = normalized;
         match input.kind.as_str() {
             "local" => {
                 let kind = input
@@ -286,11 +361,10 @@ impl Engine {
         if let Err(reason) = runtime.access.decide(peer.ip(), &location) {
             response.metadata.response_code = ResponseCode::Refused;
             outcome = reason;
-        } else if policy.local.iter().any(|r| r.domain == domain) {
-            for record in policy.local.iter().filter(|r| {
-                r.domain == domain
-                    && (r.record_type.as_deref() == Some(kind.as_str())
-                        || r.record_type.as_deref() == Some("CNAME"))
+        } else if let Some(records) = policy.local_records(&domain) {
+            for record in records.iter().filter(|record| {
+                matches!(record.record_type.as_deref(), Some("CNAME"))
+                    || record.record_type.as_deref() == Some(kind.as_str())
             }) {
                 if let (Some(rt), Some(value)) = (&record.record_type, &record.value) {
                     response.add_answer(Record::from_rdata(
@@ -305,14 +379,10 @@ impl Engine {
         } else if self.is_blocked(&policy, &runtime, &domain) {
             response.metadata.response_code = ResponseCode::NXDomain;
             outcome = "blocked";
-        } else if let Some((_, upstream)) = policy
-            .forward
-            .iter()
-            .find(|(suffix, _)| domain == *suffix || domain.ends_with(&format!(".{suffix}")))
-        {
+        } else if let Some(upstream) = policy.forward_target(&domain) {
             let _foreground = self.begin_foreground(true);
             let budget = Duration::from_millis(runtime.settings.resolution.timeout_ms);
-            match tokio::time::timeout(budget, forward(wire, *upstream)).await {
+            match tokio::time::timeout(budget, forward(wire, upstream)).await {
                 Err(_) => {
                     response.metadata.response_code = ResponseCode::ServFail;
                     outcome = "timeout";
@@ -401,8 +471,8 @@ impl Engine {
         runtime: &crate::features::FeatureRuntime,
         domain: &str,
     ) -> bool {
-        !matches_domain(&policy.allow, domain)
-            && (matches_domain(&policy.block, domain)
+        !policy.allow.matches(domain)
+            && (policy.block.matches(domain)
                 || (runtime.settings.adguard.enabled && self.features.ads.load().blocks(domain)))
     }
 

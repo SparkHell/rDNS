@@ -49,11 +49,13 @@ The defaults follow Unbound's TTL limits: positive answers and NS/Glue are cappe
 
 ## DNS behavior
 
-1. An exact local name takes precedence. A, AAAA, CNAME and TXT records are supported. An exact local name without the requested type returns NOERROR with no answer.
+1. Local records take precedence. An exact local name beats a wildcard, and the longest eligible wildcard suffix wins. A, AAAA, CNAME and TXT are supported. A matched local name without the requested type returns NOERROR with no answer.
 2. A manual allow rule overrides block rules for the name and its subdomains. Manual blocks and subscription blocks return NXDOMAIN.
-3. The longest matching conditional forward suffix uses the configured upstream UDP/TCP socket address. If several targets have the same suffix, the lowest remaining rule ID takes precedence. UDP and its TCP fallback share the configured resolution deadline and return SERVFAIL on timeout. Its response is not presented as DNSSEC validated.
+3. The longest matching conditional forward suffix uses the configured upstream UDP/TCP socket address. If an explicit wildcard and ordinary suffix of equal length both match, the wildcard wins. If several targets have the same pattern, the lowest remaining rule ID takes precedence. UDP and its TCP fallback share the configured resolution deadline and return SERVFAIL on timeout. Its response is not presented as DNSSEC validated.
 4. GFWList matches use their designated DoH group, including its configured proxy. If that path is unavailable, the default DoH group is tried. Both failing returns SERVFAIL; this route never falls back to root recursion. A confirmed DNSSEC failure returns SERVFAIL directly.
 5. Remaining names use the selected default mode: validating root recursion, DoH, or recursive-preferred parallel resolution. DNSSEC AD is set only after local validation; local records, conditional forwarding and DoH with local validation disabled clear it.
+
+Manual local records, allow rules, block rules and conditional forwarding accept leading wildcards such as `*.example.com`. They match children at any depth. Enter a separate `example.com` rule to include the parent name.
 
 Public HTTPS/SVCB answers, including their `ech` parameter, pass through the recursive path. rDns does not terminate ECH on its own DoH TLS listener. The chosen rustls server stack does not currently provide server-side ECH support.
 The binary bundles an InterNIC root hints snapshot (`resources/named.root`). Set `root_hints` in the configuration to use an updated file without rebuilding.

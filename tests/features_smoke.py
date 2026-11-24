@@ -20,7 +20,7 @@ import threading
 import time
 import urllib.request
 
-from smoke import BIN, api, certificate, expect_http_error, port, query, rcode, udp, read_exact
+from smoke import BIN, api, certificate, expect_http_error, port, query, rcode, udp, read_exact, fake_forwarder
 
 
 def xdb(version):
@@ -322,6 +322,35 @@ def run():
             api(base,'/cache/automation',dict(local_warm,local_hot_enabled=False,warm_domain_limit=1000,local_window_hours=24,local_min_queries=3),token,'PUT')
             https = udp(query('ech.test', 65), dns_port)
             assert rcode(https) == 0 and b'ech' in https, 'HTTPS/ECH record lost'
+
+            # Wildcard rules use real DNS requests with an isolated DoH fallback.
+            def add_rule(kind, domain, **fields):
+                return api(base,'/rules',dict(kind=kind,domain=domain,**fields),token)
+            add_rule('block',' *.Wild-Filter.test. ')
+            for domain in ['a.wild-filter.test','x.a.wild-filter.test']:
+                assert rcode(udp(query(domain),dns_port))==3, domain
+            for domain in ['wild-filter.test','notwild-filter.test','a.notwild-filter.test']:
+                assert rcode(udp(query(domain),dns_port))==0, domain
+            add_rule('allow','*.allowed.wild-filter.test')
+            assert rcode(udp(query('a.allowed.wild-filter.test'),dns_port))==0
+            assert rcode(udp(query('allowed.wild-filter.test'),dns_port))==3
+            expect_http_error(409,lambda:add_rule('block','*.wild-filter.test'))
+            for pattern in ['x.*.wild-filter.test','wild-*.test','*.*.test','*. test']:
+                expect_http_error(400,lambda:add_rule('block',pattern))
+            for name,value in [('*.wild-local.test','192.0.2.50'),('*.deep.wild-local.test','192.0.2.51'),('fixed.deep.wild-local.test','192.0.2.52')]:
+                add_rule('local',name,record_type='A',value=value,ttl=60)
+            for name,value in [('a.wild-local.test','192.0.2.50'),('b.deep.wild-local.test','192.0.2.51'),('fixed.deep.wild-local.test','192.0.2.52')]:
+                answer=udp(query(name),dns_port)
+                assert rcode(answer)==0 and answer.endswith(socket.inet_aton(value))
+            assert not udp(query('wild-local.test'),dns_port).endswith(socket.inet_aton('192.0.2.50'))
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as forwarder:
+                forwarder.bind(('127.0.0.1',0))
+                add_rule('forward','*.wild-forward.test',value=f'127.0.0.1:{forwarder.getsockname()[1]}')
+                thread=threading.Thread(target=fake_forwarder,args=(forwarder,),daemon=True)
+                thread.start()
+                assert not udp(query('wild-forward.test'),dns_port).endswith(socket.inet_aton('198.51.100.7'))
+                assert udp(query('x.y.wild-forward.test'),dns_port).endswith(socket.inet_aton('198.51.100.7'))
+                thread.join(timeout=1)
 
             # An obsolete download cannot publish after its source changes, and
             # a paused network read must not block unrelated settings writes.

@@ -525,12 +525,9 @@ impl Engine {
         runtime: &crate::features::FeatureRuntime,
         domain: &str,
     ) -> bool {
-        !policy.local.iter().any(|record| record.domain == domain)
+        policy.local_records(domain).is_none()
             && !self.is_blocked(policy, runtime, domain)
-            && !policy
-                .forward
-                .iter()
-                .any(|(suffix, _)| domain == suffix || domain.ends_with(&format!(".{suffix}")))
+            && policy.forward_target(domain).is_none()
     }
 
     async fn warm_question(self: &Arc<Self>, domain: &str, kind: RecordType) -> u32 {
