@@ -147,7 +147,7 @@ try {
   await save()
   await cycle('下载并更新 IPv6','geoip/refresh',200)
   await cycle('立即更新 AdGuard','adguard/refresh',200)
-  await page.getByRole('checkbox', { name: '启用 GFWList 分流' }).check()
+  await page.getByRole('checkbox', { name: '向用户开放 GFWList 分流' }).check()
   await save()
   assert(await page.getByText(/两组均失败时返回错误/).isVisible())
   await page.getByRole('heading',{name:'GeoIP 来源地区'}).waitFor()

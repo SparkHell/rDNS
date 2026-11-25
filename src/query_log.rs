@@ -19,6 +19,8 @@ pub struct QueryLogEntry {
     pub province: Option<String>,
     pub city: Option<String>,
     pub upstream: Option<String>,
+    pub rcode: Option<u16>,
+    pub response_wire: Option<Vec<u8>>,
 }
 
 enum Item {
@@ -53,7 +55,7 @@ impl QueryLog {
                 if count > 0 {
                     let started = std::time::Instant::now();
                     let mut query = QueryBuilder::new(
-                        "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol,duration_ms,country,province,city,upstream,portal_user_id,entry) ",
+                        "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol,duration_ms,country,province,city,upstream,portal_user_id,entry,rcode,response_wire) ",
                     );
                     query.push_values(entries, |mut row, e| {
                         row.push_bind(&e.at)
@@ -74,7 +76,9 @@ impl QueryLog {
                                 "public"
                             } else {
                                 e.protocol.as_str()
-                            });
+                            })
+                            .push_bind(e.rcode.map(i64::from))
+                            .push_bind(&e.response_wire);
                     });
                     if let Err(error) = query.build().execute(&pool).await {
                         worker_metrics

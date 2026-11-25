@@ -29,7 +29,7 @@ pub struct RegionRule {
     pub province: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccessSettings {
     pub mode: AccessMode,
@@ -39,6 +39,19 @@ pub struct AccessSettings {
     // Unknown covers private/reserved addresses and missing XDB results.
     pub allow_unknown: bool,
     pub trusted_proxies: Vec<String>,
+}
+
+impl Default for AccessSettings {
+    fn default() -> Self {
+        Self {
+            mode: AccessMode::default(),
+            cidrs: Vec::new(),
+            region_mode: RegionMode::default(),
+            regions: Vec::new(),
+            allow_unknown: false,
+            trusted_proxies: vec!["127.0.0.1/32".into(), "::1/128".into()],
+        }
+    }
 }
 
 pub struct AccessPolicy {
@@ -123,32 +136,21 @@ impl AccessPolicy {
     }
 
     pub fn client_ip(&self, peer: IpAddr, forwarded_for: Option<&str>) -> IpAddr {
-        let trusted = |ip: IpAddr| {
-            self.proxies
-                .iter()
-                .any(|net| net.contains(&canonical_ip(ip)))
+        let trusted = |ip: IpAddr| self.proxies.iter().any(|net| net.contains(&ip));
+        let mut ip = canonical_ip(peer);
+        let Some(value) = forwarded_for else {
+            return ip;
         };
-        if !trusted(peer) {
-            return canonical_ip(peer);
-        }
-        let Some(value) = forwarded_for.filter(|s| s.len() <= 2048) else {
-            return canonical_ip(peer);
-        };
-        let Ok(chain) = value
-            .split(',')
-            .map(|s| s.trim().parse::<IpAddr>())
-            .collect::<Result<Vec<_>, _>>()
-        else {
-            return canonical_ip(peer);
-        };
-        let mut ip = peer;
-        for previous in chain.iter().rev() {
+        for previous in value.rsplit(',') {
             if !trusted(ip) {
                 break;
             }
-            ip = *previous;
+            let Ok(previous) = previous.trim().parse() else {
+                break;
+            };
+            ip = canonical_ip(previous);
         }
-        canonical_ip(ip)
+        ip
     }
 }
 
@@ -172,6 +174,41 @@ fn parse_networks(values: &[String]) -> Result<Vec<IpNet>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_proxy_defaults_and_explicit_configuration() -> Result<()> {
+        let mut settings: AccessSettings = serde_json::from_str(r#"{"mode":"open"}"#)?;
+        assert_eq!(settings.trusted_proxies, ["127.0.0.1/32", "::1/128"]);
+        let policy = AccessPolicy::compile(settings.clone())?;
+        let client: IpAddr = "198.51.100.42".parse()?;
+        for peer in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert_eq!(
+                policy.client_ip(peer.parse()?, Some("invalid-prefix, 198.51.100.42")),
+                client
+            );
+        }
+        let untrusted = "127.0.0.2".parse()?;
+        assert_eq!(
+            policy.client_ip(untrusted, Some("198.51.100.42")),
+            untrusted
+        );
+
+        settings.trusted_proxies.push("192.0.2.0/24".into());
+        let policy = AccessPolicy::compile(settings)?;
+        assert_eq!(
+            policy.client_ip("127.0.0.1".parse()?, Some("198.51.100.42, 192.0.2.4")),
+            client
+        );
+        let settings: AccessSettings =
+            serde_json::from_str(r#"{"mode":"open","trusted_proxies":[]}"#)?;
+        let policy = AccessPolicy::compile(settings)?;
+        for peer in ["127.0.0.1", "::1"] {
+            let peer = peer.parse()?;
+            assert_eq!(policy.client_ip(peer, Some("198.51.100.42")), peer);
+        }
+        Ok(())
+    }
+
     #[test]
     fn modes_regions_unknown_and_proxy_trust() -> Result<()> {
         let mut settings = AccessSettings {

@@ -4,6 +4,7 @@ import base64
 from collections import Counter
 from contextlib import closing
 import concurrent.futures
+import http.client
 import http.server
 import json
 import os
@@ -217,13 +218,29 @@ def run():
             settings = status()['settings']
             original = json.loads(json.dumps(settings))
             def save(): return api(base, '/features', settings, token, 'PUT')
-            def doh(packet, method='POST', forwarded='8.8.8.8'):
+            def doh(packet, method='POST', forwarded='8.8.8.8', path='/dns-query'):
                 headers = {'Content-Type': 'application/dns-message', 'X-Forwarded-For':forwarded}
-                url = f'https://localhost:{doh_port}/dns-query'
+                url = f'https://localhost:{doh_port}{path}'
                 if method == 'GET': url += '?dns=' + base64.urlsafe_b64encode(packet).decode().rstrip('=')
                 request = urllib.request.Request(url, data=packet if method=='POST' else None, headers=headers, method=method)
                 with urllib.request.urlopen(request, context=ssl.create_default_context(cafile=str(cert)), timeout=5) as response:
                     return response.read()
+            def portal_call(endpoint, body=None, cookie='', method=None):
+                request = urllib.request.Request(f'https://localhost:{doh_port}/portal/api/{endpoint}',
+                    data=json.dumps(body).encode() if body is not None else None,
+                    headers={'Content-Type':'application/json', 'Cookie':cookie}, method=method)
+                with urllib.request.urlopen(request, context=ssl.create_default_context(cafile=str(cert)), timeout=5) as response:
+                    return json.load(response), response.headers.get('Set-Cookie', '').split(';')[0]
+            def register_portal(username):
+                _, cookie = portal_call('register', {'username':username, 'password':'feature-test-password'})
+                return cookie, portal_call('me', cookie=cookie)[0]['path']
+            member_cookie, member_path = register_portal('policy-member')
+            other_cookie, other_path = register_portal('other-member')
+            def personal(name, path=member_path):
+                return doh(query(name), forwarded='127.0.0.1', path=path)
+            def preferences(adguard=False, gfwlist=False):
+                values = dict(adguard=adguard, gfwlist=gfwlist)
+                assert portal_call('dns-settings', values, member_cookie, 'PUT')[0] == values
             def group(name, paths, proxy=''):
                 return {'name': name, 'servers': [{'url': base_upstream+p, 'bootstrap_ips': ['127.0.0.1']} for p in paths], 'proxy': proxy, 'timeout_ms': 1000}
             settings['access']['mode'] = 'open'
@@ -390,7 +407,11 @@ def run():
             server.paused_path = None
             settings['gfwlist']['enabled'] = True
             save()
-            assert rcode(udp(query('blocked.target.test'), dns_port)) == 0
+            assert portal_call('dns-settings', cookie=other_cookie)[0]['preferences'] == dict(adguard=False,gfwlist=False)
+            assert rcode(personal('blocked.target.test')) == 0
+            assert api(base, '/logs', token=token)[0]['outcome'] == 'doh'
+            preferences(gfwlist=True)
+            assert rcode(personal('blocked.target.test')) == 0
             logs = api(base, '/logs', token=token)
             assert logs[0]['outcome'] == 'gfw_fallback_doh' and logs[0]['upstream'] == 'default', logs[0]
             assert server.counts['/fail'] == 1
@@ -398,16 +419,35 @@ def run():
             assert special['servers'][0]['failures'] > 0 and special['servers'][0]['cooldown_until'] > 0
             save()
             assert next(g for g in status()['groups'] if g['name'] == 'special') == special
-            udp(query('safe.blocked.target.test'), dns_port)
+            personal('safe.blocked.target.test')
             assert server.counts['/fail'] == 1, 'GFWList exception ignored'
             settings['groups'][1] = group('special', ['/one'])
             save()
-            udp(query('sub.blocked.target.test'), dns_port)
+            domain = 'sub.blocked.target.test'
+            assert rcode(personal(domain)) == 0
             assert api(base, '/logs', token=token)[0]['outcome'] == 'gfw_doh'
+            assert rcode(personal(domain, other_path)) == 0
+            assert api(base, '/logs', token=token)[0]['outcome'] == 'doh'
+            assert rcode(doh(query(domain))) == 0
+            assert api(base, '/logs', token=token)[0]['outcome'] == 'doh'
+            assert rcode(udp(query(domain), dns_port)) == 0
+            assert api(base, '/logs', token=token)[0]['outcome'] == 'doh'
+            override = 'personal-override.test'
+            record, _ = portal_call('dns-records', dict(domain=override, record_type='A',value='192.0.2.88'),member_cookie)
+            values = socket.inet_aton('192.0.2.88')
+            assert personal(override).endswith(values)
+            for outside in [personal(override, other_path), doh(query(override)), udp(query(override), dns_port)]:
+                assert rcode(outside) == 0 and not outside.endswith(values)
+            portal_call('dns-records/'+str(record['id']), cookie=member_cookie, method='DELETE')
+            assert not personal(override).endswith(values)
+            preferences()
+            assert rcode(personal(domain)) == 0
+            assert api(base, '/logs', token=token)[0]['outcome'] == 'doh'
+            preferences(gfwlist=True)
             settings['groups'][1] = group('special', ['/slow'])
             settings['resolution']['timeout_ms'] = 300
             save()
-            assert rcode(udp(query('timeout.blocked.target.test'), dns_port)) == 0, 'special group consumed default fallback budget'
+            assert rcode(personal('timeout.blocked.target.test')) == 0, 'special group consumed default fallback budget'
             assert api(base, '/logs', token=token)[0]['outcome'] == 'gfw_fallback_doh'
             settings['groups'][1] = group('special', ['/one'])
             settings['resolution']['timeout_ms'] = 15000
@@ -449,7 +489,7 @@ def run():
             settings['gfwlist']['enabled'] = True
             settings['groups'][1] = group('special', ['/fail'])
             save()
-            assert rcode(udp(query('noresult.blocked.target.test'), dns_port)) == 2, 'failed GFW routes must not recurse'
+            assert rcode(personal('noresult.blocked.target.test')) == 2, 'failed GFW routes must not recurse'
             settings['gfwlist']['enabled'] = False
             settings['groups'][0] = group('default', ['/two'])
             save()
@@ -493,13 +533,29 @@ def run():
             settings['access'].update(mode='open', region_mode='allow', regions=[{'country':'CN','province':'广东省'}], allow_unknown=False)
             save()
             assert rcode(udp(query('unknown.test'), dns_port)) == 5
-            assert rcode(doh(query('spoofed.test'))) == 5, 'untrusted forwarding header bypassed access rules'
-            settings['access']['trusted_proxies'] = ['127.0.0.1/32']
-            save()
+            with closing(http.client.HTTPSConnection(
+                'localhost', doh_port, source_address=('127.0.0.2', 0),
+                context=ssl.create_default_context(cafile=str(cert)), timeout=5,
+            )) as direct:
+                direct.request('POST', '/dns-query', query('untrusted-peer.test'), {
+                    'Content-Type': 'application/dns-message', 'X-Forwarded-For': '8.8.8.8',
+                })
+                response = direct.getresponse()
+                assert response.status == 200 and rcode(response.read()) == 5
+                assert api(base, '/logs', token=token)[0]['client'] == '127.0.0.2'
+            defaults = ['127.0.0.1/32', '::1/128']
+            assert status()['settings']['access']['trusted_proxies'] == defaults
             for method in ['GET','POST']:
-                assert rcode(doh(query(f'geo{method}.test'), method)) == 0, 'trusted proxy source IP was ignored'
+                forwarded = 'invalid-prefix, 8.8.8.8' if method == 'POST' else '8.8.8.8'
+                assert rcode(doh(query(f'geo{method}.test'), method, forwarded)) == 0, 'default proxy source IP was ignored'
                 log = api(base, '/logs', token=token)[0]
                 assert log['client']=='8.8.8.8' and log['province']=='广东省', log
+            settings['access']['trusted_proxies'] = []
+            save()
+            assert status()['settings']['access']['trusted_proxies'] == []
+            assert rcode(doh(query('proxy-trust-disabled.test'))) == 5
+            assert api(base, '/logs', token=token)[0]['client'] == '127.0.0.1'
+            settings['access']['trusted_proxies'] = defaults
             settings['access']['regions'] = [{'country':'CN','province':'浙江省'}]
             save()
             assert rcode(doh(query('wrongprovince.test'))) == 5
@@ -564,14 +620,23 @@ def run():
             server.resources.update({'/ads':b'||ad.test^\n@@||ok.ad.test^','/hosts':b'0.0.0.0 tracker.test'})
             save()
             api(base, '/adguard/refresh', {}, token)
-            assert rcode(udp(query('child.ad.test'), dns_port)) == 3
-            assert rcode(udp(query('ok.ad.test'), dns_port)) == 0
-            assert rcode(udp(query('tracker.test'), dns_port)) == 3
+            assert rcode(personal('child.ad.test')) == 0
+            preferences(adguard=True, gfwlist=True)
+            assert rcode(personal('child.ad.test')) == 3
+            assert rcode(personal('child.ad.test', other_path)) == 0
+            assert rcode(doh(query('child.ad.test'))) == 0
+            assert rcode(udp(query('child.ad.test'), dns_port)) == 0
+            assert rcode(personal('ok.ad.test')) == 0
+            assert rcode(personal('tracker.test')) == 3
             server.resources['/hosts'] = b'invalid'
             expect_http_error(502, lambda: api(base,'/adguard/refresh',{},token))
-            assert rcode(udp(query('tracker.test'), dns_port)) == 3
+            assert rcode(personal('tracker.test')) == 3
+            preferences(gfwlist=True)
+            assert rcode(personal('tracker.test')) == 0
+            preferences(adguard=True, gfwlist=True)
             settings['adguard']['enabled'] = False
             save()
+            assert rcode(personal('tracker.test')) == 0
             assert status()['gfwlist']['count'] == old_count
             assert api(base, '/geoip/lookup', {'ip':'8.8.8.8'}, token)['location']['country_code'] == 'CN'
             # The scheduler must refresh a due source on startup without a manual request.
@@ -589,7 +654,8 @@ def run():
                 except OSError: pass
                 time.sleep(.05)
             else: raise AssertionError('scheduled GFWList update did not run')
-            assert rcode(udp(query('scheduled.target.test'), dns_port))==0
+            assert portal_call('dns-settings', cookie=member_cookie)[0]['preferences'] == dict(adguard=True,gfwlist=True)
+            assert rcode(personal('scheduled.target.test'))==0
             assert api(base, '/logs', token=token)[0]['outcome']=='gfw_fallback_doh', 'scheduled list match did not use the configured default DoH fallback'
             if os.environ.get('RDNS_FEATURE_UI') == '1':
                 cache_before = api(base, '/cache', token=token)['settings']

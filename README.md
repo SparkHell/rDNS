@@ -49,11 +49,11 @@ The defaults follow Unbound's TTL limits: positive answers and NS/Glue are cappe
 
 ## DNS behavior
 
-1. Local records take precedence. An exact local name beats a wildcard, and the longest eligible wildcard suffix wins. A, AAAA, CNAME and TXT are supported. A matched local name without the requested type returns NOERROR with no answer.
-2. A manual allow rule overrides block rules for the name and its subdomains. Manual blocks and subscription blocks return NXDOMAIN.
+1. Administrator local records take precedence. An exact local name beats a wildcard, and the longest eligible wildcard suffix wins. A, AAAA, CNAME and TXT are supported. A matched local name without the requested type returns NOERROR with no answer.
+2. A manual allow rule overrides blocks for the name and its subdomains. Administrator blocks and custom subscription blocks return NXDOMAIN. Personal DoH can then use exact-name personal records where no administrator conditional forward applies, followed by optional AdGuard filtering.
 3. The longest matching conditional forward suffix uses the configured upstream UDP/TCP socket address. If an explicit wildcard and ordinary suffix of equal length both match, the wildcard wins. If several targets have the same pattern, the lowest remaining rule ID takes precedence. UDP and its TCP fallback share the configured resolution deadline and return SERVFAIL on timeout. Its response is not presented as DNSSEC validated.
-4. GFWList matches use their designated DoH group, including its configured proxy. If that path is unavailable, the default DoH group is tried. Both failing returns SERVFAIL; this route never falls back to root recursion. A confirmed DNSSEC failure returns SERVFAIL directly.
-5. Remaining names use the selected default mode: validating root recursion, DoH, or recursive-preferred parallel resolution. DNSSEC AD is set only after local validation; local records, conditional forwarding and DoH with local validation disabled clear it.
+4. When enabled by a personal DoH user, GFWList matches use their designated DoH group, including its configured proxy. If that path is unavailable, the default DoH group is tried. Both failing returns SERVFAIL; this route never falls back to root recursion. A confirmed DNSSEC failure returns SERVFAIL directly.
+5. Remaining names use the selected default mode: root recursion, DoH, or recursive-preferred parallel resolution. DNSSEC AD is set only after successful local validation.
 
 Manual local records, allow rules, block rules and conditional forwarding accept leading wildcards such as `*.example.com`. They match children at any depth. Enter a separate `example.com` rule to include the parent name.
 
@@ -64,7 +64,7 @@ At startup, rDns uses IPv4 root addresses when an IPv4 route is available, and I
 
 Duplicate allow/block rules and identical forwarding targets return HTTP 409. On upgrade, the database keeps the oldest ID for each duplicate and preserves distinct targets.
 
-Subscriptions brings together AdGuard, GFWList, GeoIP and custom sources. AdGuard defaults to off and combines AdGuard DNS Filter with AdAway; exceptions apply within this source.
+Subscriptions brings together AdGuard, GFWList, GeoIP and custom sources. AdGuard combines AdGuard DNS Filter with AdAway and honours their exceptions. The AdGuard and GFWList admin switches make the features available to personal DoH users and control automatic list refresh. Shared DoH, UDP/TCP, DoT and DoQ follow the base administrator rules and default resolution mode.
 
 Remote filter lists accept one domain per line, `0.0.0.0 domain`, `127.0.0.1 domain`, and Adblock `||domain^` entries. Unsupported list rules are ignored. Updates are size limited to 10 MiB and applied only after successful retrieval and parsing. The background refresher runs hourly; manual refresh is available in the console.
 For an internal HTTPS list, set `subscription_ca` to the PEM CA certificate that signed its server certificate. TLS verification remains enabled.
@@ -79,13 +79,15 @@ When Nginx terminates TLS, set `doh = "127.0.0.1:18443"` and `doh_http = true` i
 
 Each active member can copy a unique `/dns/<22 characters>` URL and rotate it. Route the `/dns/` prefix to the HTTPS DoH listener and preserve the full request URI. The suffix is case-sensitive and consists of uniformly random ASCII letters and digits. A personal URL is a bearer credential for DNS queries; configure reverse-proxy access logs to redact these paths and OAuth callback query strings. Protect the service database and its backups, which contain recoverable personal addresses and provider client secrets. A rotation immediately invalidates the old URL. Disabling a user also revokes their sessions. All DoH requests remain subject to the configured CIDR and region policies.
 
+Under **个人 DNS 设置**, users can add, edit or delete exact-name A, AAAA, CNAME and TXT records and choose whether to use AdGuard and GFWList. Both preferences default to off for existing and new accounts. User settings affect only that account's personal DoH URL and portal query test. Administrators choose the lists and GFWList upstreams. Changes apply immediately on the server and survive address rotation. Client caches retain answers until their TTL expires.
+
 For email sign-in, open **用户门户 → 邮箱验证码登录**, enable the option and enter the SMTP host, port, TLS mode, sender address and allowed mailbox domains. Supply credentials if the relay requires authentication. Separate domains with commas or spaces and list each permitted subdomain explicitly. The portal checks the domain at both delivery and login. Codes expire after ten minutes, allow five attempts and can be used once. First-time email users follow the current registration policy.
 
-The portal offers a direct iOS profile download and an iPhone camera QR code. The QR opens a single-use download on the portal's HTTPS origin and expires after five minutes. Address rotation or account suspension revokes outstanding links. After downloading, install the profile in iOS Settings.
+The iOS camera QR code uses the personal DoH URL with `?mobileconfig=1` appended. When opening the portal on an HTTP management port, set a public HTTPS DoH origin to generate the code. The profile contains the same resolver URL without that parameter. The download link shares the resolver credential and expires when the address rotates or the account is suspended. Install the downloaded profile in iOS Settings.
 
 For external sign-in, configure the public HTTPS origin and register its exact `/portal/callback/<provider-id>` URL shown in the console with the provider. OIDC uses issuer discovery and signed ID tokens. For generic OAuth 2.0, configure the authorization, token and user profile endpoints, scopes, client authentication method, and a stable user ID field (top-level key or JSON Pointer). Providers must support authorization code with S256 PKCE. The portal accepts credentials over HTTPS and loads platform trust roots for enterprise providers. Provider IDs and stable identity mappings identify accounts; email addresses are never used for automatic linking.
 
-Members can inspect their own 24-hour, 7-day or 30-day query history within the configured retention period. Administrators can filter analytics by member and entry point. Pre-upgrade rows remain historical. Rotating a URL preserves its member's history.
+Members can inspect their own query history and trend in the server's local timezone. Query details support domain search and filters for record type, handling outcome and DNS response code. New personal queries retain the final DNS response for the configured log period. Earlier entries show their available metadata. The DNS test tool uses the same resolver and access policies and offers a record type selector with common types first and a numeric picker for the 16-bit type range. Administrators can filter analytics by member and entry point. Rotating a URL preserves its member's history.
 
 ## DoH upstream pools and parallel resolution
 
@@ -95,11 +97,11 @@ Advanced Settings groups upstreams, listeners and certificates. Configure one gl
 
 The three default modes are:
 
-- **仅本地递归**: the existing DNSSEC-validating recursive path.
+- **仅本地递归**: validate recursive answers first. After a DNSSEC validation failure, return the result of an unvalidated recursive lookup when available, clear AD, and record `recursive_dnssec_unverified`. EDNS clients also receive an Extended DNS Error indicating the validation failure.
 - **仅 DoH 上游**: use the selected default pool.
-- **递归优先，DoH 并行兜底**: start both paths, prefer a successful recursive response within the configured priority window (300 ms by default), then use a ready DoH response. If DoH is still pending, return whichever eligible path succeeds. The total request budget defaults to 15 seconds. A known bogus DNSSEC result is never bypassed.
+- **递归优先，DoH 并行兜底**: start both paths, prefer a successful recursive response within the configured priority window (300 ms by default), then use a ready DoH response. A recursive DNSSEC failure immediately makes DoH eligible. DoH fallback trusts the configured upstream and clears AD. The total request budget defaults to 15 seconds.
 
-DoH local DNSSEC validation defaults on and uses root trust anchors through Hickory, including DNSKEY/DS queries over the same upstream/proxy path. Disabling it explicitly trusts the configured upstream and always clears AD. Valid NXDOMAIN/NODATA replies are answers, not failover triggers. HTTPS/SVCB records and ECH parameters are preserved.
+For DoH-only and GFWList routes, local DoH DNSSEC validation defaults on and uses root trust anchors through Hickory, including DNSKEY/DS queries over the same upstream/proxy path. Disabling it explicitly trusts the configured upstream and always clears AD. Valid NXDOMAIN and NODATA replies complete resolution. HTTPS/SVCB records and ECH parameters are preserved.
 
 ## Client and regional access
 
@@ -107,7 +109,7 @@ In **客户端**, choose **开放模式** (all source networks), **白名单模�
 
 The network condition and regional condition must both pass. Regional rules can allow only, or block, selected countries/regions and provinces. Use an ISO country code such as `CN` or the database country name; a blank province matches the entire country. Province names must match the **来源地区** IP lookup result. Private/reserved IPs and unavailable lookup results follow the explicit unknown-IP choice whenever regional restrictions are enabled. Rejected requests return DNS REFUSED and are logged with the rejection reason.
 
-For DoH behind a reverse proxy, configure **可信代理网段** with only the proxy's addresses, for example `127.0.0.1/32` and `::1/128` for a local Caddy. `X-Forwarded-For` is accepted only from those peers, walked from right to left until the first untrusted hop, and used for both policy and logging. Other peers cannot override their socket source address. Raw DNS, DoT and DoQ use their socket peer.
+The default **可信代理网段** list contains `127.0.0.1/32` and `::1/128` for local DoH reverse proxies. Edit this list to match the deployment. An empty list uses the socket address for every peer. rDNS walks a trusted peer’s `X-Forwarded-For` from right to left until the first untrusted hop and uses that address for access policy and logging. Other peers, raw DNS, DoT and DoQ use their socket address.
 
 ## GeoIP and GFWList data
 
@@ -161,7 +163,7 @@ The console's certificate page can save new absolute paths. Saving validates the
 
 ## Verification
 
-Run `cargo test --locked` for unit tests and a local integration test covering all five transports, policy rules, roles, subscription updates, certificate rotation, failure rollback and restart persistence. Run `cargo test --test smoke live_root_dnssec_and_ech -- --ignored --nocapture` where direct DNS access to authoritative servers is available; it checks root recursion, a signed answer's AD bit, the deliberately bogus `dnssec-failed.org` response and an HTTPS record carrying `ech`. Run `cargo test --test smoke console_screenshot -- --ignored --nocapture` with Chromium installed for a browser walkthrough and screenshot at `/tmp/rdns-console-dashboard.png`.
+Run `cargo test --locked` for unit tests and a local integration test covering all five transports, policy rules, roles, subscription updates, certificate rotation, failure rollback and restart persistence. Run `cargo test --test smoke live_root_dnssec_and_ech -- --ignored --nocapture` where direct DNS access to authoritative servers is available; it checks root recursion, a signed answer's AD bit, the marked unverified `dnssec-failed.org` answer in recursive-only mode and an HTTPS record carrying `ech`. Run `cargo test --test smoke console_screenshot -- --ignored --nocapture` with Chromium installed for a browser walkthrough and screenshot at `/tmp/rdns-console-dashboard.png`.
 The feature integration smoke includes local TLS DoH pools, round robin/cache and timeout failover, GFWList exceptions/default-group fallback, real HTTP CONNECT and SOCKS5 tunnels, generated IPv4/IPv6 XDB databases, trusted/untrusted forwarded IPs, region rules, roles and restart persistence. Run `npx --no-install playwright-core install chromium` from `web/` or set `RDNS_CHROME` to a local Chromium executable. Run `RDNS_FEATURE_UI=1 python3 tests/features_smoke.py` for HTTP saves, reconnect, session revocation and desktop/mobile checks. Screenshots are written to the system temporary directory.
 
 With a debug binary built, run `RDNS_LATENCY_BASELINE=1 python3 tests/features_smoke.py` to measure client-side UDP P95/P99 over 500 sequential local-rule queries and 500 warm-cache queries. Query logs queue up to 1024 entries and apply backpressure when full. The writer commits up to 64 entries per statement. The stats API reports queue depth, failed entries and the duration of the last batch write in microseconds.

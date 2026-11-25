@@ -367,14 +367,6 @@ impl DohGroup {
     }
 }
 
-pub fn dnssec_error(error: &NetError) -> bool {
-    match error {
-        NetError::Dns(DnsError::DnssecBogus) => true,
-        NetError::Dns(DnsError::Nsec { proof, .. }) => proof.is_bogus() || proof.is_indeterminate(),
-        _ => false,
-    }
-}
-
 #[derive(Clone)]
 struct DohHandle(Arc<DohGroup>);
 impl DnsHandle for DohHandle {

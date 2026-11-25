@@ -1,9 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { DnsLookup, DnsRecords, QueryTrend, RecordTypeInput } from './PortalDns.jsx'
+import { PortalDohGuide } from './PortalDohGuide.jsx'
+import { PersonalDnsSettings } from './PortalDnsSettings.jsx'
 import './portal.css'
 
-async function request(path, { method = 'GET', body, token } = {}) {
+async function request(path, { method = 'GET', body, token, signal } = {}) {
   const response = await fetch(path, {
     method,
+    signal,
     cache: 'no-store',
     headers: {
       ...(body !== undefined && { 'Content-Type': 'application/json' }),
@@ -20,6 +24,7 @@ async function request(path, { method = 'GET', body, token } = {}) {
 }
 
 const memberAPI = '/portal/api'
+const memberDnsRequest = (path, options) => request(memberAPI + path, options)
 const adminAPI = '/api/v1/portal'
 const states = { active: '已开通', pending: '待审核', disabled: '已停用' }
 const entries = {
@@ -75,162 +80,170 @@ function Table({ labels, rows, empty = '暂无数据' }) {
   )
 }
 
-function Analytics({ token, users = [] }) {
-  const [days, setDays] = useState(1),
-    [page, setPage] = useState(1)
-  const [user, setUser] = useState(''),
-    [entry, setEntry] = useState('')
-  const [revision, refresh] = useState(0),
-    [data, setData] = useState(null),
-    [error, setError] = useState('')
+const outcomes = {
+  recursive: '递归', doh: 'DoH', gfw_doh: 'GFWList DoH', gfw_fallback_doh: 'GFWList 兜底',
+  local: '本地记录', personal_local: '个人解析', forward: '条件转发', blocked: '已拦截', error: '错误', timeout: '超时', refused: '已拒绝',
+  nxdomain: '域名不存在', nodata: '无记录', dnssec_bogus: 'DNSSEC 验证失败',
+  recursive_dnssec_unverified: 'DNSSEC 验证失败，已返回递归结果',
+  client_whitelist: '网段未允许', client_blacklist: '网段已禁止',
+  region_unknown: '未知地区拒绝', region_whitelist: '地区未允许', region_blacklist: '地区已禁止',
+}
+
+function LogAnswer({ row, rcodes }) {
+  if (!row.response) return row.rcode == null ? '未保存' : (rcodes[row.rcode] || 'RCODE' + row.rcode)
+  const record = row.response.answers[0]
+  const expand = record || row.response.authorities.length || row.response.additionals.length
+  if (!expand) return <><span className="portal-rcode">{row.response.rcode}</span> <small>无记录</small></>
+  return (
+    <details className="portal-log-answer">
+      <summary>
+        <span className="portal-rcode">{row.response.rcode}</span>
+        {record ? <code>{record.qtype} {record.data}</code> : <small>查看权威或附加记录</small>}
+        {row.response.answers.length > 1 && <small>+{row.response.answers.length - 1}</small>}
+      </summary>
+      {row.response.ad && <small>DNSSEC 已验证</small>}
+      <DnsRecords response={row.response} />
+    </details>
+  )
+}
+
+function Analytics({ token, users = [], lookupRevision = 0 }) {
+  const [days, setDays] = useState(1)
+  const [page, setPage] = useState(1)
+  const [user, setUser] = useState('')
+  const [entry, setEntry] = useState('')
+  const [filters, setFilters] = useState('')
+  const [revision, refresh] = useState(0)
+  const [data, setData] = useState(null)
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(true)
+
   useEffect(() => {
-    let active = true
+    const controller = new AbortController()
     setError('')
-    setData(null)
-    const params = new URLSearchParams({ days, page })
+    setLoading(true)
+    const params = new URLSearchParams(filters)
+    params.set('days', days)
+    params.set('page', page)
     if (user) params.set('user', user)
     if (entry) params.set('entry', entry)
-    request((token ? adminAPI : memberAPI) + '/analytics?' + params, { token })
+    request((token ? adminAPI : memberAPI) + '/analytics?' + params, { token, signal: controller.signal })
       .then((value) => {
-        if (active) setData(value)
+        if (!controller.signal.aborted) setData(value)
       })
-      .catch((e) => {
-        if (active) setError(e.message)
+      .catch((failure) => {
+        if (!controller.signal.aborted) setError(failure.message)
       })
-    return () => {
-      active = false
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false)
+      })
+    return () => controller.abort()
+  }, [days, page, user, entry, filters, revision, lookupRevision, token])
+
+  function search(event) {
+    event.preventDefault()
+    const params = new URLSearchParams()
+    for (const [key, value] of new FormData(event.currentTarget)) {
+      if (value.trim()) params.set(key, value.trim())
     }
-  }, [days, page, user, entry, revision, token])
-  const peak = Math.max(1, ...(data?.trend || []).map((row) => row.count))
+    setFilters(params.toString())
+    setPage(1)
+  }
+  const labels = ['时间', '域名', '类型', '处理结果', '最终应答', '耗时', ...(token ? ['入口', '用户 ID'] : [])]
   return (
-    <section className="panel portal-section">
+    <section className="panel portal-section portal-analytics" aria-busy={loading}>
       <header className="panel-head">
         <div>
           <h2>查询分析</h2>
-          {data && <p>日志保留 {data.retention} 天 · 趋势按 UTC 汇总</p>}
+          {data && <p>服务器时间（{data.server_offset}） · 日志保留 {data.retention} 天</p>}
         </div>
-        <button className="btn tertiary" onClick={() => refresh(revision + 1)}>
-          刷新
-        </button>
+        <button className="btn tertiary" onClick={() => refresh((value) => value + 1)} disabled={loading}>刷新</button>
       </header>
-      <div className="portal-filters">
-        <label>
-          时间范围
-          <select
-            value={days}
-            onChange={(e) => {
-              setDays(Number(e.target.value))
-              setPage(1)
-            }}
-          >
-            {[
-              [1, '最近 24 小时'],
-              [7, '最近 7 天'],
-              [30, '最近 30 天'],
-            ].map(([v, n]) => (
-              <option key={v} value={v}>
-                {n}
-              </option>
-            ))}
+      <div className="portal-filters portal-time-filters">
+        <label>时间范围
+          <select value={days} onChange={(e) => { setDays(Number(e.target.value)); setPage(1) }}>
+            <option value={1}>最近 24 小时</option>
+            <option value={7}>最近 7 天</option>
+            <option value={30}>最近 30 天</option>
           </select>
         </label>
-        {token && (
-          <>
-            <label>
-              用户
-              <select
-                aria-label="用户筛选"
-                value={user}
-                onChange={(e) => {
-                  setUser(e.target.value)
-                  setPage(1)
-                }}
-              >
-                <option value="">全部用户</option>
-                {users.map((u) => (
-                  <option value={u.id} key={u.id}>
-                    {u.name} · #{u.id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              入口
-              <select
-                value={entry}
-                onChange={(e) => {
-                  setEntry(e.target.value)
-                  setPage(1)
-                }}
-              >
-                <option value="">全部入口</option>
-                {Object.entries(entries).map(([k, v]) => (
-                  <option value={k} key={k}>
-                    {v}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </>
-        )}
+        {token && <>
+          <label>用户
+            <select aria-label="用户筛选" value={user} onChange={(e) => { setUser(e.target.value); setPage(1) }}>
+              <option value="">全部用户</option>
+              {users.map((u) => <option key={u.id} value={u.id}>{u.name} · #{u.id}</option>)}
+            </select>
+          </label>
+          <label>入口
+            <select value={entry} onChange={(e) => { setEntry(e.target.value); setPage(1) }}>
+              <option value="">全部入口</option>
+              {Object.entries(entries).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+            </select>
+          </label>
+        </>}
       </div>
       <ErrorMessage message={error} />
-      {data && (
-        <>
-          <dl className="portal-metrics">
-            {[
-              ['查询量', data.total],
-              ['拦截率', data.total ? ((100 * data.blocked) / data.total).toFixed(1) + '%' : '—'],
-              ['平均耗时', data.latency == null ? '—' : data.latency.toFixed(1) + ' ms'],
-            ].map(([k, v]) => (
-              <div key={k}>
-                <dt>{k}</dt>
-                <dd>{v}</dd>
-              </div>
-            ))}
-          </dl>
-          <div className="portal-breakdown">
-            <div>
-              <h3>查询趋势</h3>
-              <div className="portal-series">
-                {data.trend.map((r) => (
-                  <div key={r.time}>
-                    <time>{r.time.replace('T', ' ')}</time>
-                    <meter min="0" max={peak} value={r.count} />
-                    <b>{r.count}</b>
-                  </div>
-                ))}
-                {!data.trend.length && '暂无查询'}
-              </div>
-            </div>
-            <div>
-              <h3>热门域名</h3>
-              <Table labels={['域名', '查询量']} rows={data.domains.map((r) => [r.domain, r.count])} />
-            </div>
+      {!data && loading && <p className="portal-loading" role="status">正在加载查询统计…</p>}
+      {data && <>
+        <dl className="portal-metrics">
+          {[
+            ['查询量', data.total.toLocaleString()],
+            ['拦截率', data.total ? ((100 * data.blocked) / data.total).toFixed(1) + '%' : '—'],
+            ['平均耗时', data.latency == null ? '—' : data.latency.toFixed(1) + ' ms'],
+          ].map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}
+        </dl>
+        <div className="portal-breakdown">
+          <QueryTrend rows={data.trend} hourly={days === 1} />
+          <div className="portal-domains">
+            <h3>热门域名</h3>
+            <Table labels={['域名', '查询量']} rows={data.domains.map((row) => [row.domain, row.count.toLocaleString()])} />
           </div>
-          <h3>查询明细</h3>
-          <Table
-            labels={['时间', '域名', '类型', '结果', '耗时', ...(token ? ['入口', '用户 ID'] : [])]}
-            rows={data.logs.map((r) => [
-              new Date(r.at).toLocaleString(),
-              r.domain,
-              r.qtype,
-              r.outcome,
-              r.duration_ms == null ? '—' : r.duration_ms.toFixed(1) + ' ms',
-              ...(token ? [entries[r.entry] || r.entry, r.user] : []),
-            ])}
-          />
-          <div className="portal-pagination">
-            <button disabled={page === 1} onClick={() => setPage(page - 1)}>
-              上一页
-            </button>
-            <span>第 {page} 页</span>
-            <button disabled={page * 50 >= data.total} onClick={() => setPage(page + 1)}>
-              下一页
-            </button>
-          </div>
-        </>
-      )}
+        </div>
+        <div className="portal-log-heading"><h3>查询明细</h3><span>{data.detail_total.toLocaleString()} 条</span></div>
+        <form className="portal-filters portal-log-filters" onSubmit={search}>
+          <label>搜索域名<input name="search" type="search" maxLength={253} placeholder="输入域名关键词" /></label>
+          <RecordTypeInput name="qtype" label="查询类型" placeholder="全部类型" />
+          <label>处理结果
+            <select name="outcome">
+              <option value="">全部结果</option>
+              {data.outcomes.map((key) => <option key={key} value={key}>{outcomes[key] || key}</option>)}
+            </select>
+          </label>
+          <label>应答状态
+            <select name="rcode">
+              <option value="">全部状态</option>
+              {Object.entries(data.rcodes).map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+            </select>
+          </label>
+          <button className="btn primary" disabled={loading}>筛选</button>
+          {filters && <button type="button" className="btn tertiary" onClick={(event) => {
+            event.currentTarget.form.reset()
+            setFilters('')
+            setPage(1)
+          }}>清除</button>}
+        </form>
+        <div className="table-wrap portal-log-table">
+          <table aria-label="查询明细">
+            <thead><tr>{labels.map((label) => <th key={label} scope="col">{label}</th>)}</tr></thead>
+            <tbody>{data.logs.length ? data.logs.map((row) => (
+              <tr key={row.id}>
+                <td data-label="时间"><time dateTime={row.at}>{row.local_at}</time></td>
+                <td className="portal-log-domain" data-label="域名">{row.domain}</td>
+                <td data-label="类型"><code>{row.qtype}</code></td>
+                <td data-label="处理结果">{outcomes[row.outcome] || row.outcome}</td>
+                <td data-label="最终应答"><LogAnswer row={row} rcodes={data.rcodes} /></td>
+                <td data-label="耗时">{row.duration_ms == null ? '—' : row.duration_ms.toFixed(1) + ' ms'}</td>
+                {token && <><td data-label="入口">{entries[row.entry] || row.entry}</td><td data-label="用户 ID">{row.user ?? '—'}</td></>}
+              </tr>
+            )) : <tr><td className="empty" colSpan={labels.length}>没有符合条件的查询</td></tr>}</tbody>
+          </table>
+        </div>
+        <div className="portal-pagination">
+          <button disabled={page === 1 || loading} onClick={() => setPage(page - 1)}>上一页</button>
+          <span>第 {page} 页</span>
+          <button disabled={page * 50 >= data.detail_total || loading} onClick={() => setPage(page + 1)}>下一页</button>
+        </div>
+      </>}
     </section>
   )
 }
@@ -273,16 +286,10 @@ export function Portal() {
   const [method, setMethod] = useState('password')
   const [copied, setCopied] = useState(false)
   const [iosQr, setIosQr] = useState(null)
-  useEffect(() => {
-    if (!iosQr) return
-    const timer = setTimeout(() => setIosQr(null), iosQr.expires_in * 1000)
-    return () => clearTimeout(timer)
-  }, [iosQr])
+  const [lookupRevision, refreshLookups] = useState(0)
   function showIosQr() {
-    action(async () => {
-      setIosQr(null)
-      setIosQr(await request(memberAPI + '/ios-qr', { method: 'POST' }))
-    })
+    if (iosQr) setIosQr(null)
+    else action(async () => setIosQr(await request(memberAPI + '/ios-qr', { method: 'POST' })))
   }
   async function load() {
     const [o, u] = await Promise.all([
@@ -320,9 +327,9 @@ export function Portal() {
     setMethod(next)
     setError('')
   }
-  const address = user?.path ? (user.base || location.origin) + user.path : ''
+  const address = user?.resolver_url
   return (
-    <main className="portal-shell">
+    <main className={user ? "portal-shell portal-member" : "portal-shell"}>
       <header className="portal-brand">
         <div className="brand">
           <span className="brand-mark">r</span>Dns
@@ -392,68 +399,72 @@ export function Portal() {
         </section>
       ) : (
         <>
-          <h1>{user.name} 的 DNS</h1>
-          <section className="panel portal-address">
-            <h2>专属 DoH 地址</h2>
-            {address ? (
-              <>
-                <label>
-                  解析器 URL
-                  <input readOnly value={address} onFocus={(e) => e.target.select()} />
-                </label>
-                <div className="portal-buttons">
-                  <button
-                    className="btn primary"
-                    onClick={() =>
-                      action(async () => {
-                        await navigator.clipboard.writeText(address)
-                        setCopied(true)
-                      })
-                    }
-                  >
-                    {copied ? '已复制' : '复制地址'}
-                  </button>
-                  <a className="btn tertiary" href={memberAPI + '/rdns.mobileconfig'}>
-                    下载 iOS 描述文件
-                  </a>
-                  <button type="button" className="btn tertiary" disabled={busy} onClick={showIosQr}>
-                    {iosQr ? '重新生成 iOS 二维码' : '扫码安装 iOS 描述文件'}
-                  </button>
-                  <button
-                    disabled={busy}
-                    className="btn tertiary"
-                    onClick={() => {
-                      if (confirm('更换后，使用旧地址的设备需要重新配置。继续更换？'))
+          <h1 className="portal-member-title">{user.name} 的 DNS</h1>
+          <div className="portal-workspace">
+            <section className="panel portal-address">
+              <h2>专属 DoH 地址</h2>
+              {address ? (
+                <>
+                  <label>
+                    解析器 URL
+                    <input readOnly value={address} onFocus={(e) => e.target.select()} />
+                  </label>
+                  <div className="portal-buttons">
+                    <button
+                      className="btn primary"
+                      onClick={() =>
                         action(async () => {
-                          await request(memberAPI + '/rotate', { method: 'POST', body: {} })
-                          await load()
+                          await navigator.clipboard.writeText(address)
+                          setCopied(true)
                         })
-                    }}
-                  >
-                    更换地址
-                  </button>
-                </div>
-                {iosQr && <section className="ios-profile-qr" aria-label="iOS 描述文件二维码">
-                  <img src={iosQr.image} width="240" height="240" alt="用 iPhone 相机扫描以下载 iOS 描述文件"/>
-                  <div>
-                    <h3>用 iPhone 相机扫码</h3>
-                    <p>打开扫码链接并允许下载，然后前往「设置 → 已下载描述文件 → 安装」。</p>
-                    <p>二维码 5 分钟内有效，下载后失效。</p>
-                    <a href={iosQr.url} className="text-button blue">打开扫码下载链接</a>
+                      }
+                    >
+                      {copied ? '已复制' : '复制地址'}
+                    </button>
+                    <button type="button" className="btn tertiary" disabled={busy} onClick={showIosQr}>
+                      {iosQr ? '收起 iOS 二维码' : '扫码安装 iOS 描述文件'}
+                    </button>
+                    <button
+                      disabled={busy}
+                      className="btn tertiary"
+                      onClick={() => {
+                        if (confirm('更换后，使用旧地址的设备需要重新配置。继续更换？'))
+                          action(async () => {
+                            await request(memberAPI + '/rotate', { method: 'POST', body: {} })
+                            await load()
+                          })
+                      }}
+                    >
+                      更换地址
+                    </button>
                   </div>
-                </section>}
-                <p>在 iPhone 的“设置”中安装下载的描述文件。更换专属地址后，请重新下载并安装。</p>
-              </>
-            ) : (
-              <>
-                <p>账号待审核。管理员批准后即可获取地址。</p>
-                <button className="btn tertiary" onClick={() => action(load)}>
-                  刷新状态
-                </button>
-              </>
-            )}
-          </section>
-          {address && <Analytics />}
+                  {iosQr && <section className="ios-profile-qr" aria-label="iOS 描述文件二维码">
+                    <img src={iosQr.image} width="240" height="240" alt="用 iPhone 相机扫描以下载 iOS 描述文件"/>
+                    <div>
+                      <h3>用 iPhone 相机扫码</h3>
+                      <p>打开扫码链接并允许下载，然后前往「设置 → 已下载描述文件 → 安装」。</p>
+                      <a href={iosQr.url} className="text-button blue">打开扫码下载链接</a>
+                    </div>
+                  </section>}
+                </>
+              ) : (
+                <>
+                  <p className="portal-hint">{user.path
+                    ? '尚未配置 HTTPS DoH 入口。请从 HTTPS DoH 地址打开门户，或联系管理员配置公开地址。'
+                    : '账号待审核。管理员批准后即可获取地址。'}</p>
+                  <button className="btn tertiary" onClick={() => action(load)}>
+                    刷新状态
+                  </button>
+                </>
+              )}
+            </section>
+            {user.path && <DnsLookup key={user.path}
+              run={(body) => request(memberAPI + '/lookup', { method: 'POST', body })}
+              onComplete={() => refreshLookups((value) => value + 1)} />}
+          </div>
+          {user.path && <PersonalDnsSettings key={user.id} request={memberDnsRequest} />}
+          {address && <PortalDohGuide />}
+          {user.path && <Analytics lookupRevision={lookupRevision} />}
         </>
       )}
     </main>

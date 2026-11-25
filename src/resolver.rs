@@ -5,6 +5,7 @@ use crate::{
     cache::{CacheSettings, CachedProvider, PersistentCache},
     config::Config,
     features::Features,
+    portal::{DnsPreferences, query_policy},
     store::{Rule, RuleInput, Store},
     upstream::{DohGroup, ResolveMode},
 };
@@ -13,14 +14,15 @@ use arc_swap::ArcSwap;
 use hickory_proto::{
     op::{Edns, Message, MessageType, OpCode, ResponseCode},
     rr::{
-        DNSClass, Name, RData, Record,
-        rdata::{A, AAAA, CNAME, TXT},
+        DNSClass, Name, RData, Record, RecordType,
+        rdata::{A, AAAA, CNAME, TXT, opt::EdnsOption},
     },
 };
 use hickory_resolver::{
     TtlConfig,
     config::ResolverOpts,
-    recursor::{DnssecConfig, DnssecPolicy, Recursor, RecursorOptions},
+    net::{DnsError, NetError},
+    recursor::{DnssecConfig, DnssecPolicy, Recursor, RecursorError, RecursorOptions},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -92,6 +94,17 @@ impl Policy {
             (subdomain || (wildcard.is_none() && domain == suffix)).then_some(*target)
         })
     }
+
+    fn blocks(&self, domain: &str) -> bool {
+        !self.allow.matches(domain) && self.block.matches(domain)
+    }
+}
+
+pub(crate) fn record_type_label(kind: RecordType) -> String {
+    match kind {
+        RecordType::Unknown(code) => format!("TYPE{code}"),
+        _ => kind.to_string(),
+    }
 }
 
 pub struct Engine {
@@ -100,7 +113,7 @@ pub struct Engine {
     policy: ArcSwap<Policy>,
     policy_reload: tokio::sync::Mutex<()>,
     pub features: Arc<Features>,
-    recursor: ArcSwap<Recursor<CachedProvider>>,
+    recursor: ArcSwap<Recursors>,
     prefetch: prefetch::Prefetch,
     cache: Arc<PersistentCache>,
     roots: Vec<IpAddr>,
@@ -352,34 +365,65 @@ impl Engine {
                 .trim_end_matches('.')
                 .to_ascii_lowercase()
         };
-        let kind = query.query_type().to_string();
+        let kind = record_type_label(query.query_type());
         let policy = self.policy.load_full();
         let runtime = self.features.current.load_full();
         let location = runtime.geo.lookup(crate::access::canonical_ip(peer.ip()));
+        let access = runtime.access.decide(peer.ip(), &location);
+        let personal = match user_id.filter(|_| access.is_ok()) {
+            Some(user) => query_policy(&self.store.pool, user, &domain).await?,
+            None => Some((DnsPreferences::default(), Vec::new())),
+        };
+        let inactive = personal.is_none();
+        let (preferences, personal_records) = personal.unwrap_or_default();
+        let forward_target = policy.forward_target(&domain);
         let mut selected_upstream = None;
         let outcome;
-        if let Err(reason) = runtime.access.decide(peer.ip(), &location) {
+        if let Err(reason) = access {
             response.metadata.response_code = ResponseCode::Refused;
             outcome = reason;
+        } else if inactive {
+            response.metadata.response_code = ResponseCode::Refused;
+            outcome = "refused";
         } else if let Some(records) = policy.local_records(&domain) {
-            for record in records.iter().filter(|record| {
-                matches!(record.record_type.as_deref(), Some("CNAME"))
-                    || record.record_type.as_deref() == Some(kind.as_str())
-            }) {
-                if let (Some(rt), Some(value)) = (&record.record_type, &record.value) {
-                    response.add_answer(Record::from_rdata(
-                        query.name().clone(),
+            answer_local(
+                &mut response,
+                &query,
+                &kind,
+                records.iter().filter_map(|record| {
+                    Some((
+                        record.record_type.as_deref()?,
+                        record.value.as_deref()?,
                         record.ttl.unwrap_or(300) as u32,
-                        parse_rdata(rt, value)?,
-                    ));
-                }
-            }
-            response.metadata.authoritative = true;
+                    ))
+                }),
+            )?;
             outcome = "local";
-        } else if self.is_blocked(&policy, &runtime, &domain) {
+        } else if policy.blocks(&domain) {
             response.metadata.response_code = ResponseCode::NXDomain;
             outcome = "blocked";
-        } else if let Some(upstream) = policy.forward_target(&domain) {
+        } else if forward_target.is_none() && !personal_records.is_empty() {
+            answer_local(
+                &mut response,
+                &query,
+                &kind,
+                personal_records.iter().map(|record| {
+                    (
+                        record.record_type.as_str(),
+                        record.value.as_str(),
+                        record.ttl,
+                    )
+                }),
+            )?;
+            outcome = "personal_local";
+        } else if preferences.adguard
+            && runtime.settings.adguard.enabled
+            && !policy.allow.matches(&domain)
+            && self.features.ads.load().blocks(&domain)
+        {
+            response.metadata.response_code = ResponseCode::NXDomain;
+            outcome = "blocked";
+        } else if let Some(upstream) = forward_target {
             let _foreground = self.begin_foreground(true);
             let budget = Duration::from_millis(runtime.settings.resolution.timeout_ms);
             match tokio::time::timeout(budget, forward(wire, upstream)).await {
@@ -401,8 +445,11 @@ impl Engine {
                 }
             }
         } else {
+            let gfw = preferences.gfwlist
+                && runtime.settings.gfwlist.enabled
+                && self.features.list.load().matches(&domain);
             match self
-                .cache_lookup(&runtime, &request, &domain, true)
+                .cache_lookup(&runtime, &request, gfw, true)
                 .await
                 .as_ref()
             {
@@ -422,13 +469,20 @@ impl Engine {
                         let mut edns = Edns::new();
                         edns.set_max_payload(request.max_payload())
                             .set_dnssec_ok(do_bit);
+                        // RFC 8914 Extended DNS Error, when the client supports EDNS.
+                        if let Some(warning) = answer.dnssec_warning {
+                            edns.options_mut().insert(EdnsOption::Unknown(
+                                15,
+                                (warning as u16).to_be_bytes().to_vec(),
+                            ));
+                        }
                         edns
                     });
                     outcome = answer.outcome;
                 }
                 Ok(Err(error)) => {
                     response.metadata.response_code = ResponseCode::ServFail;
-                    outcome = if *error == LookupFailure::Bogus {
+                    outcome = if matches!(error, LookupFailure::Dnssec(_)) {
                         "dnssec_bogus"
                     } else {
                         "error"
@@ -458,6 +512,8 @@ impl Engine {
                 province: location.province,
                 city: location.city,
                 upstream: selected_upstream,
+                rcode: Some(u16::from(response.metadata.response_code)),
+                response_wire: user_id.map(|_| wire.clone()),
             })
             .await
         {
@@ -465,17 +521,6 @@ impl Engine {
         }
         Ok(wire)
     }
-    fn is_blocked(
-        &self,
-        policy: &Policy,
-        runtime: &crate::features::FeatureRuntime,
-        domain: &str,
-    ) -> bool {
-        !policy.allow.matches(domain)
-            && (policy.block.matches(domain)
-                || (runtime.settings.adguard.enabled && self.features.ads.load().blocks(domain)))
-    }
-
     async fn routed_lookup(
         &self,
         runtime: &crate::features::FeatureRuntime,
@@ -496,7 +541,7 @@ impl Engine {
         };
         let lookup = async {
             match mode {
-                ResolveMode::Recursive => self.recursive_lookup(request).await,
+                ResolveMode::Recursive => self.recursive_lookup(request, true).await,
                 ResolveMode::Doh => {
                     let primary = group
                         .context("missing upstream group")
@@ -545,8 +590,8 @@ impl Engine {
                         .context("missing upstream group")
                         .map_err(|_| LookupFailure::Unavailable)?;
                     prefer_recursive(
-                        self.recursive_lookup(request),
-                        doh_lookup(doh, request.clone(), settings.resolution.validate_dnssec),
+                        self.recursive_lookup(request, false),
+                        doh_lookup(doh, request.clone(), false),
                         Duration::from_millis(settings.resolution.priority_ms),
                     )
                     .await
@@ -566,10 +611,12 @@ impl Engine {
         }
         Ok(result)
     }
-    async fn recursive_lookup(&self, request: &Message) -> Result<Resolved, LookupFailure> {
-        let query = request.queries[0].clone();
-        let do_bit = request.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok);
-        let recursor = if crate::cache::bypass_cache(request) {
+    async fn recursive_lookup(
+        &self,
+        request: &Message,
+        allow_unverified: bool,
+    ) -> Result<Resolved, LookupFailure> {
+        let recursors = if crate::cache::bypass_cache(request) {
             match build_recursor(&self.roots, &self.cache) {
                 Ok(recursor) => Arc::new(recursor),
                 Err(error) => {
@@ -580,23 +627,40 @@ impl Engine {
         } else {
             self.recursor.load_full()
         };
-        match recursor
-            .resolve(query.clone(), Instant::now(), do_bit)
-            .await
-        {
+        match Self::resolve_recursive(&recursors.validating, request).await {
+            Err(LookupFailure::Dnssec(code)) if allow_unverified => {
+                let mut answer = Self::resolve_recursive(&recursors.unverified, request)
+                    .await
+                    .map_err(|_| LookupFailure::Dnssec(code))?;
+                answer.outcome = "recursive_dnssec_unverified";
+                answer.dnssec_warning = Some(code);
+                Ok(answer)
+            }
+            result => result,
+        }
+    }
+
+    async fn resolve_recursive(
+        recursor: &Recursor<CachedProvider>,
+        request: &Message,
+    ) -> Result<Resolved, LookupFailure> {
+        let query = request.queries[0].clone();
+        let do_bit = request.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok);
+        match recursor.resolve(query, Instant::now(), do_bit).await {
             Ok(mut message) => {
-                let secure = validated_answer_is_secure(&message).ok_or(LookupFailure::Bogus)?;
                 if !matches!(
                     message.metadata.response_code,
                     ResponseCode::NoError | ResponseCode::NXDomain
                 ) {
                     return Err(LookupFailure::Unavailable);
                 }
-                message.metadata.authentic_data = secure;
+                message.metadata.authentic_data =
+                    recursor.is_validating() && validated_answer_is_secure(&message)?;
                 Ok(Resolved {
                     message,
                     outcome: "recursive",
                     upstream: None,
+                    dnssec_warning: None,
                 })
             }
             Err(error) if error.is_nx_domain() || error.is_no_records_found() => {
@@ -620,16 +684,15 @@ impl Engine {
                     message,
                     outcome: if nx { "nxdomain" } else { "nodata" },
                     upstream: None,
+                    dnssec_warning: None,
                 })
             }
             Err(error) => {
                 tracing::debug!(%error, "recursive lookup failed");
-                if matches!(&error, hickory_resolver::recursor::RecursorError::Net(error) if crate::upstream::dnssec_error(error))
-                {
-                    Err(LookupFailure::Bogus)
-                } else {
-                    Err(LookupFailure::Unavailable)
-                }
+                Err(match error {
+                    RecursorError::Net(error) => dnssec_failure(&error),
+                    _ => LookupFailure::Unavailable,
+                })
             }
         }
     }
@@ -640,11 +703,34 @@ struct Resolved {
     message: Message,
     outcome: &'static str,
     upstream: Option<String>,
+    dnssec_warning: Option<DnssecFailure>,
 }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LookupFailure {
     Unavailable,
-    Bogus,
+    Dnssec(DnssecFailure),
+}
+
+// RFC 8914 Extended DNS Error information codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+enum DnssecFailure {
+    Indeterminate = 5,
+    Bogus = 6,
+}
+
+fn dnssec_failure(error: &NetError) -> LookupFailure {
+    match error {
+        NetError::Dns(DnsError::DnssecBogus) => LookupFailure::Dnssec(DnssecFailure::Bogus),
+        NetError::Dns(DnsError::Nsec { proof, .. }) if proof.is_bogus() => {
+            LookupFailure::Dnssec(DnssecFailure::Bogus)
+        }
+        NetError::Dns(DnsError::Nsec { proof, .. }) if proof.is_indeterminate() => {
+            LookupFailure::Dnssec(DnssecFailure::Indeterminate)
+        }
+        _ => LookupFailure::Unavailable,
+    }
 }
 
 async fn doh_lookup(
@@ -655,7 +741,7 @@ async fn doh_lookup(
     match group.resolve(request, validate).await {
         Ok(mut message) => {
             if validate {
-                let secure = validated_answer_is_secure(&message).ok_or(LookupFailure::Bogus)?;
+                let secure = validated_answer_is_secure(&message)?;
                 // Negative answers have no answer RRsets; the validator sets AD from the NSEC proof.
                 message.metadata.authentic_data =
                     secure || (message.answers.is_empty() && message.metadata.authentic_data);
@@ -666,18 +752,14 @@ async fn doh_lookup(
                 message,
                 outcome: "doh",
                 upstream: Some(group.name.clone()),
+                dnssec_warning: None,
             })
         }
         Err(error) => {
             tracing::debug!(group = %group.name, %error, "DoH lookup failed");
-            if error
-                .downcast_ref::<hickory_resolver::net::NetError>()
-                .is_some_and(crate::upstream::dnssec_error)
-            {
-                Err(LookupFailure::Bogus)
-            } else {
-                Err(LookupFailure::Unavailable)
-            }
+            Err(error
+                .downcast_ref::<NetError>()
+                .map_or(LookupFailure::Unavailable, dnssec_failure))
         }
     }
 }
@@ -694,27 +776,32 @@ where
     tokio::pin!(recursive, doh);
     let deadline = tokio::time::sleep(priority);
     tokio::pin!(deadline);
-    let mut rec_pending = true;
+    let mut recursive_failure = None;
     let mut doh_pending = true;
     let mut elapsed = false;
     let mut ready = None;
     loop {
         tokio::select! {
             biased;
-            result = &mut recursive, if rec_pending => {
-                rec_pending = false;
-                match result { Ok(answer) => return Ok(answer), Err(LookupFailure::Bogus) => return Err(LookupFailure::Bogus), Err(_) => {} }
+            result = &mut recursive, if recursive_failure.is_none() => {
+                let failure = match result {
+                    Ok(answer) => return Ok(answer),
+                    Err(failure) => failure,
+                };
                 if let Some(answer) = ready.take() { return Ok(answer); }
-                if !doh_pending { return Err(LookupFailure::Unavailable); }
+                if !doh_pending { return Err(failure); }
+                recursive_failure = Some(failure);
             }
             result = &mut doh, if doh_pending => {
                 doh_pending = false;
                 match result {
-                    Ok(answer) if !rec_pending || elapsed => return Ok(answer),
+                    Ok(answer) if recursive_failure.is_some() || elapsed => return Ok(answer),
                     Ok(answer) => ready = Some(answer),
-                    Err(LookupFailure::Bogus) => return Err(LookupFailure::Bogus),
-                    Err(_) if !rec_pending => return Err(LookupFailure::Unavailable),
-                    Err(_) => {}
+                    Err(_) => {
+                        if let Some(failure) = recursive_failure {
+                            return Err(failure);
+                        }
+                    }
                 }
             }
             _ = &mut deadline, if !elapsed => {
@@ -725,10 +812,12 @@ where
     }
 }
 
-fn build_recursor(
-    roots: &[IpAddr],
-    cache: &Arc<PersistentCache>,
-) -> Result<Recursor<CachedProvider>> {
+struct Recursors {
+    validating: Recursor<CachedProvider>,
+    unverified: Recursor<CachedProvider>,
+}
+
+fn build_recursor(roots: &[IpAddr], cache: &Arc<PersistentCache>) -> Result<Recursors> {
     build_recursor_with_settings(roots, cache, &cache.settings())
 }
 
@@ -736,7 +825,7 @@ fn build_recursor_with_settings(
     roots: &[IpAddr],
     cache: &Arc<PersistentCache>,
     settings: &CacheSettings,
-) -> Result<Recursor<CachedProvider>> {
+) -> Result<Recursors> {
     let mut resolver_options = ResolverOpts::default();
     resolver_options.positive_max_ttl = Some(Duration::from_secs(u64::from(
         settings.ns_max_ttl.min(settings.answer_max_ttl),
@@ -749,14 +838,20 @@ fn build_recursor_with_settings(
         cache_policy: TtlConfig::from_opts(&resolver_options),
         ..RecursorOptions::default()
     };
-    Recursor::new(
-        roots,
-        DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
-        None,
-        options,
-        CachedProvider::new(cache.clone(), roots),
-    )
-    .context("starting validating recursor")
+    let build = |policy| {
+        Recursor::new(
+            roots,
+            policy,
+            None,
+            options.clone(),
+            CachedProvider::new(cache.clone(), roots),
+        )
+        .context("starting recursor")
+    };
+    Ok(Recursors {
+        validating: build(DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()))?,
+        unverified: build(DnssecPolicy::ValidationDisabled)?,
+    })
 }
 
 fn response(request: &Message, code: ResponseCode) -> Message {
@@ -773,21 +868,21 @@ fn response(request: &Message, code: ResponseCode) -> Message {
     message
 }
 
-fn validated_answer_is_secure(message: &Message) -> Option<bool> {
-    if message
+fn validated_answer_is_secure(message: &Message) -> Result<bool, LookupFailure> {
+    if message.answers.iter().any(|record| record.proof.is_bogus()) {
+        Err(LookupFailure::Dnssec(DnssecFailure::Bogus))
+    } else if message
         .answers
         .iter()
-        .any(|record| record.proof.is_bogus() || record.proof.is_indeterminate())
+        .any(|record| record.proof.is_indeterminate())
     {
-        None
+        Err(LookupFailure::Dnssec(DnssecFailure::Indeterminate))
     } else {
-        Some(
-            !message.answers.is_empty()
-                && message
-                    .answers
-                    .iter()
-                    .all(|record| record.proof.is_secure()),
-        )
+        Ok(!message.answers.is_empty()
+            && message
+                .answers
+                .iter()
+                .all(|record| record.proof.is_secure()))
     }
 }
 
@@ -836,6 +931,25 @@ pub(crate) fn matches_domain(set: &HashSet<String>, domain: &str) -> bool {
         };
         remaining = suffix;
     }
+}
+
+fn answer_local<'a>(
+    response: &mut Message,
+    query: &hickory_proto::op::Query,
+    kind: &str,
+    records: impl Iterator<Item = (&'a str, &'a str, u32)>,
+) -> Result<()> {
+    for (record_type, value, ttl) in records {
+        if record_type == "CNAME" || query.query_type() == RecordType::ANY || record_type == kind {
+            response.add_answer(Record::from_rdata(
+                query.name().clone(),
+                ttl,
+                parse_rdata(record_type, value)?,
+            ));
+        }
+    }
+    response.metadata.authoritative = true;
+    Ok(())
 }
 
 fn parse_rdata(kind: &str, value: &str) -> Result<RData> {
@@ -936,6 +1050,7 @@ mod tests {
             message: Message::query(),
             outcome,
             upstream: None,
+            dnssec_warning: None,
         })
     }
 
@@ -967,13 +1082,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.outcome, "doh");
-        let result = prefer_recursive(
-            async { Err(LookupFailure::Bogus) },
-            async { ready("doh") },
-            Duration::from_millis(0),
-        )
-        .await;
-        assert!(matches!(result, Err(LookupFailure::Bogus)));
+        for failure in [DnssecFailure::Bogus, DnssecFailure::Indeterminate] {
+            let failure = LookupFailure::Dnssec(failure);
+            let result = prefer_recursive(
+                async { Err(failure) },
+                async { ready("doh") },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.outcome, "doh");
+
+            let result = prefer_recursive(
+                async { Err(failure) },
+                async { Err(LookupFailure::Unavailable) },
+                Duration::from_secs(1),
+            )
+            .await;
+            assert!(matches!(result, Err(error) if error == failure));
+        }
         let result = prefer_recursive(
             async {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1022,22 +1149,28 @@ mod tests {
     }
 
     #[test]
-    fn bogus_dnssec_proof_never_becomes_a_successful_answer() {
+    fn classifies_dnssec_proof() {
         let name = Name::from_ascii("example.com.").unwrap();
         let mut answer = Message::response(0, OpCode::Query);
         let mut record = Record::from_rdata(name, 60, RData::A(A("192.0.2.1".parse().unwrap())));
         record.proof = Proof::Bogus;
         answer.add_answer(record.clone());
-        assert_eq!(validated_answer_is_secure(&answer), None);
+        assert_eq!(
+            validated_answer_is_secure(&answer),
+            Err(LookupFailure::Dnssec(DnssecFailure::Bogus))
+        );
         record.proof = Proof::Indeterminate;
         answer.answers = vec![record.clone()];
-        assert_eq!(validated_answer_is_secure(&answer), None);
+        assert_eq!(
+            validated_answer_is_secure(&answer),
+            Err(LookupFailure::Dnssec(DnssecFailure::Indeterminate))
+        );
         record.proof = Proof::Insecure;
         answer.answers = vec![record.clone()];
-        assert_eq!(validated_answer_is_secure(&answer), Some(false));
+        assert_eq!(validated_answer_is_secure(&answer), Ok(false));
         record.proof = Proof::Secure;
         answer.answers = vec![record];
-        assert_eq!(validated_answer_is_secure(&answer), Some(true));
+        assert_eq!(validated_answer_is_secure(&answer), Ok(true));
     }
 
     #[test]

@@ -322,7 +322,7 @@ impl Engine {
                 SELECT at,domain,qtype,outcome FROM query_log ORDER BY id DESC LIMIT 50000
              ), counts AS (
                 SELECT domain,qtype,COUNT(*) AS hits FROM sample
-                WHERE at >= ? AND outcome IN ('recursive','doh','gfw_doh','gfw_fallback_doh')
+                WHERE at >= ? AND outcome IN ('recursive','doh')
                   AND qtype IN ('A','AAAA','HTTPS','SVCB')
                 GROUP BY domain,qtype
              ), parents AS (
@@ -333,7 +333,6 @@ impl Engine {
              FROM parents JOIN counts USING(domain) ORDER BY parents.hits DESC,parents.domain,counts.qtype"
         ).bind(since.to_rfc3339()).bind(i64::from(settings.local_min_queries)).bind(settings.warm_domain_limit as i64)
             .fetch_all(&self.store.pool).await?;
-        let runtime = self.features.current.load_full();
         let policy = self.policy.load_full();
         let mut local = Vec::<LocalHot>::new();
         for (domain, count, kind) in rows {
@@ -344,7 +343,7 @@ impl Engine {
                 && entry.domain == domain
             {
                 entry.kinds.push(kind);
-            } else if self.warm_allowed(&policy, &runtime, &domain) {
+            } else if Self::warm_allowed(&policy, &domain) {
                 local.push(LocalHot {
                     domain,
                     count,
@@ -519,21 +518,16 @@ impl Engine {
         }
     }
 
-    fn warm_allowed(
-        &self,
-        policy: &Policy,
-        runtime: &crate::features::FeatureRuntime,
-        domain: &str,
-    ) -> bool {
+    fn warm_allowed(policy: &Policy, domain: &str) -> bool {
         policy.local_records(domain).is_none()
-            && !self.is_blocked(policy, runtime, domain)
+            && !policy.blocks(domain)
             && policy.forward_target(domain).is_none()
     }
 
     async fn warm_question(self: &Arc<Self>, domain: &str, kind: RecordType) -> u32 {
         let runtime = self.features.current.load_full();
         let policy = self.policy.load_full();
-        if !self.warm_allowed(&policy, &runtime, domain) {
+        if !Self::warm_allowed(&policy, domain) {
             return 300;
         }
         let Ok(name) = Name::from_ascii(format!("{domain}.")) else {
@@ -543,7 +537,7 @@ impl Engine {
         request.metadata.recursion_desired = true;
         request.add_query(Query::query(name, kind));
         if let Ok(Ok(answer)) = self
-            .cache_lookup(&runtime, &request, domain, false)
+            .cache_lookup(&runtime, &request, false, false)
             .await
             .as_ref()
             && let Some(ttl) = answer

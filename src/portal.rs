@@ -1,14 +1,18 @@
+mod dns;
 mod email;
 mod federation;
+mod lookup;
 mod mobileconfig;
 mod reporting;
+
+pub(crate) use dns::{DnsPreferences, query_policy};
 
 use crate::api::{ApiState, require};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode, Uri, header},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -69,6 +73,8 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         "INSERT OR IGNORE INTO portal_settings(id) VALUES(1)",
         "CREATE TABLE IF NOT EXISTS portal_users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, password TEXT, identity TEXT UNIQUE, status TEXT NOT NULL, credential TEXT COLLATE BINARY UNIQUE)",
         "CREATE UNIQUE INDEX IF NOT EXISTS portal_local_name ON portal_users(name) WHERE identity IS NULL",
+        "CREATE TABLE IF NOT EXISTS portal_dns_preferences(user_id INTEGER PRIMARY KEY REFERENCES portal_users(id) ON DELETE CASCADE, adguard INTEGER NOT NULL, gfwlist INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS portal_dns_records(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES portal_users(id) ON DELETE CASCADE, domain TEXT NOT NULL, record_type TEXT NOT NULL, value TEXT NOT NULL, ttl INTEGER NOT NULL, UNIQUE(user_id,domain,record_type,value))",
         "CREATE TABLE IF NOT EXISTS portal_profile_tickets(user_id INTEGER PRIMARY KEY REFERENCES portal_users(id) ON DELETE CASCADE,hash TEXT UNIQUE NOT NULL,origin TEXT NOT NULL,expires INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS portal_sessions(hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES portal_users(id),expires INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS portal_mail(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL)",
@@ -97,6 +103,8 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     for (name, kind) in [
         ("portal_user_id", "INTEGER"),
         ("entry", "TEXT NOT NULL DEFAULT 'historical'"),
+        ("rcode", "INTEGER"),
+        ("response_wire", "BLOB"),
     ] {
         if !cols.iter().any(|r| r.get::<String, _>("name") == name) {
             sqlx::query(&format!("ALTER TABLE query_log ADD COLUMN {name} {kind}"))
@@ -110,6 +118,12 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     tx.commit().await?;
     Ok(())
 }
+#[derive(Clone, Copy)]
+pub(crate) struct EntryPoint {
+    pub doh: bool,
+    pub tls: bool,
+}
+
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/portal/api/options", get(options))
@@ -126,6 +140,16 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/portal/api/me", get(me))
         .route("/portal/api/rotate", post(rotate))
+        .route("/portal/api/lookup", post(lookup::test))
+        .route(
+            "/portal/api/dns-settings",
+            get(dns::settings).put(dns::save_preferences),
+        )
+        .route("/portal/api/dns-records", post(dns::add_record))
+        .route(
+            "/portal/api/dns-records/{id}",
+            axum::routing::put(dns::edit_record).delete(dns::delete_record),
+        )
         .route("/portal/api/analytics", get(reporting::personal))
         .route("/portal/auth/{provider}", get(federation::start))
         .route("/portal/callback/{provider}", get(federation::callback))
@@ -161,6 +185,19 @@ pub async fn identify_doh(State(s): State<ApiState>, mut req: Request, next: Nex
         .strip_prefix("/dns/")
         .filter(|k| k.len() == 22 && k.bytes().all(|b| b.is_ascii_alphanumeric()))
     {
+        if matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ) && req.uri().query() == Some("mobileconfig=1")
+        {
+            let mut response = mobileconfig::download_credential(&s, key, req.headers(), req.uri())
+                .await
+                .into_response();
+            if req.method() == axum::http::Method::HEAD {
+                *response.body_mut() = axum::body::Body::empty();
+            }
+            return response;
+        }
         sqlx::query_scalar::<_, i64>(
             "SELECT id FROM portal_users WHERE credential=? AND status='active'",
         )
@@ -488,12 +525,31 @@ async fn logout(State(s): State<ApiState>, h: HeaderMap, Json(_): Json<Value>) -
     )
         .into_response())
 }
-async fn me(State(s): State<ApiState>, h: HeaderMap) -> Reply {
+async fn me(
+    State(s): State<ApiState>,
+    Extension(entry): Extension<EntryPoint>,
+    h: HeaderMap,
+    uri: Uri,
+) -> Reply {
     let id = authenticate(&s, &h).await?;
-    let row=sqlx::query("SELECT name,status,credential,base FROM portal_users,portal_settings WHERE portal_users.id=?").bind(id).fetch_one(&s.engine.store.pool).await.map_err(internal)?;
-    Ok(Json(
-        json!({"id":id,"name":row.get::<String,_>("name"),"status":row.get::<String,_>("status"),"base":row.get::<String,_>("base"),"path":row.get::<Option<String>,_>("credential").map(|c|format!("/dns/{c}"))}),
-    ))
+    let row = sqlx::query("SELECT name,status,credential,base FROM portal_users,portal_settings WHERE portal_users.id=?")
+        .bind(id)
+        .fetch_one(&s.engine.store.pool)
+        .await
+        .map_err(internal)?;
+    let base: String = row.get("base");
+    let path = row
+        .get::<Option<String>, _>("credential")
+        .map(|key| format!("/dns/{key}"));
+    let resolver_url = if let Some(path) = &path {
+        mobileconfig::resolver_origin(&base, entry, &h, &uri)?.map(|origin| origin + path)
+    } else {
+        None
+    };
+    Ok(Json(json!({
+        "id": id, "name": row.get::<String, _>("name"), "status": row.get::<String, _>("status"),
+        "base": base, "path": path, "resolver_url": resolver_url
+    })))
 }
 async fn rotate(State(s): State<ApiState>, h: HeaderMap, Json(_): Json<Value>) -> Reply {
     let id = authenticate(&s, &h).await?;

@@ -14,6 +14,8 @@ import sqlite3
 import ssl
 import subprocess
 import tempfile
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
@@ -122,7 +124,7 @@ private_key = "localhost.key"
     subprocess.run([BIN,'init-admin',config,'admin'],input=PASSWORD.encode(),check=True,stdout=subprocess.DEVNULL)
     server_log = (directory/'server.log').open('w+')
     def start():
-        return subprocess.Popen([BIN,config],env={**os.environ,'SSL_CERT_FILE':str(cert),'NO_PROXY':'localhost,127.0.0.1','no_proxy':'localhost,127.0.0.1'}, stdout=server_log,stderr=subprocess.STDOUT)
+        return subprocess.Popen([BIN,config],env={**os.environ,'TZ':'Asia/Kathmandu','SSL_CERT_FILE':str(cert),'NO_PROXY':'localhost,127.0.0.1','no_proxy':'localhost,127.0.0.1'}, stdout=server_log,stderr=subprocess.STDOUT)
     def admin_login():
         for i in range(100):
             try:
@@ -130,8 +132,9 @@ private_key = "localhost.key"
             except OSError:
                 time.sleep(0.1)
         raise AssertionError('admin listener unavailable')
-    def call(path, body=None, cookie='', status=200, method=None):
-        con = http.client.HTTPSConnection('localhost',dns_port,context=ssl.create_default_context(cafile=cert),timeout=5)
+    def call(path, body=None, cookie='', status=200, method=None, via_admin=False):
+        con = (http.client.HTTPConnection('127.0.0.1',admin_port,timeout=5) if via_admin
+               else http.client.HTTPSConnection('localhost',dns_port,context=ssl.create_default_context(cafile=cert),timeout=5))
         try:
             raw = isinstance(body, bytes)
             con.request(method or ('GET' if body is None else 'POST'),path,
@@ -139,7 +142,7 @@ private_key = "localhost.key"
                         'Content-Type':'application/dns-message' if raw else 'application/json'})
             res=con.getresponse()
             data=res.read()
-            if path == '/portal/api/rdns.mobileconfig' and status == 200:
+            if (path == '/portal/api/rdns.mobileconfig' or path.endswith('?mobileconfig=1')) and status == 200:
                 assert res.getheader('Content-Type') == 'application/x-apple-aspen-config'
                 assert 'rdns.mobileconfig' in res.getheader('Content-Disposition')
                 assert res.getheader('Cache-Control') == 'no-store'
@@ -202,25 +205,22 @@ private_key = "localhost.key"
         assert mobile_profile(b, public + bob['path']) != original
         qr_endpoint='/portal/api/ios-qr'
         call(qr_endpoint,{},status=401)
-        def ticket(cookie):
+        assert alice['resolver_url']==public+alice['path']
+        assert call('/portal/api/me',cookie=a,via_admin=True)[0]['resolver_url'] is None
+        call(qr_endpoint,{},a,status=409,via_admin=True)
+        call(mobile,cookie=a,status=409,via_admin=True)
+        def download_link(cookie, path):
             data=call(qr_endpoint,{},cookie)[0]
             assert data['image'].startswith('data:image/svg+xml;base64,')
-            assert data['expires_in']==300
-            assert data['url'].startswith(public+'/portal/install/')
-            return urlsplit(data['url']).path
-        previous=ticket(a)
-        download=ticket(a)
-        call(previous,status=404)
-        call(download,status=405,method='HEAD')
-        descriptor=plistlib.loads(call(download)[0])
-        assert descriptor['PayloadUUID']==original
-        assert descriptor['PayloadContent'][0]['DNSSettings']['ServerURL']==public+alice['path']
-        call(download,status=404)
-        expired=ticket(a)
-        db.execute('UPDATE portal_profile_tickets SET expires=unixepoch()-1 WHERE user_id=?',(alice['id'],))
-        db.commit()
-        call(expired,status=404)
-        before_rotate=ticket(a)
+            assert data['url']==public+path+'?mobileconfig=1'
+            return path+'?mobileconfig=1'
+        before_rotate=download_link(a,alice['path'])
+        for _ in range(2):
+            descriptor=plistlib.loads(call(before_rotate)[0])
+            assert descriptor['PayloadUUID']==original
+            assert descriptor['PayloadContent'][0]['DNSSettings']['ServerURL']==public+alice['path']
+        assert call(before_rotate,method='HEAD')[0] == b''
+        call('/dns-query?mobileconfig=1',status=400)
         wire=query('portal.test')
         check=lambda data: rcode(data)==0 and data.endswith(bytes([192,0,2,27]))
         assert check(call(alice['path']+'?dns='+b64(wire))[0])
@@ -238,6 +238,74 @@ private_key = "localhost.key"
         assert admin('analytics?entry=historical')['total']==1
         assert admin('analytics?entry=public')['total']==1
         assert admin('analytics?entry=personal')['total']==2
+        history=admin('analytics?entry=historical')['logs'][0]
+        assert history['response'] is None and history['rcode'] is None
+        detail=call('/portal/api/analytics?search=PORTAL&qtype=TYPE1&outcome=local&rcode=0',cookie=a)[0]
+        row,=detail['logs']
+        expected=datetime.fromisoformat(row['at']).astimezone(ZoneInfo('Asia/Kathmandu'))
+        assert row['local_at']==expected.strftime('%Y-%m-%d %H:%M:%S')
+        assert detail['server_offset']=='+05:45' and detail['detail_total']==1
+        assert row['response']['rcode']=='NOERROR' and row['response']['answers'][0]['data']=='192.0.2.27'
+        assert any(bucket['time']==expected.strftime('%Y-%m-%dT%H:00') and bucket['count']==1 for bucket in detail['trend'])
+        no_match=call('/portal/api/analytics?search=not-present',cookie=a)[0]
+        assert no_match['total']==1 and no_match['detail_total']==0 and not no_match['logs']
+        lookup='/portal/api/lookup'
+        call(lookup,{'domain':'portal.test','qtype':'A'},status=401)
+        call(lookup,{'domain':'portal.test','qtype':'NOT-A-TYPE'},a,status=400)
+        for qtype in ('A','1','ANY','TYPE65400'):
+            result=call(lookup,{'domain':'portal.test','qtype':qtype,'dnssec_ok':True},a)[0]
+            assert result['response']['rcode']=='NOERROR'
+            assert bool(result['response']['answers'])==(qtype!='TYPE65400')
+            if result['response']['answers']:
+                assert result['response']['answers'][0]['data']=='192.0.2.27'
+        dns_settings, dns_records = '/portal/api/dns-settings', '/portal/api/dns-records'
+        call(dns_settings, status=401)
+        default_dns = call(dns_settings,cookie=b)[0]
+        assert default_dns['records']==[] and default_dns['preferences']==dict(adguard=False,gfwlist=False)
+        call(dns_settings,dict(adguard=True,gfwlist=False),a,method='PUT')
+        assert call(dns_settings,cookie=b)[0]==default_dns
+        call(dns_settings,dict(adguard=True,gfwlist=False,group='unauthorized'),a,method='PUT',status=422)
+        personal_name='private.portal.test'
+        personal_rule=dict(domain=' Private.Portal.Test. ',record_type='A',value='192.0.2.110',ttl=30)
+        call(dns_records,personal_rule,status=401)
+        personal_record=call(dns_records,personal_rule,a)[0]
+        assert personal_record['domain']==personal_name and personal_record['ttl']==30
+        personal_edit=dns_records+'/'+str(personal_record['id'])
+        call(personal_edit,personal_rule,b,method='PUT',status=404)
+        call(personal_edit,cookie=b,method='DELETE',status=404)
+        call(dns_records,personal_rule,a,status=409)
+        call(dns_records,dict(personal_rule,record_type='CNAME',value='target.test'),a,status=409)
+        call(dns_records,dict(personal_rule,domain='*.portal.test'),a,status=400)
+        call(dns_records,dict(personal_rule,domain='.',value='192.0.2.111'),a,status=400)
+        call(dns_records,dict(personal_rule,domain='alias.portal.test',record_type='CNAME',value='Alias.Portal.Test.'),a,status=400)
+        call(dns_records,dict(personal_rule,record_type='AAAA'),a,status=400)
+        call(dns_records,dict(personal_rule,ttl=0),a,status=400)
+        call(dns_records,dict(personal_rule,value='192.0.2.120'),b)
+        def resolved(path, name, value, kind=1):
+            answer=call(path,query(name,kind))[0]
+            assert rcode(answer)==0 and answer.endswith(value)
+        resolved(alice['path'],personal_name,bytes([192,0,2,110]))
+        resolved(bob['path'],personal_name,bytes([192,0,2,120]))
+        call(personal_edit,dict(personal_rule,value='192.0.2.111'),a,method='PUT')
+        resolved(alice['path'],personal_name,bytes([192,0,2,111]))
+        empty=call(lookup,dict(domain=personal_name,qtype='AAAA'),a)[0]['response']
+        assert empty['rcode']=='NOERROR' and not empty['answers']
+        for name, kind, value, needle in [
+            (personal_name, 'AAAA', '2001:db8::1', '2001:db8::1'),
+            ('alias.portal.test', 'CNAME', ' Private.Portal.Test. ', 'private.portal.test.'),
+            (personal_name, 'TXT', 'verification token', 'verification token'),
+        ]:
+            extra=call(dns_records,dict(domain=name,record_type=kind,value=value),a)[0]
+            query_type='A' if kind=='CNAME' else kind
+            result=call(lookup,dict(domain=name,qtype=query_type),a)[0]['response']
+            assert result['rcode']=='NOERROR' and any(needle in item['data'] and item['ttl']==300 for item in result['answers'])
+            call(dns_records+'/'+str(extra['id']),cookie=a,method='DELETE')
+        call(dns_records,dict(personal_rule,domain='portal.test'),a)
+        assert check(call(alice['path'],wire)[0]), 'personal record overrode an administrator local record'
+        api(base,'/rules',dict(kind='block',domain=personal_name),token)
+        assert rcode(call(alice['path'],query(personal_name))[0])==3, 'personal record bypassed an administrator block'
+        api(base,'/rules/'+str(next(r['id'] for r in api(base,'/rules',token=token) if r['domain']==personal_name)),token=token,method='DELETE')
+        resolved(alice['path'],personal_name,bytes([192,0,2,111]))
         # Keep a resolver using the old credential during rotation.
         ready=threading.Event()
         def poll_old_address():
@@ -264,6 +332,7 @@ private_key = "localhost.key"
         assert mobile_profile(a, public + new) == original
         call(alice['path'],wire,status=404)
         assert check(call(new,wire)[0])
+        resolved(new,personal_name,bytes([192,0,2,111]))
         assert call('/portal/api/analytics',cookie=a)[0]['total']>=2
         for _ in range(51):
             assert check(call(new,wire)[0])
@@ -298,6 +367,9 @@ private_key = "localhost.key"
         call(verify, dict(**revoked, code=smtp.code), status=401)
         cfg.update(base=public,registration='approval',public=False)
         admin('settings',cfg,'PUT')
+        assert call('/portal/api/me',cookie=a,via_admin=True)[0]['resolver_url']==public+new
+        assert call(qr_endpoint,{},a,via_admin=True)[0]['url']==public+new+'?mobileconfig=1'
+        mobile_profile(a, public+new)
         call('/dns-query',wire,status=404)
         cfg['base'] = 'https://resolver.example.test:8443'
         admin('settings', cfg, 'PUT')
@@ -306,6 +378,8 @@ private_key = "localhost.key"
         admin('settings', cfg, 'PUT')
         pending=member('pending')
         call(mobile, cookie=pending, status=403)
+        call(dns_settings,cookie=pending,status=403)
+        call(dns_records,personal_rule,pending,status=403)
         assert profile(pending)['path'] is None
         admin('users/'+str(profile(pending)['id']),{'action':'activate'})
         assert check(call(profile(pending)['path'],wire)[0])
@@ -359,9 +433,15 @@ private_key = "localhost.key"
         policy['access'].update(mode='whitelist',cidrs=['192.0.2.0/24'])
         api(base,'/features',policy,token,'PUT')
         assert rcode(call(new,wire)[0])==5
+        assert call(lookup,{'domain':'portal.test','qtype':'A'},a)[0]['response']['rcode']=='REFUSED'
         server.terminate();server.wait(timeout=10)
         server=start();token=admin_login()
         assert profile(a)['path']==new and admin('settings')['registration']=='closed'
+        assert call(dns_settings,cookie=a)[0]['preferences']==dict(adguard=True,gfwlist=False)
+        assert rcode(call(new,query(personal_name))[0])==5
+        policy['access']['cidrs']=['127.0.0.0/8']
+        api(base,'/features',policy,token,'PUT')
+        resolved(new,personal_name,bytes([192,0,2,111]))
         call('/dns-query',wire,status=404)
         assert all(new not in str(row) for row in api(base,'/audit',token=token))
         if os.environ.get('RDNS_PORTAL_UI'):

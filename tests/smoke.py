@@ -187,6 +187,18 @@ class FilterHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        packet = self.rfile.read(int(self.headers["Content-Length"]))
+        question = query("dnssec-failed.org")[12:]
+        assert self.path == "/dns-query" and packet[12:].startswith(question)
+        answer = packet[:2] + struct.pack("!5H", 0x81a0, 1, 1, 0, 0) + question
+        answer += struct.pack("!HHHIH", 0xc00c, 1, 1, 60, 4) + socket.inet_aton("192.0.2.90")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/dns-message")
+        self.send_header("Content-Length", str(len(answer)))
+        self.end_headers()
+        self.wfile.write(answer)
+
     def log_message(self, *_args):
         pass
 
@@ -324,9 +336,16 @@ def run():
                         capture_output=True, text=True, timeout=25, check=True,
                     )
                     assert "RRSIG" not in unsigned_response.stdout, "RRSIG leaked without DNSSEC DO bit"
-                    bogus = udp(query("dnssec-failed.org"), dns_port, timeout=20)
+                    question = bytearray(query("dnssec-failed.org"))
+                    question[11] = 1
+                    question.extend(struct.pack("!BHHIH", 0, 41, 1232, 0, 0))
+                    bogus = udp(question, dns_port, timeout=20)
                     print(f"dnssec-failed.org: rcode={rcode(bogus)} AD={bool(bogus[3] & 0x20)} answers={int.from_bytes(bogus[6:8], 'big')}")
-                    assert rcode(bogus) == 2, f"bogus DNSSEC domain returned RCODE {rcode(bogus)}\n{log.read_text()[-3000:]}"
+                    assert rcode(bogus) == 0 and int.from_bytes(bogus[6:8], "big"), log.read_text()[-3000:]
+                    assert not bogus[3] & 0x20, "unverified answer must clear AD"
+                    assert bogus.endswith((b"\x00\x0f\x00\x02\x00\x05", b"\x00\x0f\x00\x02\x00\x06")), "missing DNSSEC EDE"
+                    assert any(row["domain"] == "dnssec-failed.org" and row["outcome"] == "recursive_dnssec_unverified"
+                               for row in api(base, "/logs", token=token)), "missing unverified result in DNS logs"
                     ech = subprocess.run(
                         ["dig", "+tcp", "+short", "+time=20", "+tries=1", "-p", str(dns_port), "@127.0.0.1", "cloudflare-ech.com", "HTTPS"],
                         capture_output=True, text=True, timeout=25, check=True,
@@ -340,6 +359,26 @@ def run():
                     assert stats["process_rss_bytes"] > 0
                     print(f"SQLite persisted cache: {cached}")
                     print("PASS: root recursion, DNSSEC failure and public ECH HTTPS record")
+
+                    original_features = api(base, "/features", token=token)["settings"]
+                    features = json.loads(json.dumps(original_features))
+                    features["resolution"].update(mode="parallel", group="fixture", priority_ms=5000,
+                                                  validate_dnssec=True)
+                    features["groups"].append({
+                        "name": "fixture",
+                        "servers": [{"url": f"https://localhost:{list_port}/dns-query",
+                                     "bootstrap_ips": ["127.0.0.1"]}],
+                    })
+                    try:
+                        api(base, "/features", features, token, "PUT")
+                        answer = udp(query("dnssec-failed.org"), dns_port)
+                        assert rcode(answer) == 0 and answer.endswith(socket.inet_aton("192.0.2.90"))
+                        assert not answer[3] & 0x20, "DoH fallback must clear upstream AD"
+                        latest = api(base, "/logs", token=token)[0]
+                        assert (latest["outcome"], latest["upstream"]) == ("doh", "fixture"), latest
+                    finally:
+                        api(base, "/features", original_features, token, "PUT")
+                    print("PASS: parallel mode returns the DoH answer after recursive DNSSEC failure")
 
                 first = peer_fingerprint(dot_port)
                 first_doh = peer_fingerprint(doh_port)

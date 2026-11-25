@@ -44,7 +44,10 @@ pub fn admin_router(state: ApiState) -> Router {
     };
     router
         .merge(crate::portal::admin_routes())
-        .merge(portal_pages())
+        .merge(portal_pages(crate::portal::EntryPoint {
+            doh: state.engine.config.doh_on_admin,
+            tls: false,
+        }))
         .route("/api/v1/login", post(login))
         .route("/api/v1/logout", post(logout))
         .route("/api/v1/me", get(me))
@@ -105,7 +108,10 @@ pub fn admin_router(state: ApiState) -> Router {
 
 pub fn doh_router(state: ApiState) -> Router {
     doh_queries(&state)
-        .merge(portal_pages())
+        .merge(portal_pages(crate::portal::EntryPoint {
+            doh: true,
+            tls: !state.engine.config.doh_http,
+        }))
         .route(
             "/assets/{file}",
             get(|Path(file): Path<String>| async move { serve(&format!("assets/{file}")) }),
@@ -123,7 +129,7 @@ fn doh_queries(state: &ApiState) -> Router<ApiState> {
         ))
 }
 
-fn portal_pages() -> Router<ApiState> {
+fn portal_pages(entry: crate::portal::EntryPoint) -> Router<ApiState> {
     Router::new()
         .merge(crate::portal::routes())
         .route(
@@ -132,6 +138,7 @@ fn portal_pages() -> Router<ApiState> {
         )
         .route("/portal", get(index))
         .route("/portal/", get(index))
+        .layer(axum::Extension(entry))
 }
 
 fn unauthorized() -> (StatusCode, String) {
@@ -1108,18 +1115,8 @@ async fn doh_answer(
     if wire.len() > 65535 {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let ip = state
-        .engine
-        .features
-        .current
-        .load()
-        .access
-        .client_ip(peer.ip(), forwarded);
-    match state
-        .engine
-        .answer_for(wire, SocketAddr::new(ip, peer.port()), "doh", user)
-        .await
-    {
+    let peer = doh_client(&state, peer, forwarded);
+    match state.engine.answer_for(wire, peer, "doh", user).await {
         Ok(answer) => (
             [
                 (header::CONTENT_TYPE, "application/dns-message"),
@@ -1130,6 +1127,21 @@ async fn doh_answer(
             .into_response(),
         Err(_) => StatusCode::BAD_REQUEST.into_response(),
     }
+}
+
+pub(crate) fn doh_client(
+    state: &ApiState,
+    peer: SocketAddr,
+    forwarded: Option<&str>,
+) -> SocketAddr {
+    let ip = state
+        .engine
+        .features
+        .current
+        .load()
+        .access
+        .client_ip(peer.ip(), forwarded);
+    SocketAddr::new(ip, peer.port())
 }
 
 async fn index() -> Response {

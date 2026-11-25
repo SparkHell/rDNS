@@ -127,11 +127,10 @@ impl Engine {
         self: &Arc<Self>,
         runtime: &Arc<FeatureRuntime>,
         request: &Message,
-        domain: &str,
+        gfw: bool,
         foreground: bool,
     ) -> Arc<Outcome> {
         let edns = request.edns.as_ref();
-        let gfw = runtime.settings.gfwlist.enabled && self.features.list.load().matches(domain);
         if edns.is_some_and(|edns| !edns.options().as_ref().is_empty())
             || !request.answers.is_empty()
             || !request.authorities.is_empty()

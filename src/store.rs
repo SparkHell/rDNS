@@ -672,6 +672,8 @@ mod tests {
                 province: None,
                 city: None,
                 upstream: None,
+                rcode: None,
+                response_wire: None,
             })
             .await?;
         assert_eq!(store.logs().await?[0]["duration_ms"], 0.125);
