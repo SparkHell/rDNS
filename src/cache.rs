@@ -183,12 +183,19 @@ impl PersistentCache {
     }
     pub fn try_background(self: Arc<Self>) -> Option<BackgroundPermit> {
         let limit = self.settings.load().background_concurrency;
-        self.background
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < limit).then_some(active + 1)
-            })
-            .ok()?;
-        Some(BackgroundPermit(self))
+        let mut active = self.background.load(Ordering::Acquire);
+        while active < limit {
+            match self.background.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(BackgroundPermit(self)),
+                Err(current) => active = current,
+            }
+        }
+        None
     }
 
     pub fn background_active(&self) -> usize {
