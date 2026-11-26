@@ -3,7 +3,8 @@ import { createRoot } from 'react-dom/client'
 import './style.css'
 import { Portal, PortalAdmin } from './Portal.jsx'
 import CacheJobs from './CacheJobs.jsx'
-import FeaturePages, { FeatureIcon, RegionStats, cleanFeatureSettings } from './FeaturePages.jsx'
+import { DnsLookup } from './PortalDns.jsx'
+import FeaturePages, { FeatureIcon, RegionStats, SourceUpload, cleanFeatureSettings } from './FeaturePages.jsx'
 
 const NAV = [
   ['overview', '概览', '◫'],
@@ -15,7 +16,7 @@ const NAV = [
 
 const sections = {
   overview: [['dashboard', '运行概览'], ['logs', '查询日志']],
-  policy: [['rules', '解析与过滤'], ['subscriptions', '订阅源']],
+  policy: [['rules', '解析与过滤'], ['subscriptions', '订阅源'], ['dns-test', 'DNS 解析测试']],
   advanced: [['upstreams', '解析上游'], ['listeners', '监听服务'], ['certificates', '证书'], ['clients', '客户端']],
   users: [['portal', '用户门户'], ['accounts', '管理员']],
 }
@@ -164,14 +165,27 @@ function App() {
     }
     if (activeSession.current === token) receiveFeatures(snapshot)
   }
+  async function uploadSource(source, file) {
+    const query = source === 'custom' ? '?' + new URLSearchParams({ name: file.name }) : ''
+    const result = await api(`/sources/${source}/upload${query}`, token, {
+      method: 'POST', body: file, headers: { 'Content-Type': 'application/octet-stream' },
+      signal: AbortSignal.timeout(330000),
+    })
+    if (activeSession.current === token) {
+      if (source === 'custom') {
+        const current = await api('/subscriptions', token)
+        if (activeSession.current === token) setSubscriptions(current)
+      } else receiveFeatures(result)
+    }
+  }
   async function saveFeatures() {
     const saved = await writeSettings('/features', 'PUT', cleanFeatureSettings(featureDraft))
     if (activeSession.current === token) receiveFeatures(saved, JSON.stringify(featureDraft))
   }
 
-  async function run(action) {
+  async function run(action, describe = () => '操作已完成') {
     setBusy(true); setError(''); setSuccess('')
-    try { await action(); await refresh(); setSuccess('操作已完成') } catch (err) { await refresh(); setError(err.message) } finally { setBusy(false) }
+    try { const result = await action(); await refresh(); setSuccess(describe(result)) } catch (err) { await refresh(); setError(err.message) } finally { setBusy(false) }
   }
 
   async function changePassword(event) {
@@ -224,11 +238,17 @@ function App() {
       <main className="content"><div className="page-heading"><div><h1>{NAV.find(([id]) => id === page)?.[1]}</h1><p className="muted">{subtitle(page)}</p></div><button className="btn secondary" onClick={() => refresh()} disabled={busy}>↻ 刷新数据</button></div>{error && <div className="notice error" role="alert">{error}</div>}{success && <div className="notice success" role="status">{success}</div>}
         {sections[page] && (page !== 'users' || isAdmin) && <nav className="section-nav" aria-label={NAV.find(([id])=>id===page)[1]+'栏目'}>{sections[page].map(([id,label])=>
           <button type="button" key={id} aria-current={section===id ? 'page' : undefined} onClick={()=>openSection(id)}>{label}</button>)}</nav>}
-        {['clients', 'upstreams', 'subscriptions'].includes(section) && <FeaturePages page={section} status={featureStatus} draft={featureDraft} setDraft={setFeatureDraft} isAdmin={isAdmin} busy={busy} save={() => run(saveFeatures)} command={refreshSource} testProxy={address=>writeSettings('/proxy/test','POST',{address})} lookup={ip => api('/geoip/lookup', token, { method: 'POST', body: JSON.stringify({ ip }) }).catch(error => { setError(error.message); throw error })}/>}
+        {['clients', 'upstreams', 'subscriptions'].includes(section) && <FeaturePages page={section} status={featureStatus} draft={featureDraft} setDraft={setFeatureDraft} isAdmin={isAdmin} busy={busy} save={() => run(saveFeatures)} command={refreshSource} upload={uploadSource} testProxy={address=>writeSettings('/proxy/test','POST',{address})} lookup={ip => api('/geoip/lookup', token, { method: 'POST', body: JSON.stringify({ ip }) }).catch(error => { setError(error.message); throw error })}/>}
         {section === 'dashboard' && <><div className="hero"><div><span className="hero-status"><i/> {featureStatus?.settings.resolution.mode === 'doh' && !featureStatus?.settings.resolution.validate_dnssec ? 'DoH 上游解析' : 'DNSSEC 本地验证'}</span><h2>从根开始，可信解析。</h2><p>本地递归与 DoH 上游按策略解析，企业规则即时生效。</p></div><div className="hero-art"><span className="orbit orbit-one"/><span className="orbit orbit-two"/><span className="orbit-core">DNS</span></div></div><div className="metric-grid"><Metric title="总查询" value={stats.total} foot="保留期内查询" icon="↗"/><Metric title="已过滤" value={stats.blocked} foot="广告及黑名单" icon="⊘"/><Metric title="过滤率" value={`${stats.total ? Math.round(stats.blocked / stats.total * 100) : 0}%`} foot="占全部查询" icon="◉"/><Metric title="策略规则" value={rules.length} foot="本地配置" icon="◈"/></div><section className="panel"><div className="panel-head"><div><h2>最新查询</h2><p>最近的解析活动</p></div><button className="text-button blue" onClick={() => openSection('logs')}>查看全部 →</button></div><Logs rows={logs.slice(0, 7)}/></section><RegionStats regions={stats.regions}/></>}
         {section === 'logs' && <section className="panel"><div className="panel-head"><div><h2>查询活动</h2><p>最多显示最近 200 条</p></div><span className="pill">{logs.length} 条记录</span></div><Logs rows={logs}/></section>}
-        {section === 'rules' && <><section className="panel"><div className="panel-head"><div><h2>规则列表</h2><p>本地记录优先，其次为过滤和条件转发</p></div><span className="pill">{rules.length} 条规则</span></div><div className="table-wrap"><table><thead><tr><th>类型</th><th>域名</th><th>记录 / 上游</th><th>TTL</th><th/></tr></thead><tbody>{rules.map(item => <tr key={item.id}><td><span className={`tag ${item.kind}`}>{kindName(item.kind)}</span></td><td className="strong">{item.domain}</td><td>{item.record_type ? `${item.record_type} · ${item.value}` : item.value || '—'}</td><td>{item.ttl || '—'}</td><td>{canEdit && <button className="text-button danger" onClick={() => run(() => api(`/rules/${item.id}`, token, { method: 'DELETE' }))}>删除</button>}</td></tr>)}{!rules.length && <Empty columns={5} text="暂无规则。添加记录或过滤规则开始使用。"/>}</tbody></table></div></section>{canEdit && <section className="panel form-panel"><div className="panel-head"><div><h2>新增规则</h2><p>变更后即时应用到新查询</p></div></div><form onSubmit={event => { event.preventDefault(); run(async () => { await api('/rules', token, { method: 'POST', body: JSON.stringify(rule) }); setRule({ kind: 'local', domain: '', record_type: 'A', value: '', ttl: 300 }) }) }} className="form-grid"><label>规则类型<select value={rule.kind} onChange={e => setRule({ ...rule, kind: e.target.value })}><option value="local">本地记录</option><option value="allow">白名单</option><option value="block">黑名单</option><option value="forward">条件转发</option></select></label><label>域名<input aria-describedby="rule-domain-help" placeholder="example.com 或 *.example.com" value={rule.domain} onChange={e => setRule({ ...rule, domain: e.target.value })} required /></label>{rule.kind === 'local' && <label>记录类型<select value={rule.record_type} onChange={e => setRule({ ...rule, record_type: e.target.value })}><option>A</option><option>AAAA</option><option>CNAME</option><option>TXT</option></select></label>}{['local', 'forward'].includes(rule.kind) && <label>{rule.kind === 'forward' ? '上游地址' : '记录值'}<input placeholder={rule.kind === 'forward' ? '10.0.0.53:53' : '192.0.2.10'} value={rule.value} onChange={e => setRule({ ...rule, value: e.target.value })} required /></label>}{rule.kind === 'local' && <label>TTL（秒）<input type="number" min="1" max="86400" value={rule.ttl} onChange={e => setRule({ ...rule, ttl: Number(e.target.value) })}/></label>}<button className="btn primary" disabled={busy}>添加规则 →</button><p id="rule-domain-help" className="full-width policy-help">*.example.com 匹配子域名，不含 example.com。</p></form></section>}</>}
-        {section === 'subscriptions' && <><section className="panel"><div className="panel-head"><div><h2>自定义过滤订阅</h2><p>支持纯域名、hosts 和 Adblock 域名规则</p></div><span className="pill">{subscriptions.length} 个源</span></div><div className="subscription-list">{subscriptions.map(item => <div className="subscription" key={item.id}><div className="sub-icon">▤</div><div className="sub-main"><div className="strong truncate">{item.url}</div><small>{item.last_error ? `更新失败：${item.last_error}` : item.updated_at ? `最后更新 ${new Date(item.updated_at).toLocaleString()}` : '尚未更新'}</small></div>{canEdit && <div className="row-actions"><button className="btn tertiary" disabled={busy} onClick={() => run(() => api(`/subscriptions/${item.id}/refresh`, token, { method: 'POST' }))}>更新</button><button className="text-button danger" onClick={() => run(() => api(`/subscriptions/${item.id}`, token, { method: 'DELETE' }))}>删除</button></div>}</div>)}{!subscriptions.length && <div className="empty">暂无自定义订阅源。</div>}</div></section>{canEdit && <section className="panel form-panel"><div className="panel-head"><div><h2>添加订阅源</h2><p>仅接受 HTTPS 地址；定时自动更新</p></div></div><form className="inline-form" onSubmit={event => { event.preventDefault(); run(async () => { await api('/subscriptions', token, { method: 'POST', body: JSON.stringify({ url }) }); setUrl('') }) }}><input type="url" placeholder="https://example.com/blocklist.txt" value={url} onChange={e => setUrl(e.target.value)} required/><button className="btn primary" disabled={busy}>添加订阅</button></form></section>}</>}
+        {section === 'dns-test' && <DnsLookup consoleView run={body => writeSettings('/dns/lookup', 'POST', body)} />}
+        {section === 'rules' && canEdit && <RuleImport busy={busy} onImport={(text, form) => run(async () => {
+          const result = await writeSettings('/rules/import', 'POST', { text })
+          form.reset()
+          return result
+        }, result => `已导入 ${result.count} 条过滤规则`)}/>}
+        {section === 'rules' && <><section className="panel"><div className="panel-head"><div><h2>规则列表</h2><p>本地记录优先，其次为过滤和条件转发</p></div><span className="pill">{rules.length} 条规则</span></div><div className="table-wrap"><table><thead><tr><th>类型</th><th>域名</th><th>记录 / 上游</th><th>TTL</th><th/></tr></thead><tbody>{rules.map(item => <tr key={item.id}><td><span className={`tag ${item.kind}`}>{kindName(item.kind)}</span></td><td className="strong">{item.domain}{item.filter_match && <small className="rule-match">{item.filter_match}</small>}</td><td>{item.record_type ? `${item.record_type} · ${item.value}` : item.value || '—'}</td><td>{item.ttl || '—'}</td><td>{canEdit && <button className="text-button danger" onClick={() => run(() => api(`/rules/${item.id}`, token, { method: 'DELETE' }))}>删除</button>}</td></tr>)}{!rules.length && <Empty columns={5} text="暂无规则。添加记录或过滤规则开始使用。"/>}</tbody></table></div></section>{canEdit && <section className="panel form-panel"><div className="panel-head"><div><h2>新增规则</h2><p>变更后即时应用到新查询</p></div></div><form onSubmit={event => { event.preventDefault(); run(async () => { await api('/rules', token, { method: 'POST', body: JSON.stringify(rule) }); setRule({ kind: 'local', domain: '', record_type: 'A', value: '', ttl: 300 }) }) }} className="form-grid"><label>规则类型<select value={rule.kind} onChange={e => setRule({ ...rule, kind: e.target.value })}><option value="local">本地记录</option><option value="allow">白名单</option><option value="block">黑名单</option><option value="forward">条件转发</option></select></label><label>域名<input aria-describedby="rule-domain-help" placeholder="example.com 或 *.example.com" value={rule.domain} onChange={e => setRule({ ...rule, domain: e.target.value })} required /></label>{rule.kind === 'local' && <label>记录类型<select value={rule.record_type} onChange={e => setRule({ ...rule, record_type: e.target.value })}><option>A</option><option>AAAA</option><option>CNAME</option><option>TXT</option></select></label>}{['local', 'forward'].includes(rule.kind) && <label>{rule.kind === 'forward' ? '上游地址' : '记录值'}<input placeholder={rule.kind === 'forward' ? '10.0.0.53:53' : '192.0.2.10'} value={rule.value} onChange={e => setRule({ ...rule, value: e.target.value })} required /></label>}{rule.kind === 'local' && <label>TTL（秒）<input type="number" min="1" max="86400" value={rule.ttl} onChange={e => setRule({ ...rule, ttl: Number(e.target.value) })}/></label>}<button className="btn primary" disabled={busy}>添加规则 →</button><p id="rule-domain-help" className="full-width policy-help">*.example.com 匹配子域名，不含 example.com。</p></form></section>}</>}
+        {section === 'subscriptions' && <><section className="panel"><div className="panel-head"><div><h2>自定义过滤订阅</h2><p>支持纯域名、hosts 和 Adblock 域名规则</p></div><span className="pill">{subscriptions.length} 个源</span></div><div className="subscription-list">{subscriptions.map(item => <div className="subscription" key={item.id}><div className="sub-icon">▤</div><div className="sub-main"><div className="strong truncate">{item.url.startsWith('upload:') ? item.url.slice(7) : item.url}</div><small>{item.url.startsWith('upload:') && '手动上传 · '}{item.last_error ? `更新失败：${item.last_error}` : item.updated_at ? `最后更新 ${new Date(item.updated_at).toLocaleString()}` : '尚未更新'}</small></div>{canEdit && <div className="row-actions">{!item.url.startsWith('upload:') && <button className="btn tertiary" disabled={busy} onClick={() => run(() => api(`/subscriptions/${item.id}/refresh`, token, { method: 'POST' }))}>更新</button>}<button className="text-button danger" onClick={() => run(() => api(`/subscriptions/${item.id}`, token, { method: 'DELETE' }))}>删除</button></div>}</div>)}{!subscriptions.length && <div className="empty">暂无自定义订阅源。</div>}</div></section>{canEdit && <section className="panel form-panel"><div className="panel-head"><div><h2>添加订阅源</h2><p>HTTPS 订阅定时更新。上传同名文件可替换已有的手动订阅。</p></div></div><form className="inline-form" onSubmit={event => { event.preventDefault(); run(async () => { await api('/subscriptions', token, { method: 'POST', body: JSON.stringify({ url }) }); setUrl('') }) }}><input type="url" placeholder="https://example.com/blocklist.txt" value={url} onChange={e => setUrl(e.target.value)} required/><button className="btn primary" disabled={busy}>添加订阅</button></form><div className="policy-body"><SourceUpload source="custom" label="上传自定义过滤文件" accept=".txt,.list,.hosts,.conf" command={uploadSource} /></div></section>}</>}
         {section === 'certificates' && <section className="panel certificate-panel"><div className="certificate-symbol">◇</div><span className="tag local">TLS CERTIFICATE</span><h2>安全连接证书</h2><p>DoH、DoT 和 DoQ 共用一组 PEM 证书。填写服务器上的绝对路径并保存；服务会先验证证书与私钥，再更新新连接使用的证书。替换同一路径下的文件后，使用重载按钮重新读取。</p>{isAdmin && <><form className="cert-path-form" onSubmit={event => { event.preventDefault(); run(() => api('/certificates', token, { method: 'PUT', body: JSON.stringify(certPaths) })) }}><label>证书链路径<input type="text" autoComplete="off" placeholder="/opt/rDns/certs/fullchain.pem" value={certPaths.certificate} onChange={e => setCertPaths({ ...certPaths, certificate: e.target.value })} required /></label><label>私钥路径<input type="text" autoComplete="off" placeholder="/opt/rDns/certs/privkey.pem" value={certPaths.private_key} onChange={e => setCertPaths({ ...certPaths, private_key: e.target.value })} required /></label><button className="btn primary" disabled={busy}>保存路径并应用</button></form><button className="btn tertiary" disabled={busy} onClick={() => run(() => api('/certificates/reload', token, { method: 'POST' }))}>↻ 重载当前路径</button></>}<div className="hint">只有管理员可配置路径和重载证书；操作结果会写入审计日志。</div></section>}
         {section === 'listeners' && <section className="panel"><div className="panel-head"><div><h2>协议监听</h2><p>保存后立即生效；端口冲突会阻止本次变更并显示错误</p></div><span className="pill">实时连接</span></div>{listenerDraft ? <form className="listener-form" onSubmit={event => { event.preventDefault(); run(saveListeners) }}>{[['dns_udp','DNS · UDP','53'],['dns_tcp','DNS · TCP','53'],['doh','DoH · HTTPS','443'],['dot','DoT · TLS','853'],['doq','DoQ · QUIC','853']].map(([key,label,port]) => <div className="listener-row" key={key}><div className="listener-name"><strong>{label}</strong><small>标准端口 {port}</small></div><label className="listener-switch"><input type="checkbox" checked={listenerDraft[key].enabled} disabled={!isAdmin} onChange={e => setListenerDraft({ ...listenerDraft, [key]: { ...listenerDraft[key], enabled: e.target.checked } })}/><span>{listenerDraft[key].enabled ? '启用' : '关闭'}</span></label><input className="listener-address" aria-label={`${label} 监听地址`} type="text" value={listenerDraft[key].address} disabled={!isAdmin} onChange={e => setListenerDraft({ ...listenerDraft, [key]: { ...listenerDraft[key], address: e.target.value } })}/><span className={`tag ${listenerStatus?.running?.[key] ? 'local' : 'forward'}`}>{listenerStatus?.running?.[key] ? '运行中' : '未监听'}</span></div>)}<div className="listener-actions"><span>管理面板始终监听本机，不受这些开关影响。</span>{isAdmin && <button className="btn primary" disabled={busy}>保存并应用</button>}</div></form> : <div className="empty">正在连接实时状态…</div>}</section>}
         {page === 'cache' && cacheStatus?.automation && <CacheJobs state={cacheStatus.automation} isAdmin={isAdmin} busy={busy} save={payload => writeSettings('/cache/automation','PUT',payload)} refresh={kind => writeSettings('/cache/automation/'+kind+'/refresh','POST',{})} run={run}/>}
@@ -248,7 +268,32 @@ function App() {
       </main></div></div>
 }
 
-function subtitle(page) { return ({ policy: '管理解析与过滤规则及订阅源。', users: '管理门户用户和控制台管理员。', advanced: '配置解析上游、监听服务、证书及客户端访问。', portal: '管理注册、身份提供方、个人解析地址与查询统计。', overview: '实时掌握解析流量、过滤效果与服务状态。', logs: '查看客户端查询及策略处理结果。', rules: '定义本地域名、访问策略与条件转发。', subscriptions: '管理 AdGuard、GFWList、GeoIP 和自定义过滤订阅。', listeners: '实时启停 DNS 协议并检查端口占用。', cache: '管理 DNS 缓存和地区热点预热。', clients: '配置来源网段和国家/地区、省级行政区的访问条件。', upstreams: '配置多上游轮询、代理连接与递归并行策略。', gfwlist: '按内置及订阅名单选择特定解析路径。', geoip: '维护离线数据库并检查来源 IP 的访问判断。', certificates: '更新加密 DNS 接入证书。', accounts: '管理控制台访问权限。' })[page] }
+
+function RuleImport({ busy, onImport }) {
+  function submit(event) {
+    event.preventDefault()
+    const form = event.currentTarget
+    onImport(new FormData(form).get('rules'), form)
+  }
+
+  return <details className="panel rule-import">
+    <summary>批量导入过滤规则</summary>
+    <form className="policy-body" onSubmit={submit}>
+      <label>分流规则
+        <textarea name="rules" rows={7} required disabled={busy} spellCheck={false}
+          aria-describedby="rule-import-help"
+          placeholder={'DOMAIN-SUFFIX,example.com,REJECT\nDOMAIN,login.example.com,DIRECT'} />
+      </label>
+      <p className="policy-help" id="rule-import-help">每行一条，支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-WILDCARD（* 和 ?）及 Mihomo 的 DOMAIN-REGEX。策略为 REJECT 或 DIRECT。多条导入规则同时命中时，最后导入的生效。</p>
+      <div className="row-actions">
+        <button className="btn primary" disabled={busy}>导入规则</button>
+        <a className="text-button blue" href="/rules/one-click-login.list" download>下载一键登录拦截清单</a>
+      </div>
+    </form>
+  </details>
+}
+
+function subtitle(page) { return ({ policy: '管理解析与过滤规则及订阅源。', users: '管理门户用户和控制台管理员。', advanced: '配置解析上游、监听服务、证书及客户端访问。', portal: '管理注册、身份提供方、个人解析地址与查询统计。', overview: '实时掌握解析流量、过滤效果与服务状态。', logs: '查看客户端查询及策略处理结果。', rules: '定义本地域名、访问策略与条件转发。', subscriptions: '管理 AdGuard、GFWList、GeoIP 和自定义过滤订阅。', 'dns-test': '按当前客户端的访问策略和全局 DNS 规则测试域名。', listeners: '实时启停 DNS 协议并检查端口占用。', cache: '管理 DNS 缓存和地区热点预热。', clients: '配置来源网段和国家/地区、省级行政区的访问条件。', upstreams: '配置多上游轮询、代理连接与递归并行策略。', gfwlist: '按内置及订阅名单选择特定解析路径。', geoip: '维护离线数据库并检查来源 IP 的访问判断。', certificates: '更新加密 DNS 接入证书。', accounts: '管理控制台访问权限。' })[page] }
 function kindName(kind) { return ({ local: '本地记录', allow: '白名单', block: '黑名单', forward: '条件转发' })[kind] || kind }
 function Metric({ title, value, foot, icon }) { return <div className="metric"><div className="metric-top"><span>{title}</span><span className="metric-icon">{icon}</span></div><div className="metric-value">{value.toLocaleString?.() ?? value}</div><div className="metric-foot">{foot}</div></div> }
 function Empty({ columns, text }) { return <tr><td colSpan={columns} className="empty">{text}</td></tr> }

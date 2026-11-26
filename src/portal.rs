@@ -1,7 +1,7 @@
 mod dns;
 mod email;
 mod federation;
-mod lookup;
+pub(crate) mod lookup;
 mod mobileconfig;
 mod reporting;
 

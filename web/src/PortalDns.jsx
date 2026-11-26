@@ -103,7 +103,20 @@ export function DnsRecords({ response }) {
   ))
 }
 
-export function DnsLookup({ run, onComplete }) {
+const blockReasons = {
+  blacklist: '命中管理员黑名单',
+  imported_rule: '命中批量导入的拒绝规则',
+  subscription: '命中自定义过滤订阅',
+  adguard: '命中 AdGuard 广告过滤规则',
+  client_whitelist: '当前客户端 IP 未列入允许网段',
+  client_blacklist: '当前客户端 IP 命中禁止网段',
+  region_whitelist: '当前客户端地区未列入允许名单',
+  region_blacklist: '当前客户端地区命中禁止名单',
+  region_unknown: '当前客户端地区未知，访问策略拒绝该请求',
+  inactive_account: '当前账号未启用',
+}
+
+export function DnsLookup({ run, onComplete, consoleView = false }) {
   const [answer, setAnswer] = useState(null)
   const [queryType, setQueryType] = useState('1')
   const [busy, setBusy] = useState(false)
@@ -117,9 +130,12 @@ export function DnsLookup({ run, onComplete }) {
     setAnswer(null)
     setError('')
     try {
-      const result = await run({ domain: data.get('domain'), qtype: 'TYPE' + selectedCode, dnssec_ok: data.has('dnssec') })
+      const result = await run({
+        domain: data.get('domain'), qtype: 'TYPE' + selectedCode, dnssec_ok: data.has('dnssec'),
+        ...(consoleView && { adguard: data.has('adguard') }),
+      })
       setAnswer({ ...result, qtype: namedTypes[selectedCode] || result.qtype })
-      onComplete()
+      onComplete?.()
     } catch (failure) {
       setError(failure.message)
     } finally {
@@ -127,8 +143,8 @@ export function DnsLookup({ run, onComplete }) {
     }
   }
   return (
-    <section className="panel portal-lookup">
-      <h2>DNS 解析测试</h2>
+    <section className={`panel portal-lookup${consoleView ? ' console-lookup' : ''}`}>
+      <h2>{consoleView ? '测试全局 DNS 策略' : 'DNS 解析测试'}</h2>
       <form className="portal-lookup-form" onSubmit={submit}>
         <label>
           域名
@@ -138,17 +154,20 @@ export function DnsLookup({ run, onComplete }) {
         <LookupTypeOptions value={queryType} onChange={setQueryType} disabled={busy} />
         <label className="portal-dnssec"><input type="checkbox" name="dnssec" /> 请求 DNSSEC 记录</label>
         <button className="btn primary" disabled={busy}>{busy ? '正在查询…' : '开始查询'}</button>
+        {consoleView && <label className="portal-dnssec"><input type="checkbox" name="adguard" /> 测试时应用 AdGuard 过滤</label>}
       </form>
       {error && <p role="alert" className="notice error">{error}</p>}
       {answer && (
         <div className="portal-lookup-result">
           <div role="status" className="portal-result-head">
             <strong>{answer.domain} <small>{answer.qtype}</small></strong>
-            <span className="portal-rcode">{answer.response.rcode}</span>
+            <span className={`portal-rcode${answer.block_reason ? ' blocked' : ''}`}>{answer.response.rcode}</span>
             <span>{answer.duration_ms.toFixed(1)} ms</span>
             {answer.response.ad && <span>DNSSEC 已验证</span>}
           </div>
-          {!answer.response.answers.length && <p className="portal-hint">应答区无记录</p>}
+          {answer.block_reason
+            ? <p className="dns-block-reason" role="status">拦截原因：{blockReasons[answer.block_reason] || '命中当前访问或过滤策略'}</p>
+            : !answer.response.answers.length && <p className="portal-hint">应答区无记录</p>}
           <DnsRecords response={answer.response} />
         </div>
       )}

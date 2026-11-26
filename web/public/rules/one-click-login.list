@@ -1,0 +1,113 @@
+# 本机号码一键登录拦截
+# 按需复制到「解析与过滤 → 批量导入过滤规则」。
+# 部分认证域名与本机号码校验共用。末尾的服务端规则只对使用同一 DNS 的业务服务器生效。
+
+# 中国移动号码认证
+# https://dev.10086.cn/numIdentific
+# https://github.com/privacy-protection-tools/anti-AD/blob/master/discretion/anv.txt
+DOMAIN-SUFFIX,cmpassport.com,REJECT
+
+# 中国电信天翼账号认证
+# https://id.189.cn/source/files/abilityPDF/preGetMobile.pdf
+# https://e.189.cn/sdk/agreement/helpReply.do
+DOMAIN,id6.me,REJECT
+DOMAIN,open.e.189.cn,REJECT
+DOMAIN,e.189.cn,REJECT
+
+# 中国联通号码认证
+# https://help.aliyun.com/zh/pnvs/support/faq-sdk
+# https://github.com/privacy-protection-tools/anti-AD/blob/master/discretion/anv.txt
+DOMAIN,auth.wosms.cn,REJECT
+DOMAIN,opencloud.wostore.cn,REJECT
+DOMAIN,enrichgw.10010.com,REJECT
+DOMAIN,hmrz.wo.cn,REJECT
+DOMAIN,id.mail.wo.cn,REJECT
+DOMAIN,mdn.open.wo.cn,REJECT
+
+# 联通小程序认证的区域网关，来自极验接入文档的一键登录章节。
+# https://static.geetest.com/proservice/G4/%E5%B0%8F%E7%A8%8B%E5%BA%8F%E5%BC%80%E5%8F%91%E5%90%8E%E5%8F%B0request%E5%90%88%E6%B3%95%E5%9F%9F%E5%90%8D%E5%92%8C%E4%B8%9A%E5%8A%A1%E5%9F%9F%E5%90%8D%E9%85%8D%E7%BD%AE%E8%AF%B4%E6%98%8E.pdf
+DOMAIN,hs.wosms.cn,REJECT
+DOMAIN,nisportal.10010.com,REJECT
+DOMAIN,nisah1.10010.com,REJECT
+DOMAIN,nisah2.10010.com,REJECT
+DOMAIN,nisbj1.10010.com,REJECT
+DOMAIN,nisbj2.10010.com,REJECT
+DOMAIN,nisbj3.10010.com,REJECT
+DOMAIN,niscq1.10010.com,REJECT
+DOMAIN,nisfj1.10010.com,REJECT
+DOMAIN,nisgd1.10010.com,REJECT
+DOMAIN,nisgd2.10010.com,REJECT
+DOMAIN,nisgd3.10010.com,REJECT
+DOMAIN,nisgd4.10010.com,REJECT
+DOMAIN,nisgs1.10010.com,REJECT
+DOMAIN,nisgx1.10010.com,REJECT
+DOMAIN,nisgz1.10010.com,REJECT
+DOMAIN,nisgz2.10010.com,REJECT
+DOMAIN,nishan1.10010.com,REJECT
+DOMAIN,nisheb1.10010.com,REJECT
+DOMAIN,nisheb2.10010.com,REJECT
+DOMAIN,nisheb3.10010.com,REJECT
+DOMAIN,nishen1.10010.com,REJECT
+DOMAIN,nishen2.10010.com,REJECT
+DOMAIN,nishlj1.10010.com,REJECT
+DOMAIN,nishub1.10010.com,REJECT
+DOMAIN,nishub2.10010.com,REJECT
+DOMAIN,nishub3.10010.com,REJECT
+DOMAIN,nishun1.10010.com,REJECT
+DOMAIN,nishun2.10010.com,REJECT
+DOMAIN,nishun3.10010.com,REJECT
+DOMAIN,nisjl1.10010.com,REJECT
+DOMAIN,nisjs1.10010.com,REJECT
+DOMAIN,nisjs2.10010.com,REJECT
+DOMAIN,nisjs3.10010.com,REJECT
+DOMAIN,nisjx2.10010.com,REJECT
+DOMAIN,nisln1.10010.com,REJECT
+DOMAIN,nisln2.10010.com,REJECT
+DOMAIN,nisnmg1.10010.com,REJECT
+DOMAIN,nisnmg2.10010.com,REJECT
+DOMAIN,nisnmg3.10010.com,REJECT
+DOMAIN,nisnmg4.10010.com,REJECT
+DOMAIN,nisnx1.10010.com,REJECT
+DOMAIN,nisqh1.10010.com,REJECT
+DOMAIN,nissc1.10010.com,REJECT
+DOMAIN,nissd1.10010.com,REJECT
+DOMAIN,nissd2.10010.com,REJECT
+DOMAIN,nissd3.10010.com,REJECT
+DOMAIN,nissh1x1.10010.com,REJECT
+DOMAIN,nissh3x1.10010.com,REJECT
+DOMAIN,nisshh1.10010.com,REJECT
+DOMAIN,nistj1.10010.com,REJECT
+DOMAIN,nisxj1.10010.com,REJECT
+DOMAIN,nisxj3.10010.com,REJECT
+DOMAIN,nisxz1.10010.com,REJECT
+DOMAIN,nisyn1.10010.com,REJECT
+DOMAIN,niszhj1.10010.com,REJECT
+DOMAIN,niszhj2.10010.com,REJECT
+
+# MobTech 秒验。api.verify.mob.com 也用于 MobPush。
+# https://pvz3.mengxingstar.com/doc/share_list.html
+DOMAIN,api.verify.mob.com,REJECT
+
+# 极光安全认证 Web SDK 加载域名
+# https://docs.jiguang.cn/jverification/client/web_guide
+DOMAIN,jverification.jiguang.cn,REJECT
+
+# 网易易盾和极验一键登录
+# https://github.com/privacy-protection-tools/anti-AD/blob/master/discretion/anv.txt
+# https://static.geetest.com/proservice/G4/%E5%B0%8F%E7%A8%8B%E5%BA%8F%E5%BC%80%E5%8F%91%E5%90%8E%E5%8F%B0request%E5%90%88%E6%B3%95%E5%9F%9F%E5%90%8D%E5%92%8C%E4%B8%9A%E5%8A%A1%E5%9F%9F%E5%90%8D%E9%85%8D%E7%BD%AE%E8%AF%B4%E6%98%8E.pdf
+DOMAIN,ye.dun.163yun.com,REJECT
+DOMAIN,onelogin.geetest.com,REJECT
+
+# 第三方认证服务端接口。按需去掉下面的 #。
+# 极光 JVerification
+# https://docs.jiguang.cn/jverification/server/rest_api/loginTokenVerify_api
+# DOMAIN,api.verification.jpush.cn,REJECT
+
+# 阿里云号码认证。该接入点也用于号码校验和短信认证 API。
+# https://help.aliyun.com/zh/pnvs/developer-reference/sdk-integration-overview/
+# DOMAIN,dypnsapi.aliyuncs.com,REJECT
+
+# 个推个验 APP / H5
+# https://docs.getui.com/geyan/server/
+# DOMAIN,openapi-gy.getui.com,REJECT
+# DOMAIN,h-gy.getui.net,REJECT

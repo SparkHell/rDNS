@@ -153,6 +153,14 @@ try {
     summary.querySelector('.portal-rcode').getBoundingClientRect().right >= 6))
   await answer.click()
   await page.locator('.portal-log-answer[open]').first().getByText('192.0.2.27', { exact: true }).waitFor()
+  const block = await page.request.post(admin + '/api/v1/rules', {
+    data: {kind:'block', domain:'portal-block-reason.test'},
+    headers: {Authorization: 'Bearer ' + token},
+  })
+  assert(block.ok())
+  await tester.getByLabel('域名', { exact: true }).fill('portal-block-reason.test')
+  await query.click()
+  await tester.getByText('拦截原因：命中管理员黑名单', {exact:true}).waitFor()
   if (process.env.RDNS_LAYOUT_CAPTURE) {
     await page.getByRole('button',{name:'收起 iOS 二维码',exact:true}).click()
     await page.evaluate(() => window.scrollTo(0, 0))

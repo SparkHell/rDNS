@@ -66,6 +66,12 @@ Duplicate allow/block rules and identical forwarding targets return HTTP 409. On
 
 Subscriptions brings together AdGuard, GFWList, GeoIP and custom sources. AdGuard combines AdGuard DNS Filter with AdAway and honours their exceptions. The AdGuard and GFWList admin switches make the features available to personal DoH users and control automatic list refresh. Shared DoH, UDP/TCP, DoT and DoQ follow the base administrator rules and default resolution mode.
 
+The anti-AD preset uses its AdGuard Home list as the primary AdGuard source. Save the source selection and enable AdGuard in the personal DoH settings. The source status shows unique block and exception rules and the number of skipped lines. Domain, wildcard and regular expression rules match the queried hostname. Rules with modifiers are skipped.
+
+Under **解析与过滤**, editors can paste Surge or Clash/Mihomo rules. Use `DOMAIN` for an exact DNS name, `DOMAIN-SUFFIX` for the name and its descendants, or `DOMAIN-WILDCARD` with `*` (zero or more characters) and `?` (one character). Mihomo-style `DOMAIN-REGEX` matches the DNS name using Rust regex syntax. `REJECT` returns NXDOMAIN and `DIRECT` allows normal DNS processing, including any configured conditional forwarding. The latest imported match wins across rule types and batches. Importing the same matching type and value replaces the previous filter. Local records keep their existing priority. An invalid line rejects the entire batch. The page links to a [one-click login rule list](web/public/rules/one-click-login.list).
+
+Administrators can upload AdGuard DNS rules (UTF-8), GFWList (AutoProxy text or Base64), and GeoIP IPv4/IPv6 XDB files. A successful upload immediately replaces the selected source snapshot. Automatic downloads pause for that source until a manual download succeeds. Editors can upload a custom domain list as a separate source and replace it by uploading another file with the same name. For a reverse proxy, allow request bodies up to 80 MiB on the upload API when uploading large XDB files.
+
 Remote filter lists accept one domain per line, `0.0.0.0 domain`, `127.0.0.1 domain`, and Adblock `||domain^` entries. Unsupported list rules are ignored. Updates are size limited to 10 MiB and applied only after successful retrieval and parsing. The background refresher runs hourly; manual refresh is available in the console.
 For an internal HTTPS list, set `subscription_ca` to the PEM CA certificate that signed its server certificate. TLS verification remains enabled.
 
@@ -100,6 +106,8 @@ The three default modes are:
 - **仅本地递归**: validate recursive answers first. After a DNSSEC validation failure, return the result of an unvalidated recursive lookup when available, clear AD, and record `recursive_dnssec_unverified`. EDNS clients also receive an Extended DNS Error indicating the validation failure.
 - **仅 DoH 上游**: use the selected default pool.
 - **递归优先，DoH 并行兜底**: start both paths, prefer a successful recursive response within the configured priority window (300 ms by default), then use a ready DoH response. A recursive DNSSEC failure immediately makes DoH eligible. DoH fallback trusts the configured upstream and clears AD. The total request budget defaults to 15 seconds.
+
+Under **高级设置 → 解析上游**, select relaxed (default) or strict recursion. Relaxed name minimisation continues after an intermediate NXDOMAIN while discovering delegations. In strict mode, queries without the requested RR type, including NXDOMAIN and NODATA, and recursive failures try the default DoH pool. In the recursive strategy, the DoH request starts after the strict recursive attempt. Strict sequential fallback reserves part of the total budget for DoH. If DoH yields no positive answer after a recursive negative response, that recursive response is retained. Strict fallback honours the DoH DNSSEC setting.
 
 For DoH-only and GFWList routes, local DoH DNSSEC validation defaults on and uses root trust anchors through Hickory, including DNSKEY/DS queries over the same upstream/proxy path. Disabling it explicitly trusts the configured upstream and always clears AD. Valid NXDOMAIN and NODATA replies complete resolution. HTTPS/SVCB records and ECH parameters are preserved.
 
@@ -140,9 +148,12 @@ Query logs include `duration_ms`: server processing time from decoding the reque
 | GET, PUT | `/features` | Viewer, Admin | Inspect status or atomically apply access, GeoIP, upstream and GFWList settings; viewers receive a reduced view |
 | POST | `/gfwlist/refresh` | Admin | Refresh the saved GFWList source, retaining the active list on failure |
 | POST | `/geoip/refresh` | Admin | Download/validate/install `{"ip_version":4}` or `6` |
+| POST | `/sources/{source}/upload` | Admin, or Editor for custom | Upload a raw file for `adguard`, `gfwlist`, `geoip4`, `geoip6` or `custom?name=...` (send `name` as a query parameter for custom files) |
 | POST | `/geoip/lookup` | Viewer | Look up `{"ip":"8.8.8.8"}` and evaluate saved access rules |
+| POST | `/dns/lookup` | Viewer | Test global DNS resolution with `{"domain":"example.com","qtype":"A","dnssec_ok":false}` and report any policy block reason. Pass `"adguard":true` to test the enabled AdGuard list. |
 | GET | `/ws` | Authenticated | Status stream; admins can send `listeners.update`, `cache.update`, `features.update`, `gfwlist.refresh`, `geoip.refresh` with `request_id` and `settings`; first message is `{"type":"auth","token":"..."}` |
 | GET, POST | `/rules` | Viewer, Editor | List and add rules |
+| POST | `/rules/import` | Editor | Import filters atomically from a JSON object with a multiline `text` field |
 | DELETE | `/rules/{id}` | Editor | Remove a rule |
 | GET, POST | `/subscriptions` | Viewer, Editor | List and add filter sources |
 | POST | `/subscriptions/{id}/refresh` | Editor | Download and atomically replace a source's domains |

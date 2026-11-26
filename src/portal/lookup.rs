@@ -8,11 +8,13 @@ use hickory_proto::{
 use std::net::SocketAddr;
 
 #[derive(Deserialize)]
-pub(super) struct Input {
+pub(crate) struct Input {
     domain: String,
     qtype: String,
     #[serde(default)]
     dnssec_ok: bool,
+    #[serde(default)]
+    adguard: bool,
 }
 
 pub(super) fn record_type(input: &str) -> Option<RecordType> {
@@ -100,6 +102,16 @@ pub(super) async fn test(
     Json(input): Json<Input>,
 ) -> Reply {
     let id = dns::authenticate_active(&s, &h).await?;
+    run(&s, peer, &h, input, Some(id)).await
+}
+
+pub(crate) async fn run(
+    s: &ApiState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    input: Input,
+    user_id: Option<i64>,
+) -> Reply {
     let domain = input.domain.trim();
     if domain.is_empty() || domain.len() > 1024 {
         return Err(bad("请输入有效的域名"));
@@ -114,22 +126,34 @@ pub(super) async fn test(
     let mut edns = Edns::new();
     edns.set_max_payload(1232).set_dnssec_ok(input.dnssec_ok);
     query.edns = Some(edns);
-    let wire = query.to_vec().map_err(internal)?;
+    let lookup_error = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DNS 解析测试暂时不可用".to_owned(),
+        )
+    };
+    let wire = query.to_vec().map_err(|_| lookup_error())?;
     let peer = crate::api::doh_client(
-        &s,
+        s,
         peer,
-        h.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
     );
-    let started = std::time::Instant::now();
-    let wire = s
+    let result = s
         .engine
-        .answer_for(&wire, peer, "doh", Some(id))
+        .answer_with_diagnostics(
+            &wire,
+            peer,
+            if user_id.is_some() { "doh" } else { "test" },
+            user_id,
+            user_id.is_none() && input.adguard,
+        )
         .await
-        .map_err(internal)?;
-    let response = Message::from_vec(&wire).map_err(internal)?;
+        .map_err(|_| lookup_error())?;
+    let response = Message::from_vec(&result.wire).map_err(|_| lookup_error())?;
     Ok(Json(json!({
         "domain": name.to_utf8(), "qtype": type_label(qtype),
-        "duration_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "duration_ms": result.duration_ms,
+        "block_reason": result.block_reason,
         "response": DnsResponse::from(&response)
     })))
 }

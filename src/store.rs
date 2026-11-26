@@ -28,6 +28,8 @@ pub struct Rule {
     pub record_type: Option<String>,
     pub value: Option<String>,
     pub ttl: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_match: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -99,6 +101,22 @@ impl Store {
             sqlx::query("CREATE UNIQUE INDEX idx_rules_forward_target ON rules(domain,value) WHERE kind='forward'")
                 .execute(&mut *tx).await?;
         }
+        let filter_match_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('rules') WHERE name='filter_match')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if !filter_match_exists {
+            sqlx::query("ALTER TABLE rules ADD COLUMN filter_match TEXT")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DROP INDEX idx_rules_filter")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("CREATE UNIQUE INDEX idx_rules_filter ON rules(kind,domain,coalesce(filter_match,'')) WHERE kind IN ('allow','block')")
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         let columns = sqlx::query("PRAGMA table_info(query_log)")
             .fetch_all(&pool)
@@ -141,6 +159,20 @@ impl Store {
     pub async fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         sqlx::query("INSERT INTO runtime_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
             .bind(key).bind(serde_json::to_string(value)?).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn set_source_snapshot<T: Serialize>(
+        &self,
+        data_key: &str,
+        data: &T,
+        meta_key: &str,
+        meta: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO runtime_settings(key,value) VALUES(?,?),(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            .bind(data_key).bind(serde_json::to_string(data)?)
+            .bind(meta_key).bind(serde_json::to_string(meta)?)
+            .execute(&self.pool).await?;
         Ok(())
     }
 
@@ -414,7 +446,7 @@ impl Store {
 
     async fn read_rules(connection: &mut sqlx::SqliteConnection) -> Result<Vec<Rule>> {
         let rows = sqlx::query(
-            "SELECT id,kind,domain,record_type,value,ttl FROM rules ORDER BY kind,domain,id",
+            "SELECT id,kind,domain,record_type,value,ttl,filter_match FROM rules ORDER BY kind,domain,id",
         )
         .fetch_all(connection)
         .await?;
@@ -427,6 +459,7 @@ impl Store {
                 record_type: row.get("record_type"),
                 value: row.get("value"),
                 ttl: row.get("ttl"),
+                filter_match: row.get("filter_match"),
             })
             .collect())
     }
@@ -478,6 +511,32 @@ impl Store {
         Ok(())
     }
 
+    pub async fn import_filter_rules(
+        &self,
+        rules: &[crate::resolver::ImportedFilter],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for rule in rules {
+            sqlx::query(
+                "DELETE FROM rules WHERE kind IN ('allow','block') AND domain=?
+                 AND (filter_match=? OR (filter_match IS NULL AND ?='DOMAIN-SUFFIX'))",
+            )
+            .bind(&rule.domain)
+            .bind(rule.match_type)
+            .bind(rule.match_type)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("INSERT INTO rules(kind,domain,filter_match) VALUES(?,?,?)")
+                .bind(if rule.block { "block" } else { "allow" })
+                .bind(&rule.domain)
+                .bind(rule.match_type)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn subscriptions(&self) -> Result<Vec<Subscription>> {
         let rows =
             sqlx::query("SELECT id,url,last_error,updated_at FROM subscriptions ORDER BY id")
@@ -522,23 +581,43 @@ impl Store {
 
     pub async fn replace_subscription_domains(&self, id: i64, domains: &[String]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        Self::write_subscription_domains(&mut tx, id, domains).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn save_uploaded_subscription(&self, name: &str, domains: &[String]) -> Result<i64> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let id = sqlx::query_scalar("INSERT INTO subscriptions(url) VALUES(?) ON CONFLICT(url) DO UPDATE SET url=excluded.url RETURNING id")
+            .bind(format!("upload:{name}"))
+            .fetch_one(&mut *tx)
+            .await?;
+        Self::write_subscription_domains(&mut tx, id, domains).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn write_subscription_domains(
+        connection: &mut sqlx::SqliteConnection,
+        id: i64,
+        domains: &[String],
+    ) -> Result<()> {
         sqlx::query("DELETE FROM subscription_domains WHERE subscription_id=?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?;
         for domain in domains {
             sqlx::query("INSERT INTO subscription_domains(subscription_id,domain) VALUES(?,?)")
                 .bind(id)
                 .bind(domain)
-                .execute(&mut *tx)
+                .execute(&mut *connection)
                 .await?;
         }
         sqlx::query("UPDATE subscriptions SET updated_at=?,last_error=NULL WHERE id=?")
             .bind(Utc::now().to_rfc3339())
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?;
-        tx.commit().await?;
         Ok(())
     }
 

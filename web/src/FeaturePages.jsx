@@ -38,6 +38,46 @@ function RefreshButton({ command, type, version, children }) {
   </div>
 }
 
+export function SourceUpload({ source, label, accept, command }) {
+  const [file, setFile] = useState(null)
+  const [pending, setPending] = useState(false)
+  const [notice, setNotice] = useState(null)
+
+  async function submit(event) {
+    event.preventDefault()
+    if (!file || pending) return
+    const form = event.currentTarget
+    setPending(true)
+    setNotice(null)
+    try {
+      await command(source, file)
+      form.reset()
+      setFile(null)
+      setNotice({ text: '已上传并加载' })
+    } catch (error) {
+      setNotice({ text: error.message, error: true })
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return <form className="source-upload" onSubmit={submit}>
+    <label>{label}
+      <input type="file" accept={accept} disabled={pending} onChange={event => {
+        setFile(event.currentTarget.files[0] || null)
+        setNotice(null)
+      }}/>
+    </label>
+    <button className="btn tertiary" disabled={!file || pending}>{pending ? '上传中…' : '上传并加载'}</button>
+    {notice && <p className={notice.error ? 'notice error' : 'policy-help'}
+      role={notice.error ? 'alert' : 'status'}>{notice.text}</p>}
+  </form>
+}
+
+function ManualSourceStatus({ meta }) {
+  return meta?.manual && <p className="policy-help">正在使用手动上传的文件。成功下载更新后恢复自动订阅。</p>
+}
+
 function ProxyTest({ address, test }) {
   const [testing,setTesting] = useState(false)
   const [message,setMessage] = useState('')
@@ -66,7 +106,7 @@ function GroupSelect({ label, value, groups, onChange }) {
   return <label>{label}<select value={value} onChange={event => onChange(event.target.value)}><option value="">请选择上游组</option>{groups.map(group => <option key={group.name} value={group.name}>{group.name}</option>)}</select></label>
 }
 
-export default function FeaturePages({ page, status, draft, setDraft, isAdmin, busy, save, command, lookup, testProxy }) {
+export default function FeaturePages({ page, status, draft, setDraft, isAdmin, busy, save, command, upload, lookup, testProxy }) {
   const [ip, setIp] = useState('')
   const [lookupResult, setLookupResult] = useState(null)
   if (!status || !draft) return <div className="empty">正在获取策略配置…</div>
@@ -98,8 +138,22 @@ export default function FeaturePages({ page, status, draft, setDraft, isAdmin, b
     </>}
     {page === 'upstreams' && <>
       <Section title="默认解析策略" description="缓存命中直接返回；未命中时按所选模式查询">
-        <div className="policy-grid"><label>解析模式<select value={draft.resolution.mode} onChange={event => update('resolution', { mode: event.target.value })}><option value="recursive">仅本地递归</option><option value="doh">仅 DoH 上游</option><option value="parallel">递归优先，DoH 并行兜底</option></select></label><GroupSelect label="默认 DoH 上游组" value={draft.resolution.group} groups={draft.groups} onChange={value => update('resolution', { group: value })}/><label>总超时（毫秒）<input type="number" min="100" max="60000" value={draft.resolution.timeout_ms} onChange={event => update('resolution', { timeout_ms: Number(event.target.value) })}/></label>{draft.resolution.mode === 'parallel' && <label>递归优先等待（毫秒）<input type="number" min="0" max={draft.resolution.timeout_ms} value={draft.resolution.priority_ms} onChange={event => update('resolution', { priority_ms: Number(event.target.value) })}/></label>}</div>
-        <label className="policy-check"><input type="checkbox" checked={draft.resolution.validate_dnssec} onChange={event => update('resolution', { validate_dnssec: event.target.checked })}/>本地验证 DoH 答案的 DNSSEC</label><p className="policy-help">适用于仅 DoH 上游和 GFWList 路由。并行兜底直接采用上游应答。仅本地递归在校验失败时返回带标记的未验证应答。</p>
+        <div className="policy-grid">
+          <label>解析模式<select value={draft.resolution.mode} onChange={event => update('resolution', { mode: event.target.value })}>
+            <option value="recursive">{draft.resolution.recursion_compatibility === 'strict' ? '本地递归，DoH 兜底' : '仅本地递归'}</option>
+            <option value="doh">仅 DoH 上游</option><option value="parallel">递归优先，DoH 并行兜底</option>
+          </select></label>
+          {draft.resolution.mode !== 'doh' && <label>递归兼容模式<select value={draft.resolution.recursion_compatibility}
+            onChange={event => update('resolution', { recursion_compatibility: event.target.value })}>
+            <option value="relaxed">宽松（默认）</option><option value="strict">严格</option>
+          </select></label>}
+          <GroupSelect label="默认 DoH 上游组" value={draft.resolution.group} groups={draft.groups} onChange={value => update('resolution', { group: value })}/>
+          <label>总超时（毫秒）<input type="number" min="100" max="60000" value={draft.resolution.timeout_ms} onChange={event => update('resolution', { timeout_ms: Number(event.target.value) })}/></label>
+          {draft.resolution.mode === 'parallel' && <label>递归优先等待（毫秒）<input type="number" min="0" max={draft.resolution.timeout_ms} value={draft.resolution.priority_ms} onChange={event => update('resolution', { priority_ms: Number(event.target.value) })}/></label>}
+        </div>
+        {draft.resolution.mode !== 'doh' && <p className="policy-help">宽松模式在逐级查询遇到中间名称不存在时继续查询。严格模式在递归没有所查记录或失败时，尝试默认 DoH 上游组。</p>}
+        <label className="policy-check"><input type="checkbox" checked={draft.resolution.validate_dnssec} onChange={event => update('resolution', { validate_dnssec: event.target.checked })}/>本地验证 DoH 答案的 DNSSEC</label>
+        <p className="policy-help">适用于仅 DoH 上游、GFWList 路由和严格递归的 DoH 兜底。宽松模式下，DoH 并行兜底直接采用上游应答，仅本地递归在校验失败时可返回带标记的未验证应答。</p>
       </Section>
       <Section title="全局代理" description="DoH 上游组可单独选择是否使用此地址。">
         <label>全局代理地址<input type="text" spellCheck={false} autoComplete="off" value={draft.proxy_url || ''} placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
@@ -121,23 +175,30 @@ export default function FeaturePages({ page, status, draft, setDraft, isAdmin, b
       <Section title="上游运行状态" description="最近一次读取的请求与失败次数"><div className="table-wrap"><table><thead><tr><th>上游组</th><th>地址</th><th>请求</th><th>失败</th></tr></thead><tbody>{status.groups.flatMap(item => item.servers.map(server => <tr key={`${item.name}-${server.url}`}><td>{item.name}</td><td>{server.url}</td><td>{server.requests}</td><td>{server.failures}</td></tr>))}</tbody></table></div></Section>
     </>}
     {page === 'subscriptions' && !saved && <p className="policy-help">更新使用已保存的来源配置。修改下载地址后，请先保存再更新。</p>}
-    {page === 'subscriptions' && <Section title="AdGuard 广告过滤" description="维护 AdGuard DNS Filter 和 AdAway 名单，由用户在个人 DoH 中选择启用">
+    {page === 'subscriptions' && <Section title="AdGuard 广告过滤" description="维护广告过滤订阅，由用户在个人 DoH 中选择启用">
 
       <label className="policy-check"><input type="checkbox" checked={draft.adguard.enabled} onChange={e => update('adguard',{enabled:e.target.checked})}/>向用户开放 AdGuard 过滤</label>
-      <div className="policy-grid">{draft.adguard.urls.map((url,i) => <label key={i}>{i ? 'AdAway 地址' : 'AdGuard DNS Filter 地址'}<input type="url" value={url} onChange={e => update('adguard',{urls:draft.adguard.urls.map((item,j)=>j===i ? e.target.value : item)})}/></label>)}
+      <div className="policy-grid">{draft.adguard.urls.map((url,i) => <label key={i}>{i ? 'AdAway 地址' : '主要订阅地址'}<input type="url" value={url} onChange={e => update('adguard',{urls:draft.adguard.urls.map((item,j)=>j===i ? e.target.value : item)})}/></label>)}
       <label>AdGuard 更新周期（小时）<input type="number" min="1" max="720" value={draft.adguard.update_hours} onChange={e=>update('adguard',{update_hours:Number(e.target.value)})}/></label></div>
-      <p>{status.adguard.count} 条拦截规则 · {timeLabel(status.adguard.meta?.updated_at)}</p>
+      <div className="row-actions">
+        <button type="button" className="btn tertiary" disabled={busy || draft.adguard.urls[0] === 'https://anti-ad.net/easylist.txt'}
+          onClick={() => update('adguard', { urls: ['https://anti-ad.net/easylist.txt', draft.adguard.urls[1]] })}>
+          使用 anti-AD（AdGuard Home）
+        </button>
+      </div>
+      <p>{status.adguard.count.toLocaleString()} 条拦截 · {status.adguard.exceptions.toLocaleString()} 条例外 · {status.adguard.skipped.toLocaleString()} 条跳过 · {timeLabel(status.adguard.meta?.updated_at)}</p>
+      <p className="policy-help">支持域名、通配符、正则和常见 Hosts 条目，也支持例外规则。带修饰符或无法解析的规则会跳过。</p>
       {status.adguard.meta?.error && <p className="notice error">{status.adguard.meta.error}</p>}
-      <RefreshButton command={command} type="adguard.refresh">立即更新 AdGuard</RefreshButton>
+      <ManualSourceStatus meta={status.adguard.meta}/><div className="source-actions"><RefreshButton command={command} type="adguard.refresh">立即更新 AdGuard</RefreshButton><SourceUpload source="adguard" label="上传 AdGuard 规则" accept=".txt,.list,.conf" command={upload}/></div>
     </Section>}
     {page === 'subscriptions' && <Section title="GFWList 解析分流" description="维护名单和上游组，由用户在个人 DoH 中选择启用">
 
-      <label className="policy-check"><input type="checkbox" checked={draft.gfwlist.enabled} onChange={event => update('gfwlist', { enabled: event.target.checked })}/>向用户开放 GFWList 分流</label><div className="policy-grid"><label className="full-width">名单地址<input type="url" value={draft.gfwlist.url} onChange={event => update('gfwlist', { url: event.target.value })}/></label><GroupSelect label="特定 DoH / 代理上游组" value={draft.gfwlist.group} groups={draft.groups} onChange={value => update('gfwlist', { group: value })}/><label>自动更新周期（小时）<input type="number" min="1" max="720" value={draft.gfwlist.update_hours} onChange={event => update('gfwlist', { update_hours: Number(event.target.value) })}/></label></div><p className="policy-help">默认 DoH 组：{draft.resolution.group || '未选择'}。特定上游组失败后转默认 DoH 组，两组均失败时返回错误。</p><dl className="policy-details"><div><dt>有效规则</dt><dd>{status.gfwlist.count.toLocaleString()}</dd></div><div><dt>未应用规则</dt><dd>{status.gfwlist.skipped}</dd></div><div><dt>上次更新</dt><dd>{timeLabel(status.gfwlist.meta?.updated_at)}</dd></div></dl><p className="policy-help">内置官方名单快照，支持 Base64、域名、通配符及可用的正则表达式。DNS 不区分 URL 路径：正向 URL 规则应用到整个主机；路径例外与无法处理的表达式计入未应用规则。</p>{status.gfwlist.meta?.error && <p className="notice error">{status.gfwlist.meta.error}</p>}<RefreshButton command={command} type="gfwlist.refresh">立即更新 GFWList</RefreshButton>
+      <label className="policy-check"><input type="checkbox" checked={draft.gfwlist.enabled} onChange={event => update('gfwlist', { enabled: event.target.checked })}/>向用户开放 GFWList 分流</label><div className="policy-grid"><label className="full-width">名单地址<input type="url" value={draft.gfwlist.url} onChange={event => update('gfwlist', { url: event.target.value })}/></label><GroupSelect label="特定 DoH / 代理上游组" value={draft.gfwlist.group} groups={draft.groups} onChange={value => update('gfwlist', { group: value })}/><label>自动更新周期（小时）<input type="number" min="1" max="720" value={draft.gfwlist.update_hours} onChange={event => update('gfwlist', { update_hours: Number(event.target.value) })}/></label></div><p className="policy-help">默认 DoH 组：{draft.resolution.group || '未选择'}。特定上游组失败后转默认 DoH 组，两组均失败时返回错误。</p><dl className="policy-details"><div><dt>有效规则</dt><dd>{status.gfwlist.count.toLocaleString()}</dd></div><div><dt>未应用规则</dt><dd>{status.gfwlist.skipped}</dd></div><div><dt>上次更新</dt><dd>{timeLabel(status.gfwlist.meta?.updated_at)}</dd></div></dl><p className="policy-help">内置官方名单快照，支持 Base64、域名、通配符及可用的正则表达式。DNS 不区分 URL 路径：正向 URL 规则应用到整个主机；路径例外与无法处理的表达式计入未应用规则。</p>{status.gfwlist.meta?.error && <p className="notice error">{status.gfwlist.meta.error}</p>}<ManualSourceStatus meta={status.gfwlist.meta}/><div className="source-actions"><RefreshButton command={command} type="gfwlist.refresh">立即更新 GFWList</RefreshButton><SourceUpload source="gfwlist" label="上传 GFWList 名单" accept=".txt,.list,.conf,.b64" command={upload}/></div>
     </Section>}
     {page === 'subscriptions' && <>
       <Section title="GeoIP 来源地区" description="离线 ip2region XDB，支持 IPv4 与 IPv6；有效文件加载后即时生效">
         <label className="policy-check"><input type="checkbox" checked={draft.geo.enabled} onChange={event => update('geo', { enabled: event.target.checked })}/>启用 GeoIP 查询与来源统计</label>
-        {[['ipv4', 'IPv4', 4], ['ipv6', 'IPv6', 6]].map(([key, label, version]) => <div className="geo-database" key={key}><h3>{label} 数据库 <span className={`tag ${status.geo[key].available ? 'local' : 'forward'}`}>{status.geo[key].available ? '已加载' : '未加载'}</span></h3><div className="policy-grid"><label className="full-width">本地绝对路径<input value={draft.geo[`${key}_path`]} onChange={event => update('geo', { [`${key}_path`]: event.target.value })}/></label><label className="full-width">下载地址<input type="url" value={draft.geo[`${key}_url`]} onChange={event => update('geo', { [`${key}_url`]: event.target.value })}/></label></div><p className="policy-help">大小：{status.geo[key].size_bytes ? `${(status.geo[key].size_bytes / 1048576).toFixed(1)} MiB` : '—'} · 上次更新：{timeLabel(status.geo_meta?.[String(version)]?.updated_at)}</p>{status.geo_meta?.[String(version)]?.error && <p className="notice error">{status.geo_meta[String(version)].error}</p>}<RefreshButton command={command} type="geoip.refresh" version={version}>下载并更新 {label}</RefreshButton></div>)}
+        {[['ipv4', 'IPv4', 4], ['ipv6', 'IPv6', 6]].map(([key, label, version]) => <div className="geo-database" key={key}><h3>{label} 数据库 <span className={`tag ${status.geo[key].available ? 'local' : 'forward'}`}>{status.geo[key].available ? '已加载' : '未加载'}</span></h3><div className="policy-grid"><label className="full-width">本地绝对路径<input value={draft.geo[`${key}_path`]} onChange={event => update('geo', { [`${key}_path`]: event.target.value })}/></label><label className="full-width">下载地址<input type="url" value={draft.geo[`${key}_url`]} onChange={event => update('geo', { [`${key}_url`]: event.target.value })}/></label></div><p className="policy-help">大小：{status.geo[key].size_bytes ? `${(status.geo[key].size_bytes / 1048576).toFixed(1)} MiB` : '—'} · 上次更新：{timeLabel(status.geo_meta?.[String(version)]?.updated_at)}</p>{status.geo_meta?.[String(version)]?.error && <p className="notice error">{status.geo_meta[String(version)].error}</p>}<ManualSourceStatus meta={status.geo_meta?.[String(version)]}/><div className="source-actions"><RefreshButton command={command} type="geoip.refresh" version={version}>下载并更新 {label}</RefreshButton><SourceUpload source={`geoip${version}`} label={`上传 ${label} XDB`} accept=".xdb" command={upload}/></div></div>)}
         <div className="policy-grid"><label>自动更新周期（小时，0 为关闭）<input type="number" min="0" max="8760" value={draft.geo.update_hours} onChange={event => update('geo', { update_hours: Number(event.target.value) })}/></label></div><p className="policy-help">下载或校验失败时保留上一份有效数据库。地区规则已启用但来源无法识别时，按客户端页面的未知 IP 策略处理。</p>
       </Section>
       <Section title="IP 查询与访问判断" description="检查数据库识别结果及当前已保存规则"><form className="policy-lookup" onSubmit={event => { event.preventDefault(); lookup(ip).then(setLookupResult).catch(() => {}) }}><label>来源 IP<input value={ip} onChange={event => setIp(event.target.value)} placeholder="8.8.8.8" required/></label><button className="btn tertiary" disabled={busy}>查询 IP</button></form>{lookupResult && <div className="lookup-result" role="status"><strong>{lookupResult.ip} 的归属地</strong><p>{[lookupResult.location.country, lookupResult.location.province, lookupResult.location.city, lookupResult.location.isp].filter(Boolean).join(' · ') || '未知 / 内网地址'}</p><p>模拟客户端访问 rDns：{lookupResult.allowed ? '允许' : '拒绝'}</p>{lookupResult.reason && <small>{accessReasons[lookupResult.reason] || lookupResult.reason}</small>}</div>}</Section>

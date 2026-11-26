@@ -54,6 +54,14 @@ pub enum ResolveMode {
     Parallel,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecursionCompatibility {
+    #[default]
+    Relaxed,
+    Strict,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResolutionSettings {
@@ -62,6 +70,7 @@ pub struct ResolutionSettings {
     pub priority_ms: u64,
     pub timeout_ms: u64,
     pub validate_dnssec: bool,
+    pub recursion_compatibility: RecursionCompatibility,
 }
 impl Default for ResolutionSettings {
     fn default() -> Self {
@@ -71,6 +80,7 @@ impl Default for ResolutionSettings {
             priority_ms: 300,
             timeout_ms: 15000,
             validate_dnssec: true,
+            recursion_compatibility: RecursionCompatibility::Relaxed,
         }
     }
 }

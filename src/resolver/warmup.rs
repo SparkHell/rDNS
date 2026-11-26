@@ -520,7 +520,7 @@ impl Engine {
 
     fn warm_allowed(policy: &Policy, domain: &str) -> bool {
         policy.local_records(domain).is_none()
-            && !policy.blocks(domain)
+            && !matches!(policy.filter(domain), Some(super::FilterDecision::Block(_)))
             && policy.forward_target(domain).is_none()
     }
 

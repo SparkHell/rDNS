@@ -92,6 +92,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ttl = 10 if fixture == b'prefetch-fixture' else 2 if b'radar-hot' in question else 60
         answer = packet[:2] + struct.pack('!5H', 0x81a0, 1, 1, 0, 0) + question
         answer += b'\xc0\x0c' + struct.pack('!HHIH', qtype, 1, ttl, len(value)) + value
+        if question.startswith(b'\x10upstream-missing'):
+            answer = packet[:2] + struct.pack('!5H', 0x8183, 1, 0, 0, 0) + question
         self.send_response(200)
         self.send_header('Content-Type', 'application/dns-message')
         self.send_header('Content-Length', str(len(answer)))
@@ -354,6 +356,40 @@ def run():
             expect_http_error(409,lambda:add_rule('block','*.wild-filter.test'))
             for pattern in ['x.*.wild-filter.test','wild-*.test','*.*.test','*. test']:
                 expect_http_error(400,lambda:add_rule('block',pattern))
+            def import_rules(text, actor=token):
+                return api(base, '/rules/import', {'text':text}, actor)
+            add_rule('allow','batch.test')
+            assert import_rules("""[Rule]
+DOMAIN-SUFFIX,batch.test,DIRECT
+DOMAIN-SUFFIX,BATCH.TEST.,REJECT
+DOMAIN,login.batch.test,DIRECT
+""") == {'count':2}
+            def rule_status(name):
+                return rcode(udp(query(name),dns_port))
+            assert rule_status('batch.test') == 3
+            assert rule_status('login.batch.test') == 0
+            assert rule_status('child.login.batch.test') == 3
+            assert rule_status('notbatch.test') == 0
+            assert import_rules("""rules:
+  - 'DOMAIN-SUFFIX,batch.test,REJECT' # Overrides the earlier exact allow
+  - DOMAIN,exact.test,REJECT
+""") == {'count':2}
+            assert rule_status('login.batch.test') == 3
+            assert rule_status('exact.test') == 3
+            assert rule_status('child.exact.test') == 0
+            assert import_rules(r"""DOMAIN-WILDCARD,pixel-?.example.test,REJECT
+DOMAIN-WILDCARD,*.pattern.test,REJECT
+DOMAIN-REGEX,^api[0-9]{1,2}\.pattern\.test$,DIRECT
+""") == {'count':3}
+            assert rule_status('pixel-a.example.test') == 3
+            assert rule_status('pixel-ab.example.test') == 0
+            assert rule_status('x.y.pattern.test') == 3
+            assert rule_status('api12.pattern.test') == 0
+            assert rule_status('api123.pattern.test') == 3
+            assert rule_status('pattern.test') == 0
+            expect_http_error(400, lambda: import_rules('DOMAIN,exact.test,DIRECT\nDOMAIN-REGEX,[,REJECT'))
+            expect_http_error(400, lambda: import_rules('DOMAIN,exact.test,DIRECT\nIP-CIDR,192.0.2.0/24,REJECT'))
+            assert rule_status('exact.test') == 3
             for name,value in [('*.wild-local.test','192.0.2.50'),('*.deep.wild-local.test','192.0.2.51'),('fixed.deep.wild-local.test','192.0.2.52')]:
                 add_rule('local',name,record_type='A',value=value,ttl=60)
             for name,value in [('a.wild-local.test','192.0.2.50'),('b.deep.wild-local.test','192.0.2.51'),('fixed.deep.wild-local.test','192.0.2.52')]:
@@ -572,6 +608,7 @@ def run():
             # REST role enforcement and persistence across process restart.
             api(base, '/accounts', {'username':'viewer','password':'x','role':'viewer'}, token)
             viewer = api(base, '/login', {'username':'viewer','password':'x'})['token']
+            expect_http_error(403, lambda: import_rules('DOMAIN,exact.test,DIRECT', viewer))
             expect_http_error(403, lambda: api(base, '/features', settings, viewer, 'PUT'))
             assert 'groups' not in api(base, '/features', token=viewer)['settings']
             hot = query('recent-hot.test', 65)
@@ -617,9 +654,18 @@ def run():
             assert api(base, '/stats', token=token)['total'] == before_logs
             assert not configure(dict(options,token=''))['token_configured']
             settings['adguard'].update(enabled=True,urls=[base_upstream+'/ads',base_upstream+'/hosts'])
-            server.resources.update({'/ads':b'||ad.test^\n@@||ok.ad.test^','/hosts':b'0.0.0.0 tracker.test'})
+            server.resources.update({
+                '/ads': (
+                    b'! filter\n||ad.test^\n@@||ok.ad.test^\n||ad.test^\n'
+                    b'/^regex[0-9]+\\.test$/\n||pixel-*.test^\n'
+                    b'@@||pixel-ok*.test^\n@@/^safe[0-9]+\\.pixel-metrics\\.test$/\n'
+                    b'||limited.test^$dnstype=A\n/regex/$denyallow=allowed.test'
+                ),
+                '/hosts':b'0.0.0.0 tracker.test',
+            })
             save()
-            api(base, '/adguard/refresh', {}, token)
+            adguard = api(base, '/adguard/refresh', {}, token)['adguard']
+            assert (adguard['count'], adguard['exceptions'], adguard['skipped']) == (4,3,2)
             assert rcode(personal('child.ad.test')) == 0
             preferences(adguard=True, gfwlist=True)
             assert rcode(personal('child.ad.test')) == 3
@@ -628,6 +674,13 @@ def run():
             assert rcode(udp(query('child.ad.test'), dns_port)) == 0
             assert rcode(personal('ok.ad.test')) == 0
             assert rcode(personal('tracker.test')) == 3
+            assert rcode(personal('regex123.test')) == 3
+            assert rcode(personal('host.regex123.test')) == 0
+            assert rcode(personal('deep.pixel-metrics.test')) == 3
+            assert rcode(personal('badpixel-metrics.test')) == 0
+            assert rcode(personal('pixel-okay.test')) == 0
+            assert rcode(personal('safe1.pixel-metrics.test')) == 0
+            assert rcode(personal('limited.test')) == 0
             server.resources['/hosts'] = b'invalid'
             expect_http_error(502, lambda: api(base,'/adguard/refresh',{},token))
             assert rcode(personal('tracker.test')) == 3
@@ -641,6 +694,8 @@ def run():
             assert api(base, '/geoip/lookup', {'ip':'8.8.8.8'}, token)['location']['country_code'] == 'CN'
             # The scheduler must refresh a due source on startup without a manual request.
             settings['gfwlist'].update(enabled=True, url=base_upstream+'/list')
+            # A failed download after startup must retain and recompile the cached patterns.
+            settings['adguard']['enabled'] = True
             save()
             server.resources['/list'] = base64.b64encode(b'[AutoProxy 0.2.9]\n||scheduled.target.test\n')
             previous_updates = server.counts['GET/list']
@@ -654,9 +709,87 @@ def run():
                 except OSError: pass
                 time.sleep(.05)
             else: raise AssertionError('scheduled GFWList update did not run')
+            assert rule_status('login.batch.test') == 3
+            assert rule_status('child.exact.test') == 0
+            assert rule_status('x.y.pattern.test') == 3
+            assert rule_status('api12.pattern.test') == 0
+            assert rcode(personal('regex123.test')) == 3
+            assert rcode(personal('safe1.pixel-metrics.test')) == 0
             assert portal_call('dns-settings', cookie=member_cookie)[0]['preferences'] == dict(adguard=True,gfwlist=True)
             assert rcode(personal('scheduled.target.test'))==0
             assert api(base, '/logs', token=token)[0]['outcome']=='gfw_fallback_doh', 'scheduled list match did not use the configured default DoH fallback'
+            def upload(source, data, actor=token):
+                request = urllib.request.Request(
+                    base + '/api/v1/sources/' + source, data=data,
+                    headers={'Authorization':f'Bearer {actor}', 'Content-Type':'application/octet-stream'},
+                )
+                with urllib.request.urlopen(request, timeout=8) as response:
+                    return json.load(response)
+            expect_http_error(403, lambda: upload('adguard/upload', b'||manual-ad.test^', viewer))
+            assert upload('adguard/upload', b'||manual-ad.test^')['adguard']['meta']['manual']
+            assert rcode(personal('manual-ad.test')) == 3
+            assert rcode(personal('tracker.test')) == 0
+            expect_http_error(400, lambda: upload('adguard/upload', b'bad data'))
+            assert rcode(personal('manual-ad.test')) == 3
+            text = b'[AutoProxy 0.2.9]\n||manual-route.test\n'
+            assert upload('gfwlist/upload', text)['gfwlist']['meta']['manual']
+            assert rcode(personal('manual-route.test')) == 0
+            assert api(base, '/logs', token=token)[0]['outcome'] == 'gfw_fallback_doh'
+            for version in (4, 6):
+                payload = upload(f'geoip{version}/upload', xdb(version))
+                assert payload['geo_meta'][str(version)]['manual']
+                expect_http_error(400, lambda: upload(f'geoip{version}/upload', xdb(10-version)))
+                assert status()['geo_meta'][str(version)]['manual']
+            assert api(base, '/geoip/lookup', {'ip':'8.8.8.8'}, token)['location']['country_code'] == 'CN'
+            first = upload('custom/upload?name=local-rules.txt', b'first-custom.test\n')
+            second = upload('custom/upload?name=local-rules.txt', b'second-custom.test\n')
+            assert first['id'] == second['id'] and second['count'] == 1
+            assert rule_status('first-custom.test') == 0
+            assert rule_status('second-custom.test') == 3
+            def diagnostic(name, actor=token):
+                return api(base, '/dns/lookup', {'domain':name,'qtype':'A'}, actor)
+            expect_http_error(401, lambda: diagnostic('batch.test', None))
+            for name, reason in (
+                ('batch.test', 'imported_rule'),
+                ('a.wild-filter.test', 'blacklist'),
+                ('second-custom.test', 'subscription'),
+                ('upstream-missing.test', None),
+            ):
+                diagnosis = diagnostic(name, viewer)
+                assert diagnosis['response']['rcode'] == 'NXDOMAIN', diagnosis
+                assert diagnosis['block_reason'] == reason, diagnosis
+            result, _ = portal_call('lookup', {'domain':'manual-ad.test','qtype':'A'}, member_cookie)
+            assert result['response']['rcode'] == 'NXDOMAIN' and result['block_reason'] == 'adguard'
+            assert diagnostic('manual-ad.test')['block_reason'] is None
+            simulated = api(base, '/dns/lookup', {'domain':'manual-ad.test','qtype':'A','adguard':True}, token)
+            assert simulated['response']['rcode'] == 'NXDOMAIN' and simulated['block_reason'] == 'adguard'
+            expect_http_error(400, lambda: api(base, f"/subscriptions/{second['id']}/refresh", {}, token))
+
+            # Even a due subscription must retain its manual file across startup.
+            with closing(sqlite3.connect(directory/'db.sqlite3')) as connection, connection:
+                for key in ('adguard_meta', 'gfwlist_meta'):
+                    connection.execute("UPDATE runtime_settings SET value=json_set(value,'$.attempted_at',0) WHERE key=?", (key,))
+            previous_downloads = [server.counts['GET'+name] for name in ('/list','/ads')]
+            process.terminate(); process.wait(timeout=5)
+            process = subprocess.Popen([str(BIN), str(config)], stdout=output, stderr=output)
+            for _ in range(100):
+                try:
+                    assert status()['gfwlist']['meta']['manual']
+                    break
+                except OSError:
+                    time.sleep(.05)
+            else: raise AssertionError('service did not restart with uploaded sources')
+            assert rcode(personal('manual-ad.test')) == 3
+            assert rule_status('second-custom.test') == 3
+            assert [server.counts['GET'+name] for name in ('/list','/ads')] == previous_downloads
+            assert not api(base, '/gfwlist/refresh', {}, token)['gfwlist']['meta']['manual']
+            expect_http_error(502, lambda: api(base, '/geoip/refresh', {'ip_version':4}, token))
+            assert status()['geo_meta']['4']['manual']
+            settings['geo']['ipv4_url'] = base_upstream+'/v4'
+            save()
+            for version in (4, 6):
+                assert not api(base, '/geoip/refresh', {'ip_version':version}, token)['geo_meta'][str(version)]['manual']
+            assert status()['adguard']['meta']['manual']
             if os.environ.get('RDNS_FEATURE_UI') == '1':
                 cache_before = api(base, '/cache', token=token)['settings']
                 subprocess.run(['node', str(Path(__file__).with_name('feature-ui-smoke.mjs'))], check=True,

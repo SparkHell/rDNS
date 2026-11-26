@@ -14,6 +14,22 @@ use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
+pub enum SourceUpdate {
+    Automatic,
+    Download,
+    Upload(axum::body::Bytes),
+}
+
+impl SourceUpdate {
+    fn should_skip(&self, meta: &Value) -> bool {
+        matches!(self, Self::Automatic) && meta["manual"].as_bool() == Some(true)
+    }
+
+    fn is_upload(&self) -> bool {
+        matches!(self, Self::Upload(_))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeoSettings {
@@ -212,7 +228,7 @@ impl Features {
             Some(list) => list,
             None => GfwList::parse(include_str!("../resources/gfwlist.txt"))?,
         };
-        let ads = match store.setting("adguard_data").await? {
+        let mut ads: crate::adguard::Rules = match store.setting("adguard_data").await? {
             Some(rules) => rules,
             None => {
                 let mut rules = crate::adguard::Rules::default();
@@ -229,6 +245,7 @@ impl Features {
                 }
             }
         };
+        ads.compile()?;
         Ok(Arc::new(Self {
             ads: ArcSwap::from_pointee(ads),
             ad_refresh: Default::default(),
@@ -302,7 +319,9 @@ impl Features {
             settings.gfwlist.group
         );
         ensure!(
-            (r.mode == ResolveMode::Recursive && !settings.gfwlist.enabled)
+            (r.mode == ResolveMode::Recursive
+                && r.recursion_compatibility == upstream::RecursionCompatibility::Relaxed
+                && !settings.gfwlist.enabled)
                 || groups.contains_key(&r.group),
             "默认 DoH 上游组「{}」未配置，请在高级设置 → 解析上游中选择有效的组",
             r.group
@@ -389,7 +408,7 @@ impl Features {
         if refresh_ads {
             let features = self.clone();
             tokio::spawn(async move {
-                let _ = features.refresh_ads().await;
+                let _ = features.refresh_ads(SourceUpdate::Automatic).await;
             });
         }
         Ok(())
@@ -412,27 +431,50 @@ impl Features {
         } else {
             vec![]
         };
-        json!({"type":"features", "settings":settings, "geo":current.geo.status(), "groups":groups, "gfwlist":{"count":list.count,"skipped":list.skipped,"meta":self.store.setting::<Value>("gfwlist_meta").await.ok().flatten()}, "adguard":{"count":self.ads.load().count(),"meta":self.store.setting::<Value>("adguard_meta").await.ok().flatten()}, "geo_meta":self.store.setting::<Value>("geo_meta").await.ok().flatten()})
+        let ads = self.ads.load_full();
+        json!({"type":"features", "settings":settings, "geo":current.geo.status(), "groups":groups, "gfwlist":{"count":list.count,"skipped":list.skipped,"meta":self.store.setting::<Value>("gfwlist_meta").await.ok().flatten()}, "adguard":{"count":ads.count(),"exceptions":ads.exception_count(),"skipped":ads.skipped(),"meta":self.store.setting::<Value>("adguard_meta").await.ok().flatten()}, "geo_meta":self.store.setting::<Value>("geo_meta").await.ok().flatten()})
     }
 
-    pub async fn refresh_ads(&self) -> Result<()> {
+    pub async fn refresh_ads(&self, update: SourceUpdate) -> Result<()> {
         let _refresh = self.ad_refresh.lock().await;
+        let mut meta = self
+            .store
+            .setting::<Value>("adguard_meta")
+            .await?
+            .unwrap_or_default();
+        if update.should_skip(&meta) {
+            return Ok(());
+        }
+        let uploaded = update.is_upload();
         let current = self.current.load_full();
         let settings = &current.settings.adguard;
         let result = async {
-            let mut rules = crate::adguard::Rules::default();
-            for url in &settings.urls {
-                rules.add(
-                    &upstream::download(
-                        &self.config,
-                        url,
-                        current.settings.subscription_proxy(),
-                        20 * 1024 * 1024,
-                    )
-                    .await?,
-                )?;
-            }
-            Ok::<_, anyhow::Error>(rules)
+            let sources = if let SourceUpdate::Upload(bytes) = update {
+                vec![bytes.into()]
+            } else {
+                let mut sources = Vec::new();
+                for url in &settings.urls {
+                    sources.push(
+                        upstream::download(
+                            &self.config,
+                            url,
+                            current.settings.subscription_proxy(),
+                            20 * 1024 * 1024,
+                        )
+                        .await?,
+                    );
+                }
+                sources
+            };
+            tokio::task::spawn_blocking(move || {
+                let mut rules = crate::adguard::Rules::default();
+                for source in sources {
+                    rules.add(&source)?;
+                }
+                rules.compile()?;
+                Ok::<_, anyhow::Error>(rules)
+            })
+            .await?
         }
         .await;
         let _guard = self.write.lock().await;
@@ -440,18 +482,16 @@ impl Features {
             self.current.load().ad_revision == current.ad_revision,
             "AdGuard 来源已变更"
         );
-        let mut meta = self
-            .store
-            .setting::<Value>("adguard_meta")
-            .await?
-            .unwrap_or_else(|| json!({}));
         meta["attempted_at"] = json!(chrono::Utc::now().timestamp());
         match result {
             Ok(rules) => {
-                self.store.set_setting("adguard_data", &rules).await?;
-                self.ads.store(Arc::new(rules));
                 meta["updated_at"] = meta["attempted_at"].clone();
+                meta["manual"] = json!(uploaded);
                 meta["error"] = Value::Null;
+                self.store
+                    .set_source_snapshot("adguard_data", &rules, "adguard_meta", &meta)
+                    .await?;
+                self.ads.store(Arc::new(rules));
             }
             Err(error) => {
                 meta["error"] = json!("更新失败，已保留上一份规则");
@@ -460,21 +500,34 @@ impl Features {
                 return Err(error);
             }
         }
-        self.store.set_setting("adguard_meta", &meta).await?;
         self.subscription_updates.send_replace(());
         Ok(())
     }
 
-    pub async fn refresh_list(&self) -> Result<usize> {
+    pub async fn refresh_list(&self, update: SourceUpdate) -> Result<()> {
         let _refresh = self.list_refresh.lock().await;
+        let previous = self
+            .store
+            .setting::<Value>("gfwlist_meta")
+            .await?
+            .unwrap_or_default();
+        if update.should_skip(&previous) {
+            return Ok(());
+        }
+        let uploaded = update.is_upload();
         let current = self.current.load_full();
         let (url, _, proxy, _) = current.settings.list_source();
         let downloaded = async {
-            let bytes = upstream::download(&self.config, url, proxy, 10 * 1024 * 1024).await?;
+            let bytes = if let SourceUpdate::Upload(bytes) = update {
+                bytes.into()
+            } else {
+                upstream::download(&self.config, url, proxy, 10 * 1024 * 1024).await?
+            };
             tokio::task::spawn_blocking(move || {
                 let text = String::from_utf8(bytes)?;
-                let list = GfwList::parse(&text)?;
-                Ok::<_, anyhow::Error>((text, list))
+                let text = text.trim_start_matches('\u{feff}');
+                let list = GfwList::parse(text)?;
+                Ok::<_, anyhow::Error>((text.to_owned(), list))
             })
             .await?
         }
@@ -484,28 +537,45 @@ impl Features {
             self.current.load().list_revision == current.list_revision,
             "GFWList source changed during refresh"
         );
-        let result = async {
-            let (text, list) = downloaded?;
-            self.store.set_setting("gfwlist_data", &text).await?;
-            let count = list.count;
-            self.list.store(Arc::new(list));
-            Ok::<_, anyhow::Error>(count)
-        }
-        .await;
-        let previous = self
-            .store
-            .setting::<Value>("gfwlist_meta")
-            .await?
-            .unwrap_or_default();
-        let meta = json!({"attempted_at":chrono::Utc::now().timestamp(),"updated_at":if result.is_ok(){json!(chrono::Utc::now().timestamp())}else{previous["updated_at"].clone()},"error":result.as_ref().err().map(|_| "更新失败，继续使用上一份有效名单")});
-        self.store.set_setting("gfwlist_meta", &meta).await?;
+        let now = chrono::Utc::now().timestamp();
+        let result = match downloaded {
+            Ok((text, list)) => {
+                let meta =
+                    json!({"attempted_at":now, "updated_at":now, "manual":uploaded, "error":null});
+                self.store
+                    .set_source_snapshot("gfwlist_data", &text, "gfwlist_meta", &meta)
+                    .await?;
+                self.list.store(Arc::new(list));
+                Ok(())
+            }
+            Err(error) => {
+                let mut meta = previous;
+                meta["attempted_at"] = json!(now);
+                meta["error"] = json!("更新失败，继续使用上一份有效名单");
+                self.store.set_setting("gfwlist_meta", &meta).await?;
+                Err(error)
+            }
+        };
         self.subscription_updates.send_replace(());
         result
     }
 
-    pub async fn refresh_geo(&self, version: u8) -> Result<()> {
+    pub async fn refresh_geo(&self, version: u8, update: SourceUpdate) -> Result<()> {
         ensure!([4, 6].contains(&version), "ip_version must be 4 or 6");
         let _refresh = self.geo_refresh[usize::from(version == 6)].lock().await;
+        let key = version.to_string();
+        let uploaded = update.is_upload();
+        if matches!(update, SourceUpdate::Automatic)
+            && update.should_skip(
+                &self
+                    .store
+                    .setting::<Value>("geo_meta")
+                    .await?
+                    .unwrap_or_default()[&key],
+            )
+        {
+            return Ok(());
+        }
         let current = self.current.load_full();
         let settings = &current.settings.geo;
         let url = if version == 4 {
@@ -514,14 +584,18 @@ impl Features {
             &settings.ipv6_url
         };
         let prepared = async {
-            let bytes = upstream::download_with_timeout(
-                &self.config,
-                url,
-                current.settings.subscription_proxy(),
-                80 * 1024 * 1024,
-                std::time::Duration::from_secs(300),
-            )
-            .await?;
+            let bytes = if let SourceUpdate::Upload(bytes) = update {
+                bytes.into()
+            } else {
+                upstream::download_with_timeout(
+                    &self.config,
+                    url,
+                    current.settings.subscription_proxy(),
+                    80 * 1024 * 1024,
+                    std::time::Duration::from_secs(300),
+                )
+                .await?
+            };
             let geo = current.geo.clone();
             tokio::task::spawn_blocking(move || geo.prepare_database(version, bytes)).await?
         }
@@ -537,7 +611,11 @@ impl Features {
             .setting::<Value>("geo_meta")
             .await?
             .unwrap_or_else(|| json!({}));
-        let key = version.to_string();
+        let manual = if result.is_ok() {
+            uploaded
+        } else {
+            meta[&key]["manual"].as_bool().unwrap_or(false)
+        };
         let previous = meta[&key]["updated_at"].clone();
         let error = result.as_ref().err().map(|error| {
             if let Some(http) = error.downcast_ref::<reqwest::Error>() {
@@ -555,7 +633,7 @@ impl Features {
             }
             "数据库读取或校验失败，请检查下载内容和 IP 版本".to_owned()
         });
-        meta[&key] = json!({"attempted_at":chrono::Utc::now().timestamp(),"updated_at":if result.is_ok(){json!(chrono::Utc::now().timestamp())}else{previous},"error":error});
+        meta[&key] = json!({"attempted_at":chrono::Utc::now().timestamp(),"updated_at":if result.is_ok(){json!(chrono::Utc::now().timestamp())}else{previous},"manual":manual,"error":error});
         self.store.set_setting("geo_meta", &meta).await?;
         self.subscription_updates.send_replace(());
         result
@@ -565,7 +643,9 @@ impl Features {
         let settings = self.current.load().settings.clone();
         let now = chrono::Utc::now().timestamp();
         let due = |last: &Value, hours: u64| {
-            hours > 0 && now - last["attempted_at"].as_i64().unwrap_or(0) >= hours as i64 * 3600
+            hours > 0
+                && last["manual"].as_bool() != Some(true)
+                && now - last["attempted_at"].as_i64().unwrap_or(0) >= hours as i64 * 3600
         };
         if settings.adguard.enabled
             && due(
@@ -579,7 +659,7 @@ impl Features {
                 settings.adguard.update_hours,
             )
         {
-            let _ = self.refresh_ads().await;
+            let _ = self.refresh_ads(SourceUpdate::Automatic).await;
         }
         let meta = self
             .store
@@ -590,7 +670,7 @@ impl Features {
             .unwrap_or_default();
         if settings.gfwlist.enabled
             && due(&meta, settings.gfwlist.update_hours)
-            && self.refresh_list().await.is_err()
+            && self.refresh_list(SourceUpdate::Automatic).await.is_err()
         {
             tracing::warn!("GFWList refresh failed; retaining active rules");
         }
@@ -604,7 +684,10 @@ impl Features {
         for version in [4, 6] {
             if settings.geo.enabled
                 && due(&meta[version.to_string()], settings.geo.update_hours)
-                && self.refresh_geo(version).await.is_err()
+                && self
+                    .refresh_geo(version, SourceUpdate::Automatic)
+                    .await
+                    .is_err()
             {
                 tracing::warn!(version, "GeoIP refresh failed; retaining active database");
             }

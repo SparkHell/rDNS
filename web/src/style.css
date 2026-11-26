@@ -24,3 +24,10 @@
 .section-nav {display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;border-bottom:1px solid #42444a}
 .section-nav button {background:transparent;color:#b6bdc9;border:0;border-bottom:2px solid transparent;padding:10px 14px;font:inherit;cursor:pointer}
 .section-nav button[aria-current] {color:#f0f2f5;border-bottom-color:#00d861}
+
+.rule-import summary{padding:17px 22px;font-size:14px;font-weight:800;cursor:pointer}
+.rule-import[open] summary{border-bottom:1px solid #42444a}
+.rule-import textarea{resize:vertical;font-family:monospace}
+.rule-match{display:block;margin-top:4px;color:#aeb4c0;font-weight:600}
+
+.source-actions{display:flex;flex-wrap:wrap;align-items:flex-end;gap:14px 20px}.source-upload{display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px;min-width:0}.source-upload label{min-width:0;max-width:100%}.source-upload input{max-width:100%;width:240px}.source-upload input::file-selector-button{padding-right:8px;color:#cbd0da;cursor:pointer}.source-upload p{flex-basis:100%}.geo-database .source-actions{margin-top:12px}

@@ -1,16 +1,16 @@
 use crate::{
     cache::CacheSettings,
-    features::FeatureSettings,
-    resolver::{Engine, parse_filter_list},
+    features::{FeatureSettings, SourceUpdate},
+    resolver::{Engine, parse_filter_list, parse_imported_filters},
     runtime::{ListenerManager, ListenerSettings},
     store::{Account, RuleInput, Store},
     tls::TlsState,
 };
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Bytes, to_bytes},
     extract::{
-        ConnectInfo, Path, Query, State,
+        ConnectInfo, Path, Query, Request, State,
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
@@ -69,13 +69,16 @@ pub fn admin_router(state: ApiState) -> Router {
             post(refresh_cache_job),
         )
         .route("/api/v1/adguard/refresh", post(refresh_ads))
+        .route("/api/v1/sources/{source}/upload", post(upload_source))
         .route("/api/v1/features", get(feature_status).put(update_features))
         .route("/api/v1/proxy/test", post(test_proxy))
         .route("/api/v1/gfwlist/refresh", post(refresh_gfwlist))
         .route("/api/v1/geoip/refresh", post(refresh_geoip))
         .route("/api/v1/geoip/lookup", post(lookup_geoip))
         .route("/api/v1/ws", get(websocket))
+        .route("/api/v1/dns/lookup", post(test_dns))
         .route("/api/v1/rules", get(rules).post(add_rule))
+        .route("/api/v1/rules/import", post(import_rules))
         .route("/api/v1/rules/{id}", axum::routing::delete(delete_rule))
         .route(
             "/api/v1/subscriptions",
@@ -391,14 +394,117 @@ async fn test_proxy(
     Ok(Json(json!({"elapsed_ms":start.elapsed().as_millis()})))
 }
 
-async fn refresh_gfwlist(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
-    let account = require(&headers, &state.engine.store, "admin").await?;
-    state.engine.features.refresh_list().await.map_err(|_| {
+#[derive(Deserialize)]
+struct SourceUpload {
+    name: Option<String>,
+}
+
+async fn upload_source(
+    State(state): State<ApiState>,
+    Path(source): Path<String>,
+    Query(input): Query<SourceUpload>,
+    request: Request,
+) -> ApiResult {
+    let (limit, role) = match source.as_str() {
+        "adguard" => (20, "admin"),
+        "gfwlist" => (10, "admin"),
+        "geoip4" | "geoip6" => (80, "admin"),
+        "custom" => (10, "editor"),
+        _ => return Err((StatusCode::NOT_FOUND, "未知的订阅类型".into())),
+    };
+    let account = require(request.headers(), &state.engine.store, role).await?;
+    let bytes = to_bytes(request.into_body(), limit * 1024 * 1024)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("length limit") {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("上传文件不能超过 {limit} MiB"),
+                )
+            } else {
+                (StatusCode::BAD_REQUEST, "无法读取上传文件".to_owned())
+            }
+        })?;
+    if bytes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "上传文件为空".to_owned()));
+    }
+    if source == "custom" {
+        let name = input
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| {
+                !name.is_empty()
+                    && name.len() <= 255
+                    && !name.contains(['/', '\\'])
+                    && !name.chars().any(char::is_control)
+            })
+            .ok_or((StatusCode::BAD_REQUEST, "请提供有效的文件名".into()))?;
+        let domains = tokio::task::spawn_blocking(move || parse_subscription_domains(&bytes))
+            .await
+            .map_err(internal)?
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "文件中没有可用的自定义过滤规则".into(),
+                )
+            })?;
+        let id = state
+            .engine
+            .store
+            .save_uploaded_subscription(name, &domains)
+            .await
+            .map_err(internal)?;
+        state.engine.reload_policy().await.map_err(internal)?;
+        state
+            .engine
+            .store
+            .audit(
+                &account.username,
+                "subscription.upload",
+                &format!("id={id} domains={}", domains.len()),
+            )
+            .await
+            .map_err(internal)?;
+        return Ok(Json(json!({"id": id, "count": domains.len()})));
+    }
+    let features = &state.engine.features;
+    let update = SourceUpdate::Upload(bytes);
+    let result = match source.as_str() {
+        "adguard" => features.refresh_ads(update).await,
+        "gfwlist" => features.refresh_list(update).await,
+        "geoip4" => features.refresh_geo(4, update).await,
+        _ => features.refresh_geo(6, update).await,
+    };
+    result.map_err(|error| {
+        tracing::warn!(%source, %error, "subscription upload failed");
         (
-            StatusCode::BAD_GATEWAY,
-            "GFWList 更新失败，已保留原有名单，请检查来源地址和下载代理".into(),
+            StatusCode::BAD_REQUEST,
+            "上传失败，请检查文件格式、IP 版本或订阅状态中的错误信息".into(),
         )
     })?;
+    state
+        .engine
+        .store
+        .audit(&account.username, "subscription.upload", &source)
+        .await
+        .map_err(internal)?;
+    Ok(Json(features.snapshot(true).await))
+}
+
+async fn refresh_gfwlist(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "admin").await?;
+    state
+        .engine
+        .features
+        .refresh_list(SourceUpdate::Download)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "GFWList 更新失败，已保留原有名单，请检查来源地址和下载代理".into(),
+            )
+        })?;
     state
         .engine
         .store
@@ -422,7 +528,7 @@ async fn refresh_geoip(
     state
         .engine
         .features
-        .refresh_geo(input.ip_version)
+        .refresh_geo(input.ip_version, SourceUpdate::Download)
         .await
         .map_err(|_| {
             (
@@ -506,12 +612,17 @@ async fn refresh_cache_job(
 }
 async fn refresh_ads(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
     let account = require(&headers, &state.engine.store, "admin").await?;
-    state.engine.features.refresh_ads().await.map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "AdGuard 更新失败，请检查来源地址和规则格式".to_owned(),
-        )
-    })?;
+    state
+        .engine
+        .features
+        .refresh_ads(SourceUpdate::Download)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "AdGuard 更新失败，请检查来源地址和规则格式".to_owned(),
+            )
+        })?;
     state
         .engine
         .store
@@ -682,9 +793,9 @@ async fn websocket_session(state: ApiState, mut socket: WebSocket) {
                             Err(error) => Err(error.to_string()),
                         }
                     } else if value["type"] == "gfwlist.refresh" {
-                        state.engine.features.refresh_list().await.map(|_| ()).map_err(|_| "GFWList 更新失败，保留原有名单".to_string())
+                        state.engine.features.refresh_list(SourceUpdate::Download).await.map(|_| ()).map_err(|_| "GFWList 更新失败，保留原有名单".to_string())
                     } else {
-                        state.engine.features.refresh_geo(value["settings"]["ip_version"].as_u64().unwrap_or(0) as u8).await.map_err(|_| "GeoIP 更新失败，保留原有数据库".to_string())
+                        state.engine.features.refresh_geo(value["settings"]["ip_version"].as_u64().unwrap_or(0) as u8, SourceUpdate::Download).await.map_err(|_| "GeoIP 更新失败，保留原有数据库".to_string())
                     }
                 } else { Err("administrator role required".to_string()) };
                 if result.is_ok() {
@@ -738,6 +849,16 @@ async fn update_clients(
         .map_err(internal)?;
     Ok(Json(json!({"cidrs":cidrs})))
 }
+async fn test_dns(
+    State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(input): Json<crate::portal::lookup::Input>,
+) -> ApiResult {
+    require(&headers, &state.engine.store, "viewer").await?;
+    crate::portal::lookup::run(&state, peer, &headers, input, None).await
+}
+
 async fn rules(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
     require(&headers, &state.engine.store, "viewer").await?;
     Ok(Json(json!(
@@ -789,6 +910,37 @@ async fn delete_rule(
         .map_err(internal)?;
     Ok(Json(json!({"ok":true})))
 }
+
+#[derive(Deserialize)]
+struct FilterImport {
+    text: String,
+}
+
+async fn import_rules(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(input): Json<FilterImport>,
+) -> ApiResult {
+    let account = require(&headers, &state.engine.store, "editor").await?;
+    let rules = parse_imported_filters(&input.text)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let count = rules.len();
+    state
+        .engine
+        .store
+        .import_filter_rules(&rules)
+        .await
+        .map_err(internal)?;
+    state.engine.reload_policy().await.map_err(internal)?;
+    state
+        .engine
+        .store
+        .audit(&account.username, "rule.import", &format!("count={count}"))
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({"count":count})))
+}
+
 async fn subscriptions(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
     require(&headers, &state.engine.store, "viewer").await?;
     Ok(Json(json!(
@@ -862,6 +1014,9 @@ async fn refresh_subscription(
         .into_iter()
         .find(|s| s.id == id)
         .ok_or((StatusCode::NOT_FOUND, "subscription not found".into()))?;
+    if sub.url.starts_with("upload:") {
+        return Err((StatusCode::BAD_REQUEST, "请上传文件更新手动订阅".into()));
+    }
     let count = match fetch_subscription(&state.engine, sub.id, &sub.url).await {
         Ok(count) => count,
         Err(error) => {
@@ -1177,6 +1332,8 @@ fn serve(path: &str) -> Response {
         "image/svg+xml"
     } else if path.ends_with(".woff2") {
         "font/woff2"
+    } else if path.ends_with(".list") {
+        "text/plain; charset=utf-8"
     } else {
         "text/html"
     };
@@ -1208,12 +1365,7 @@ pub async fn fetch_subscription(engine: &Engine, id: i64, url: &str) -> anyhow::
         );
         data.extend_from_slice(&chunk);
     }
-    let text = std::str::from_utf8(&data)?;
-    let domains = parse_filter_list(text)?;
-    anyhow::ensure!(
-        !domains.is_empty(),
-        "subscription contains no supported domains"
-    );
+    let domains = parse_subscription_domains(&data)?;
     engine
         .store
         .replace_subscription_domains(id, &domains)
@@ -1222,9 +1374,22 @@ pub async fn fetch_subscription(engine: &Engine, id: i64, url: &str) -> anyhow::
     Ok(domains.len())
 }
 
+fn parse_subscription_domains(data: &[u8]) -> anyhow::Result<Vec<String>> {
+    let text = std::str::from_utf8(data)?.trim_start_matches('\u{feff}');
+    let domains = parse_filter_list(text)?;
+    anyhow::ensure!(
+        !domains.is_empty(),
+        "subscription contains no supported domains"
+    );
+    Ok(domains)
+}
+
 pub async fn refresh_all(engine: &Engine) {
     if let Ok(subscriptions) = engine.store.subscriptions().await {
-        for sub in subscriptions {
+        for sub in subscriptions
+            .into_iter()
+            .filter(|sub| !sub.url.starts_with("upload:"))
+        {
             if let Err(error) = fetch_subscription(engine, sub.id, &sub.url).await {
                 tracing::warn!(%error, url = %sub.url, "subscription refresh failed");
                 let _ = engine

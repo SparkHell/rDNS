@@ -304,6 +304,8 @@ private_key = "localhost.key"
         assert check(call(alice['path'],wire)[0]), 'personal record overrode an administrator local record'
         api(base,'/rules',dict(kind='block',domain=personal_name),token)
         assert rcode(call(alice['path'],query(personal_name))[0])==3, 'personal record bypassed an administrator block'
+        blocked = call(lookup,dict(domain=personal_name,qtype='A'),a)[0]
+        assert blocked['response']['rcode']=='NXDOMAIN' and blocked['block_reason']=='blacklist'
         api(base,'/rules/'+str(next(r['id'] for r in api(base,'/rules',token=token) if r['domain']==personal_name)),token=token,method='DELETE')
         resolved(alice['path'],personal_name,bytes([192,0,2,111]))
         # Keep a resolver using the old credential during rotation.
@@ -433,7 +435,8 @@ private_key = "localhost.key"
         policy['access'].update(mode='whitelist',cidrs=['192.0.2.0/24'])
         api(base,'/features',policy,token,'PUT')
         assert rcode(call(new,wire)[0])==5
-        assert call(lookup,{'domain':'portal.test','qtype':'A'},a)[0]['response']['rcode']=='REFUSED'
+        refused = call(lookup,{'domain':'portal.test','qtype':'A'},a)[0]
+        assert refused['response']['rcode']=='REFUSED' and refused['block_reason']=='client_whitelist'
         server.terminate();server.wait(timeout=10)
         server=start();token=admin_login()
         assert profile(a)['path']==new and admin('settings')['registration']=='closed'

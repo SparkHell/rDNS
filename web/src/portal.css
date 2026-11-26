@@ -552,3 +552,20 @@
   .portal-lookup-form { grid-template-columns: minmax(0, 1.4fr) minmax(84px, 1fr); }
   .portal-personal-switch-list { grid-template-columns: minmax(0, 1fr); }
 }
+
+
+.console-lookup {
+  --portal-edge: #42444a;
+  --portal-field: #25272b;
+  --portal-ink: #f0f2f5;
+  --portal-link: #8abaff;
+  --portal-muted: #b6becb;
+  --portal-primary: #00b24b;
+  --portal-secondary: #245caa;
+  max-width: 780px;
+}
+
+.console-lookup h2 { font-size: 16px; font-weight: 800; }
+.console-lookup .portal-lookup-form .btn { justify-self: start; }
+.portal-rcode.blocked { background: #794047; }
+.dns-block-reason { margin-top: 8px; color: #ffb5bd; font-size: 13px; overflow-wrap: anywhere; }

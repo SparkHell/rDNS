@@ -7,7 +7,7 @@ use crate::{
     features::Features,
     portal::{DnsPreferences, query_policy},
     store::{Rule, RuleInput, Store},
-    upstream::{DohGroup, ResolveMode},
+    upstream::{DohGroup, RecursionCompatibility, ResolveMode},
 };
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -22,7 +22,9 @@ use hickory_resolver::{
     TtlConfig,
     config::ResolverOpts,
     net::{DnsError, NetError},
-    recursor::{DnssecConfig, DnssecPolicy, Recursor, RecursorError, RecursorOptions},
+    recursor::{
+        DnssecConfig, DnssecPolicy, QNameMinimization, Recursor, RecursorError, RecursorOptions,
+    },
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -60,12 +62,28 @@ impl DomainFilter {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilterDecision {
+    Allow,
+    Block(&'static str),
+}
+
+pub(crate) struct QueryAnswer {
+    pub wire: Vec<u8>,
+    pub block_reason: Option<&'static str>,
+    pub duration_ms: f64,
+}
+
 #[derive(Default)]
 struct Policy {
     local: HashMap<String, Vec<Rule>>,
     wild_local: HashMap<String, Vec<Rule>>,
     allow: DomainFilter,
     block: DomainFilter,
+    subscription_blocks: HashSet<String>,
+    imported_exact: HashMap<String, (i64, bool)>,
+    imported_suffix: HashMap<String, (i64, bool)>,
+    imported_patterns: Vec<(i64, bool, regex::Regex)>,
     forward: Vec<(String, SocketAddr)>,
 }
 
@@ -95,8 +113,46 @@ impl Policy {
         })
     }
 
-    fn blocks(&self, domain: &str) -> bool {
-        !self.allow.matches(domain) && self.block.matches(domain)
+    fn filter(&self, domain: &str) -> Option<FilterDecision> {
+        let mut latest = self.imported_exact.get(domain).copied();
+        if !self.imported_suffix.is_empty() {
+            let mut suffix = domain;
+            loop {
+                if let Some(&rule) = self.imported_suffix.get(suffix)
+                    && latest.is_none_or(|current| current.0 < rule.0)
+                {
+                    latest = Some(rule);
+                }
+                let Some((_, parent)) = suffix.split_once('.') else {
+                    break;
+                };
+                suffix = parent;
+            }
+        }
+        for (id, block, pattern) in &self.imported_patterns {
+            if latest.is_some_and(|current| current.0 >= *id) {
+                break;
+            }
+            if pattern.is_match(domain) {
+                latest = Some((*id, *block));
+                break;
+            }
+        }
+        if let Some((_, block)) = latest {
+            return Some(if block {
+                FilterDecision::Block("imported_rule")
+            } else {
+                FilterDecision::Allow
+            });
+        }
+        if self.allow.matches(domain) {
+            Some(FilterDecision::Allow)
+        } else if self.block.matches(domain) {
+            Some(FilterDecision::Block("blacklist"))
+        } else {
+            matches_domain(&self.subscription_blocks, domain)
+                .then_some(FilterDecision::Block("subscription"))
+        }
     }
 }
 
@@ -228,6 +284,22 @@ impl Engine {
         let (rules, domains) = self.store.policy_snapshot().await?;
         let mut policy = Policy::default();
         for rule in rules {
+            if let Some(match_type) = rule.filter_match.as_deref() {
+                let block = rule.kind == "block";
+                match match_type {
+                    "DOMAIN" => {
+                        policy.imported_exact.insert(rule.domain, (rule.id, block));
+                    }
+                    "DOMAIN-SUFFIX" => {
+                        policy.imported_suffix.insert(rule.domain, (rule.id, block));
+                    }
+                    _ => {
+                        let pattern = imported_domain_pattern(match_type, &rule.domain)?;
+                        policy.imported_patterns.push((rule.id, block, pattern));
+                    }
+                }
+                continue;
+            }
             match rule.kind.as_str() {
                 "local" => {
                     if let Some(suffix) = rule.domain.strip_prefix("*.") {
@@ -258,7 +330,10 @@ impl Engine {
                 _ => {}
             }
         }
-        policy.block.suffixes.extend(domains);
+        policy.subscription_blocks.extend(domains);
+        policy
+            .imported_patterns
+            .sort_unstable_by_key(|rule| std::cmp::Reverse(rule.0));
         policy.forward.sort_by_key(|(domain, _)| {
             let wildcard = domain.strip_prefix("*.");
             std::cmp::Reverse((wildcard.unwrap_or(domain).len(), wildcard.is_some()))
@@ -341,6 +416,20 @@ impl Engine {
         protocol: &str,
         user_id: Option<i64>,
     ) -> Result<Vec<u8>> {
+        Ok(self
+            .answer_with_diagnostics(wire, peer, protocol, user_id, false)
+            .await?
+            .wire)
+    }
+
+    pub(crate) async fn answer_with_diagnostics(
+        self: &Arc<Self>,
+        wire: &[u8],
+        peer: SocketAddr,
+        protocol: &str,
+        user_id: Option<i64>,
+        test_adguard: bool,
+    ) -> Result<QueryAnswer> {
         let started = Instant::now();
         let request = Message::from_vec(wire).context("invalid DNS message")?;
         let mut response = response(&request, ResponseCode::NoError);
@@ -349,12 +438,20 @@ impl Engine {
             || request.queries.len() != 1
         {
             response.metadata.response_code = ResponseCode::FormErr;
-            return Ok(response.to_vec()?);
+            return Ok(QueryAnswer {
+                wire: response.to_vec()?,
+                block_reason: None,
+                duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            });
         }
         let query = request.queries[0].clone();
         if query.query_class() != DNSClass::IN {
             response.metadata.response_code = ResponseCode::Refused;
-            return Ok(response.to_vec()?);
+            return Ok(QueryAnswer {
+                wire: response.to_vec()?,
+                block_reason: None,
+                duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            });
         }
         let domain = if query.name().is_root() {
             ".".to_owned()
@@ -372,19 +469,29 @@ impl Engine {
         let access = runtime.access.decide(peer.ip(), &location);
         let personal = match user_id.filter(|_| access.is_ok()) {
             Some(user) => query_policy(&self.store.pool, user, &domain).await?,
-            None => Some((DnsPreferences::default(), Vec::new())),
+            None => Some((
+                DnsPreferences {
+                    adguard: test_adguard,
+                    ..Default::default()
+                },
+                Vec::new(),
+            )),
         };
         let inactive = personal.is_none();
         let (preferences, personal_records) = personal.unwrap_or_default();
         let forward_target = policy.forward_target(&domain);
+        let filter = policy.filter(&domain);
         let mut selected_upstream = None;
         let outcome;
+        let mut block_reason = None;
         if let Err(reason) = access {
             response.metadata.response_code = ResponseCode::Refused;
             outcome = reason;
+            block_reason = Some(reason);
         } else if inactive {
             response.metadata.response_code = ResponseCode::Refused;
             outcome = "refused";
+            block_reason = Some("inactive_account");
         } else if let Some(records) = policy.local_records(&domain) {
             answer_local(
                 &mut response,
@@ -399,9 +506,10 @@ impl Engine {
                 }),
             )?;
             outcome = "local";
-        } else if policy.blocks(&domain) {
+        } else if let Some(FilterDecision::Block(reason)) = filter {
             response.metadata.response_code = ResponseCode::NXDomain;
             outcome = "blocked";
+            block_reason = Some(reason);
         } else if forward_target.is_none() && !personal_records.is_empty() {
             answer_local(
                 &mut response,
@@ -418,11 +526,12 @@ impl Engine {
             outcome = "personal_local";
         } else if preferences.adguard
             && runtime.settings.adguard.enabled
-            && !policy.allow.matches(&domain)
+            && filter != Some(FilterDecision::Allow)
             && self.features.ads.load().blocks(&domain)
         {
             response.metadata.response_code = ResponseCode::NXDomain;
             outcome = "blocked";
+            block_reason = Some("adguard");
         } else if let Some(upstream) = forward_target {
             let _foreground = self.begin_foreground(true);
             let budget = Duration::from_millis(runtime.settings.resolution.timeout_ms);
@@ -519,7 +628,11 @@ impl Engine {
         {
             tracing::warn!(%error, "query log write failed");
         }
-        Ok(wire)
+        Ok(QueryAnswer {
+            wire,
+            block_reason,
+            duration_ms,
+        })
     }
     async fn routed_lookup(
         &self,
@@ -539,9 +652,37 @@ impl Engine {
         } else {
             settings.resolution.mode.clone()
         };
+        let strict = settings.resolution.recursion_compatibility == RecursionCompatibility::Strict;
+        let qtype = request.queries[0].query_type();
         let lookup = async {
             match mode {
-                ResolveMode::Recursive => self.recursive_lookup(request, true).await,
+                ResolveMode::Recursive if strict => {
+                    let doh = group
+                        .context("missing upstream group")
+                        .map_err(|_| LookupFailure::Unavailable)?;
+                    let total = Duration::from_millis(settings.resolution.timeout_ms);
+                    let reserve = doh.timeout().min(total / 2);
+                    let recursive = tokio::time::timeout(
+                        total - reserve,
+                        self.recursive_lookup(request, false, true),
+                    )
+                    .await
+                    .unwrap_or(Err(LookupFailure::Unavailable));
+                    if recursive
+                        .as_ref()
+                        .is_ok_and(|answer| answer.has_answer(qtype))
+                    {
+                        return recursive;
+                    }
+                    let fallback = tokio::time::timeout(
+                        reserve,
+                        doh_lookup(doh, request.clone(), settings.resolution.validate_dnssec),
+                    )
+                    .await
+                    .unwrap_or(Err(LookupFailure::Unavailable));
+                    fallback_answer(recursive, fallback, qtype)
+                }
+                ResolveMode::Recursive => self.recursive_lookup(request, true, false).await,
                 ResolveMode::Doh => {
                     let primary = group
                         .context("missing upstream group")
@@ -590,9 +731,14 @@ impl Engine {
                         .context("missing upstream group")
                         .map_err(|_| LookupFailure::Unavailable)?;
                     prefer_recursive(
-                        self.recursive_lookup(request, false),
-                        doh_lookup(doh, request.clone(), false),
+                        self.recursive_lookup(request, false, strict),
+                        doh_lookup(
+                            doh,
+                            request.clone(),
+                            strict && settings.resolution.validate_dnssec,
+                        ),
                         Duration::from_millis(settings.resolution.priority_ms),
+                        strict.then_some(qtype),
                     )
                     .await
                 }
@@ -615,6 +761,7 @@ impl Engine {
         &self,
         request: &Message,
         allow_unverified: bool,
+        strict: bool,
     ) -> Result<Resolved, LookupFailure> {
         let recursors = if crate::cache::bypass_cache(request) {
             match build_recursor(&self.roots, &self.cache) {
@@ -627,7 +774,12 @@ impl Engine {
         } else {
             self.recursor.load_full()
         };
-        match Self::resolve_recursive(&recursors.validating, request).await {
+        let validating = if strict {
+            &recursors.strict
+        } else {
+            &recursors.relaxed
+        };
+        match Self::resolve_recursive(validating, request).await {
             Err(LookupFailure::Dnssec(code)) if allow_unverified => {
                 let mut answer = Self::resolve_recursive(&recursors.unverified, request)
                     .await
@@ -706,6 +858,29 @@ struct Resolved {
     dnssec_warning: Option<DnssecFailure>,
 }
 
+impl Resolved {
+    fn has_answer(&self, qtype: RecordType) -> bool {
+        self.message.metadata.response_code == ResponseCode::NoError
+            && self
+                .message
+                .answers
+                .iter()
+                .any(|record| qtype == RecordType::ANY || record.record_type() == qtype)
+    }
+}
+
+fn fallback_answer(
+    recursive: Result<Resolved, LookupFailure>,
+    doh: Result<Resolved, LookupFailure>,
+    qtype: RecordType,
+) -> Result<Resolved, LookupFailure> {
+    match (recursive, doh) {
+        (_, Ok(answer)) if answer.has_answer(qtype) => Ok(answer),
+        (Ok(answer), _) | (Err(_), Ok(answer)) => Ok(answer),
+        (Err(error), Err(_)) => Err(error),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LookupFailure {
     Unavailable,
@@ -768,6 +943,7 @@ async fn prefer_recursive<R, D>(
     recursive: R,
     doh: D,
     priority: Duration,
+    fallback_for: Option<RecordType>,
 ) -> Result<Resolved, LookupFailure>
 where
     R: std::future::Future<Output = Result<Resolved, LookupFailure>>,
@@ -776,44 +952,45 @@ where
     tokio::pin!(recursive, doh);
     let deadline = tokio::time::sleep(priority);
     tokio::pin!(deadline);
-    let mut recursive_failure = None;
-    let mut doh_pending = true;
+    let mut recursive_result = None;
+    let mut doh_result = None;
     let mut elapsed = false;
-    let mut ready = None;
+    let usable = |answer: &Resolved| fallback_for.is_none_or(|qtype| answer.has_answer(qtype));
     loop {
         tokio::select! {
             biased;
-            result = &mut recursive, if recursive_failure.is_none() => {
-                let failure = match result {
-                    Ok(answer) => return Ok(answer),
-                    Err(failure) => failure,
-                };
-                if let Some(answer) = ready.take() { return Ok(answer); }
-                if !doh_pending { return Err(failure); }
-                recursive_failure = Some(failure);
-            }
-            result = &mut doh, if doh_pending => {
-                doh_pending = false;
-                match result {
-                    Ok(answer) if recursive_failure.is_some() || elapsed => return Ok(answer),
-                    Ok(answer) => ready = Some(answer),
-                    Err(_) => {
-                        if let Some(failure) = recursive_failure {
-                            return Err(failure);
-                        }
-                    }
+            result = &mut recursive, if recursive_result.is_none() => {
+                if result.as_ref().is_ok_and(usable) {
+                    return result;
                 }
+                recursive_result = Some(result);
             }
-            _ = &mut deadline, if !elapsed => {
-                elapsed = true;
-                if let Some(answer) = ready.take() { return Ok(answer); }
+            result = &mut doh, if doh_result.is_none() => {
+                doh_result = Some(result);
             }
+            _ = &mut deadline, if !elapsed => elapsed = true,
+        }
+
+        match (&recursive_result, &doh_result) {
+            (Some(_), Some(_)) => {
+                let recursive = recursive_result.take().unwrap();
+                let doh = doh_result.take().unwrap();
+                return match fallback_for {
+                    Some(qtype) => fallback_answer(recursive, doh, qtype),
+                    None => doh.or(recursive),
+                };
+            }
+            (None, Some(Ok(_))) if elapsed => {
+                return doh_result.take().unwrap();
+            }
+            _ => {}
         }
     }
 }
 
 struct Recursors {
-    validating: Recursor<CachedProvider>,
+    relaxed: Recursor<CachedProvider>,
+    strict: Recursor<CachedProvider>,
     unverified: Recursor<CachedProvider>,
 }
 
@@ -838,19 +1015,29 @@ fn build_recursor_with_settings(
         cache_policy: TtlConfig::from_opts(&resolver_options),
         ..RecursorOptions::default()
     };
-    let build = |policy| {
+    let build = |policy, qname_minimization| {
         Recursor::new(
             roots,
             policy,
             None,
-            options.clone(),
+            RecursorOptions {
+                qname_minimization,
+                ..options.clone()
+            },
             CachedProvider::new(cache.clone(), roots),
         )
         .context("starting recursor")
     };
     Ok(Recursors {
-        validating: build(DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()))?,
-        unverified: build(DnssecPolicy::ValidationDisabled)?,
+        relaxed: build(
+            DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
+            QNameMinimization::Relaxed,
+        )?,
+        strict: build(
+            DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
+            QNameMinimization::Strict,
+        )?,
+        unverified: build(DnssecPolicy::ValidationDisabled, QNameMinimization::Relaxed)?,
     })
 }
 
@@ -1005,6 +1192,132 @@ async fn forward(wire: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
+pub struct ImportedFilter {
+    pub domain: String,
+    pub match_type: &'static str,
+    pub block: bool,
+}
+
+pub(crate) fn domain_glob(pattern: &str) -> String {
+    regex::escape(pattern)
+        .replace("\\*", ".*")
+        .replace("\\?", ".")
+}
+
+pub(crate) fn domain_regex(expression: &str) -> Result<regex::Regex> {
+    Ok(regex::RegexBuilder::new(expression)
+        .case_insensitive(true)
+        .size_limit(1024 * 1024)
+        .build()?)
+}
+
+fn imported_domain_pattern(kind: &str, pattern: &str) -> Result<regex::Regex> {
+    anyhow::ensure!(!pattern.is_empty(), "请填写匹配表达式");
+    match kind {
+        "DOMAIN-WILDCARD" => {
+            anyhow::ensure!(
+                pattern.len() <= 253
+                    && pattern
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b".-*?".contains(&byte)),
+                "通配符域名只支持字母、数字、点、连字符、* 和 ?"
+            );
+            domain_regex(&format!(r"\A(?:{})\z", domain_glob(pattern)))
+        }
+        "DOMAIN-REGEX" => domain_regex(pattern).context("域名正则无效或超出编译限制"),
+        _ => anyhow::bail!("未知的域名匹配类型"),
+    }
+}
+
+pub fn parse_imported_filters(text: &str) -> Result<Vec<ImportedFilter>> {
+    let mut rules = Vec::new();
+    for (index, line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with([';', '!', '#'])
+            || line.starts_with("//")
+            || line.eq_ignore_ascii_case("[Rule]")
+            || line.eq_ignore_ascii_case("rules:")
+        {
+            continue;
+        }
+        let rule = parse_imported_filter(line)
+            .with_context(|| format!("第 {} 行", index + 1))
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        rules.push(rule);
+    }
+    anyhow::ensure!(!rules.is_empty(), "请至少输入一条过滤规则");
+    let mut seen = HashSet::new();
+    rules.reverse();
+    rules.retain(|rule| seen.insert((rule.match_type, rule.domain.clone())));
+    rules.reverse();
+    Ok(rules)
+}
+
+fn parse_imported_filter(line: &str) -> Result<ImportedFilter> {
+    let line = line
+        .find(" #")
+        .map_or(line, |index| &line[..index])
+        .trim_end();
+    let entry = line.strip_prefix('-').unwrap_or(line).trim();
+    let entry = ['\'', '"']
+        .into_iter()
+        .find_map(|quote| entry.strip_prefix(quote)?.strip_suffix(quote))
+        .unwrap_or(entry);
+    let (kind, fields) = entry
+        .split_once(',')
+        .context("请使用 匹配类型,匹配值,策略")?;
+    let (hostname, action) = fields
+        .rsplit_once(',')
+        .context("请使用 匹配类型,匹配值,策略")?;
+    let hostname = hostname.trim();
+    let match_type = match kind.trim().to_ascii_uppercase().as_str() {
+        "DOMAIN" => "DOMAIN",
+        "DOMAIN-SUFFIX" => "DOMAIN-SUFFIX",
+        "DOMAIN-WILDCARD" => "DOMAIN-WILDCARD",
+        "DOMAIN-REGEX" => "DOMAIN-REGEX",
+        _ => anyhow::bail!("匹配类型只支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-WILDCARD 和 DOMAIN-REGEX"),
+    };
+    let block = match action.trim().to_ascii_uppercase().as_str() {
+        "REJECT" => true,
+        "DIRECT" => false,
+        _ => anyhow::bail!("策略只支持 REJECT 和 DIRECT"),
+    };
+    if matches!(match_type, "DOMAIN-WILDCARD" | "DOMAIN-REGEX") {
+        let domain = if match_type == "DOMAIN-WILDCARD" {
+            hostname.trim_end_matches('.').to_ascii_lowercase()
+        } else {
+            hostname.to_owned()
+        };
+        imported_domain_pattern(match_type, &domain)?;
+        return Ok(ImportedFilter {
+            domain,
+            match_type,
+            block,
+        });
+    }
+    anyhow::ensure!(
+        hostname
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte))
+            && hostname.parse::<IpAddr>().is_err(),
+        "请填写有效域名"
+    );
+    let domain = normalize_domain(hostname).context("请填写有效域名")?;
+    anyhow::ensure!(
+        domain.parse::<IpAddr>().is_err()
+            && domain
+                .split('.')
+                .all(|label| !label.starts_with('-') && !label.ends_with('-')),
+        "请填写有效域名"
+    );
+    Ok(ImportedFilter {
+        domain,
+        match_type,
+        block,
+    })
+}
+
 pub fn parse_filter_list(text: &str) -> Result<Vec<String>> {
     let mut domains = HashSet::new();
     for line in text.lines() {
@@ -1060,6 +1373,7 @@ mod tests {
             async { ready("recursive") },
             async { ready("doh") },
             Duration::from_millis(20),
+            None,
         )
         .await
         .unwrap();
@@ -1069,6 +1383,7 @@ mod tests {
             std::future::pending(),
             async { ready("doh") },
             Duration::from_millis(30),
+            None,
         )
         .await
         .unwrap();
@@ -1078,6 +1393,7 @@ mod tests {
             async { Err(LookupFailure::Unavailable) },
             async { ready("doh") },
             Duration::from_secs(1),
+            None,
         )
         .await
         .unwrap();
@@ -1088,6 +1404,7 @@ mod tests {
                 async { Err(failure) },
                 async { ready("doh") },
                 Duration::from_secs(1),
+                None,
             )
             .await
             .unwrap();
@@ -1097,6 +1414,7 @@ mod tests {
                 async { Err(failure) },
                 async { Err(LookupFailure::Unavailable) },
                 Duration::from_secs(1),
+                None,
             )
             .await;
             assert!(matches!(result, Err(error) if error == failure));
@@ -1108,10 +1426,50 @@ mod tests {
             },
             async { Err(LookupFailure::Unavailable) },
             Duration::from_millis(1),
+            None,
         )
         .await
         .unwrap();
         assert_eq!(result.outcome, "recursive");
+    }
+
+    #[tokio::test]
+    async fn strict_recursion_tries_doh_when_requested_records_are_missing() {
+        let qtype = RecordType::A;
+        let doh_answer = || {
+            let mut answer = ready("doh").unwrap();
+            answer.message.add_answer(Record::from_rdata(
+                Name::from_ascii("resolved.test.").unwrap(),
+                60,
+                RData::A(A("192.0.2.1".parse().unwrap())),
+            ));
+            Ok(answer)
+        };
+        for rcode in [ResponseCode::NXDomain, ResponseCode::NoError] {
+            let recursive_negative = || {
+                let mut answer = ready("recursive").unwrap();
+                answer.message.metadata.response_code = rcode;
+                answer.message.add_answer(Record::from_rdata(
+                    Name::from_ascii("alias.test.").unwrap(),
+                    60,
+                    RData::CNAME(CNAME(Name::from_ascii("resolved.test.").unwrap())),
+                ));
+                Ok(answer)
+            };
+            let result = prefer_recursive(
+                async { recursive_negative() },
+                async { doh_answer() },
+                Duration::from_secs(1),
+                Some(qtype),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.outcome, "doh");
+            let result =
+                fallback_answer(recursive_negative(), Err(LookupFailure::Unavailable), qtype)
+                    .unwrap();
+            assert_eq!(result.message.metadata.response_code, rcode);
+        }
     }
     #[test]
     fn filtering_parses_hosts_and_adblock_domains() {
