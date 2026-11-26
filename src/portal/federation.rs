@@ -114,6 +114,17 @@ fn client() -> Result<Client> {
     Ok(HTTP.get_or_init(|| client).clone())
 }
 async fn discover(p: &Provider, http: &Client) -> Result<CoreProviderMetadata> {
+    static CACHE: std::sync::OnceLock<moka::sync::Cache<String, CoreProviderMetadata>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        moka::sync::Cache::builder()
+            .max_capacity(128)
+            .time_to_live(std::time::Duration::from_secs(3600))
+            .build()
+    });
+    if let Some(meta) = cache.get(&p.issuer) {
+        return Ok(meta);
+    }
     let meta = CoreProviderMetadata::discover_async(
         IssuerUrl::new(p.issuer.clone()).map_err(upstream)?,
         http,
@@ -126,6 +137,7 @@ async fn discover(p: &Provider, http: &Client) -> Result<CoreProviderMetadata> {
             .ok_or_else(|| bad("缺少令牌端点"))?
             .as_str(),
     )?;
+    cache.insert(p.issuer.clone(), meta.clone());
     Ok(meta)
 }
 const BROWSER: &str = "__Host-rdns-flow";

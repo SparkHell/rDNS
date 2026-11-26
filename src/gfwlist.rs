@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use regex::Regex;
+use regex::{Regex, RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -30,9 +30,51 @@ impl Default for GfwSettings {
 }
 
 #[derive(Default)]
+struct RulesBuilder {
+    domains: HashSet<String>,
+    wildcards: Vec<String>,
+    expressions: Vec<String>,
+}
+
+impl RulesBuilder {
+    fn build(self) -> Rules {
+        let compile = |patterns: Vec<String>| -> (RegexSet, Vec<Regex>) {
+            if patterns.is_empty() {
+                return (RegexSet::empty(), Vec::new());
+            }
+            match RegexSetBuilder::new(&patterns)
+                .size_limit(32 * 1024 * 1024)
+                .dfa_size_limit(32 * 1024 * 1024)
+                .build()
+            {
+                Ok(set) => (set, Vec::new()),
+                Err(_) => (
+                    RegexSet::empty(),
+                    patterns
+                        .into_iter()
+                        .filter_map(|p| Regex::new(&p).ok())
+                        .collect(),
+                ),
+            }
+        };
+        let (wildcard_set, wildcards) = compile(self.wildcards);
+        let (expression_set, expressions) = compile(self.expressions);
+        Rules {
+            domains: self.domains,
+            wildcard_set,
+            wildcards,
+            expression_set,
+            expressions,
+        }
+    }
+}
+
+#[derive(Default)]
 struct Rules {
     domains: HashSet<String>,
+    wildcard_set: RegexSet,
     wildcards: Vec<Regex>,
+    expression_set: RegexSet,
     expressions: Vec<Regex>,
 }
 impl Rules {
@@ -47,11 +89,20 @@ impl Rules {
                 None => break,
             }
         }
-        self.wildcards.iter().any(|r| r.is_match(domain))
-            || self.expressions.iter().any(|r| {
-                r.is_match(&format!("https://{domain}/"))
-                    || r.is_match(&format!("http://{domain}/"))
-            })
+        if self.wildcard_set.is_match(domain) || self.wildcards.iter().any(|r| r.is_match(domain)) {
+            return true;
+        }
+        if !self.expression_set.is_empty() || !self.expressions.is_empty() {
+            let https = format!("https://{domain}/");
+            let http = format!("http://{domain}/");
+            return self.expression_set.is_match(&https)
+                || self.expression_set.is_match(&http)
+                || self
+                    .expressions
+                    .iter()
+                    .any(|r| r.is_match(&https) || r.is_match(&http));
+        }
+        false
     }
 }
 
@@ -80,12 +131,10 @@ impl GfwList {
             text.trim_start().starts_with("[AutoProxy"),
             "AutoProxy header required"
         );
-        let mut list = Self {
-            include: Rules::default(),
-            exclude: Rules::default(),
-            count: 0,
-            skipped: 0,
-        };
+        let mut include = RulesBuilder::default();
+        let mut exclude = RulesBuilder::default();
+        let mut count = 0usize;
+        let mut skipped = 0usize;
         for line in text.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('!') || line.starts_with('[') {
                 continue;
@@ -95,21 +144,20 @@ impl GfwList {
                 .map(|s| (true, s))
                 .unwrap_or((false, line));
             let rules = if exception {
-                &mut list.exclude
+                &mut exclude
             } else {
-                &mut list.include
+                &mut include
             };
             if let Some(rest) = rule.strip_prefix('/') {
                 let Some(pattern) = rest.strip_suffix('/').filter(|s| !s.is_empty()) else {
-                    list.skipped += 1;
+                    skipped += 1;
                     continue;
                 };
-                match Regex::new(pattern) {
-                    Ok(regex) => {
-                        rules.expressions.push(regex);
-                        list.count += 1;
-                    }
-                    Err(_) => list.skipped += 1,
+                if Regex::new(pattern).is_ok() {
+                    rules.expressions.push(pattern.to_owned());
+                    count += 1;
+                } else {
+                    skipped += 1;
                 }
                 continue;
             }
@@ -126,7 +174,7 @@ impl GfwList {
                 .unwrap_or("");
             let rest = &rule[host.len()..];
             if exception && !rest.trim_matches(['/', '^', '|']).is_empty() {
-                list.skipped += 1;
+                skipped += 1;
                 continue;
             }
             if host.len() > 253
@@ -135,27 +183,31 @@ impl GfwList {
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || b".-_*".contains(&c))
             {
-                list.skipped += 1;
+                skipped += 1;
                 continue;
             }
             let host = host.to_ascii_lowercase();
             if host.contains('*') {
                 let expression =
                     format!("(?:^|\\.){}$", regex::escape(&host).replace("\\*", "[^.]*"));
-                match Regex::new(&expression) {
-                    Ok(regex) => rules.wildcards.push(regex),
-                    Err(_) => {
-                        list.skipped += 1;
-                        continue;
-                    }
+                if Regex::new(&expression).is_ok() {
+                    rules.wildcards.push(expression);
+                } else {
+                    skipped += 1;
+                    continue;
                 }
             } else {
                 rules.domains.insert(host);
             }
-            list.count += 1;
+            count += 1;
         }
-        ensure!(list.count > 0, "GFWList contains no supported rules");
-        Ok(list)
+        ensure!(count > 0, "GFWList contains no supported rules");
+        Ok(Self {
+            include: include.build(),
+            exclude: exclude.build(),
+            count,
+            skipped,
+        })
     }
     pub fn matches(&self, domain: &str) -> bool {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();

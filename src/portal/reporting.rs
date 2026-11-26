@@ -79,24 +79,32 @@ fn filtered<'a>(
 
 fn detail_filtered<'a>(
     columns: &str,
+    from: &str,
     cutoff: &'a str,
     f: &'a Filter,
 ) -> sqlx::QueryBuilder<'a, Sqlite> {
-    let mut query = filtered(columns, cutoff, f);
+    let mut query = sqlx::QueryBuilder::new(format!("SELECT {columns} FROM {from} WHERE q.at >= "));
+    query.push_bind(cutoff);
+    if let Some(user) = f.user {
+        query.push(" AND q.portal_user_id = ").push_bind(user);
+    }
+    if let Some(entry) = &f.entry {
+        query.push(" AND q.entry = ").push_bind(entry);
+    }
     if let Some(search) = &f.search {
         query
-            .push(" AND instr(lower(domain), ")
+            .push(" AND instr(lower(q.domain), ")
             .push_bind(search)
             .push(")>0");
     }
     if let Some(qtype) = &f.qtype {
-        query.push(" AND qtype = ").push_bind(qtype);
+        query.push(" AND q.qtype = ").push_bind(qtype);
     }
     if let Some(outcome) = &f.outcome {
-        query.push(" AND outcome = ").push_bind(outcome);
+        query.push(" AND q.outcome = ").push_bind(outcome);
     }
     if let Some(rcode) = f.rcode {
-        query.push(" AND rcode = ").push_bind(i64::from(rcode));
+        query.push(" AND q.rcode = ").push_bind(i64::from(rcode));
     }
     query
 }
@@ -181,7 +189,7 @@ async fn report(s: &ApiState, mut f: Filter) -> Reply {
         .fetch_all(&mut *tx)
         .await
         .map_err(internal)?;
-    let detail_total: i64 = detail_filtered("COUNT(*)", &cutoff, &f)
+    let detail_total: i64 = detail_filtered("COUNT(*)", "query_log q", &cutoff, &f)
         .build_query_scalar()
         .fetch_one(&mut *tx)
         .await
@@ -193,11 +201,12 @@ async fn report(s: &ApiState, mut f: Filter) -> Reply {
         .await
         .map_err(internal)?;
     let mut logs = detail_filtered(
-        "id,at,domain,qtype,outcome,duration_ms,entry,portal_user_id AS user,rcode,response_wire",
+        "q.id,q.at,q.domain,q.qtype,q.outcome,q.duration_ms,q.entry,q.portal_user_id AS user,q.rcode,COALESCE(qr.response_wire, q.response_wire) AS response_wire",
+        "query_log q LEFT JOIN query_log_responses qr ON qr.query_log_id=q.id",
         &cutoff,
         &f,
     )
-    .push(" ORDER BY id DESC LIMIT 50 OFFSET ")
+    .push(" ORDER BY q.id DESC LIMIT 50 OFFSET ")
     .push_bind((page - 1) * 50)
     .build_query_as::<Detail>()
     .fetch_all(&mut *tx)

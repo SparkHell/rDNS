@@ -1,3 +1,5 @@
+mod doh;
+
 use crate::{
     cache::CacheSettings,
     features::{FeatureSettings, SourceUpdate},
@@ -8,7 +10,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    body::{Bytes, to_bytes},
+    body::to_bytes,
     extract::{
         ConnectInfo, Path, Query, Request, State,
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
@@ -17,9 +19,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+pub(crate) use doh::doh_client;
+pub use doh::doh_router;
 use futures::StreamExt;
-use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -32,19 +34,15 @@ pub struct ApiState {
 }
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
-#[derive(RustEmbed)]
-#[folder = "web/dist/"]
-struct Web;
-
 pub fn admin_router(state: ApiState) -> Router {
     let router = if state.engine.config.doh_on_admin {
-        doh_queries(&state)
+        doh::doh_queries(&state)
     } else {
         Router::new()
     };
     router
         .merge(crate::portal::admin_routes())
-        .merge(portal_pages(crate::portal::EntryPoint {
+        .merge(doh::portal_pages(crate::portal::EntryPoint {
             doh: state.engine.config.doh_on_admin,
             tls: false,
         }))
@@ -53,6 +51,7 @@ pub fn admin_router(state: ApiState) -> Router {
         .route("/api/v1/me", get(me))
         .route("/api/v1/me/password", post(change_password))
         .route("/api/v1/stats", get(stats))
+        .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/logs", get(logs))
         .route("/api/v1/clients", get(clients).put(update_clients))
         .route(
@@ -103,45 +102,10 @@ pub fn admin_router(state: ApiState) -> Router {
             get(certificate_paths).put(update_certificate_paths),
         )
         .route("/api/v1/certificates/reload", post(reload_certificate))
-        .route("/admin", get(index))
-        .route("/admin/", get(index))
-        .route("/{*path}", get(asset))
+        .route("/admin", get(doh::index))
+        .route("/admin/", get(doh::index))
+        .route("/{*path}", get(doh::asset))
         .with_state(state)
-}
-
-pub fn doh_router(state: ApiState) -> Router {
-    doh_queries(&state)
-        .merge(portal_pages(crate::portal::EntryPoint {
-            doh: true,
-            tls: !state.engine.config.doh_http,
-        }))
-        .route(
-            "/assets/{file}",
-            get(|Path(file): Path<String>| async move { serve(&format!("assets/{file}")) }),
-        )
-        .with_state(state)
-}
-
-fn doh_queries(state: &ApiState) -> Router<ApiState> {
-    Router::new()
-        .route("/dns-query", get(doh_get).post(doh_post))
-        .route("/dns/{credential}", get(doh_get).post(doh_post))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::portal::identify_doh,
-        ))
-}
-
-fn portal_pages(entry: crate::portal::EntryPoint) -> Router<ApiState> {
-    Router::new()
-        .merge(crate::portal::routes())
-        .route(
-            "/",
-            get(|| async { axum::response::Redirect::temporary("/portal") }),
-        )
-        .route("/portal", get(index))
-        .route("/portal/", get(index))
-        .layer(axum::Extension(entry))
 }
 
 fn unauthorized() -> (StatusCode, String) {
@@ -192,6 +156,14 @@ struct Credentials {
     password: String,
 }
 async fn login(State(state): State<ApiState>, Json(input): Json<Credentials>) -> ApiResult {
+    let cache = &state.engine.store.portal_cache;
+    let username = input.username.trim();
+    if !crate::portal::check_login_rate_limit(cache, "admin", username) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed login attempts, retry shortly".into(),
+        ));
+    }
     let token = state
         .engine
         .store
@@ -200,6 +172,7 @@ async fn login(State(state): State<ApiState>, Json(input): Json<Credentials>) ->
         .map_err(internal)?;
     match token {
         Some(token) => {
+            crate::portal::clear_login_failures(cache, "admin", username);
             state
                 .engine
                 .store
@@ -209,6 +182,7 @@ async fn login(State(state): State<ApiState>, Json(input): Json<Credentials>) ->
             Ok(Json(json!({"token":token})))
         }
         None => {
+            crate::portal::record_login_failure(cache, "admin", username);
             tokio::time::sleep(Duration::from_millis(300)).await;
             Err(unauthorized())
         }
@@ -258,6 +232,7 @@ async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult 
         .unwrap()
         .trim_start_matches("Bearer ");
     state.engine.store.logout(token).await.map_err(internal)?;
+    state.listeners.publish(json!({"type":"session.check"}));
     state
         .engine
         .store
@@ -274,6 +249,120 @@ async fn me(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
 async fn stats(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
     require(&headers, &state.engine.store, "viewer").await?;
     Ok(Json(state.engine.store.stats().await.map_err(internal)?))
+}
+async fn metrics(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, String)> {
+    require(&headers, &state.engine.store, "viewer").await?;
+    let stats = state.engine.store.stats().await.map_err(internal)?;
+    let cache = state.engine.cache_stats().await;
+    let features = state.engine.features.snapshot(true).await;
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let mut out = String::new();
+    use std::fmt::Write;
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_queries_total counter\nrdns_queries_total {}",
+        stats["total"].as_i64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_queries_blocked_total counter\nrdns_queries_blocked_total {}",
+        stats["blocked"].as_i64().unwrap_or(0)
+    );
+    let _ = writeln!(out, "# TYPE rdns_cache_hits_total counter");
+    let _ = writeln!(
+        out,
+        "rdns_cache_hits_total{{tier=\"memory\"}} {}",
+        cache["memory_hits"].as_u64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "rdns_cache_hits_total{{tier=\"disk\"}} {}",
+        cache["disk_hits"].as_u64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_cache_misses_total counter\nrdns_cache_misses_total {}",
+        cache["misses"].as_u64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_cache_memory_bytes gauge\nrdns_cache_memory_bytes {}",
+        cache["memory_bytes"].as_u64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_cache_memory_entries gauge\nrdns_cache_memory_entries {}",
+        cache["memory_entries"].as_u64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_cache_disk_entries gauge\nrdns_cache_disk_entries {}",
+        cache["disk_entries"].as_i64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_cache_disk_bytes gauge\nrdns_cache_disk_bytes {}",
+        cache["disk_bytes"].as_i64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_process_rss_bytes gauge\nrdns_process_rss_bytes {}",
+        cache["process_rss_bytes"].as_u64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_query_log_queue_depth gauge\nrdns_query_log_queue_depth {}",
+        stats["query_log"]["queue_depth"].as_u64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_query_log_failed_total counter\nrdns_query_log_failed_total {}",
+        stats["query_log"]["failed_entries"].as_u64().unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE rdns_query_log_dropped_total counter\nrdns_query_log_dropped_total {}",
+        stats["query_log"]["dropped_entries"].as_u64().unwrap_or(0)
+    );
+    if let Some(groups) = features["groups"].as_array() {
+        let _ = writeln!(out, "# TYPE rdns_upstream_requests_total counter");
+        let _ = writeln!(out, "# TYPE rdns_upstream_failures_total counter");
+        let _ = writeln!(out, "# TYPE rdns_upstream_cooldown_active gauge");
+        for group in groups {
+            let gname = group["name"].as_str().unwrap_or("");
+            if let Some(servers) = group["servers"].as_array() {
+                for srv in servers {
+                    let url = srv["url"].as_str().unwrap_or("");
+                    let req = srv["requests"].as_u64().unwrap_or(0);
+                    let fail = srv["failures"].as_u64().unwrap_or(0);
+                    let cool = u64::from(srv["cooldown_until"].as_u64().unwrap_or(0) > now);
+                    let _ = writeln!(
+                        out,
+                        "rdns_upstream_requests_total{{group=\"{gname}\",url=\"{url}\"}} {req}"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "rdns_upstream_failures_total{{group=\"{gname}\",url=\"{url}\"}} {fail}"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "rdns_upstream_cooldown_active{{group=\"{gname}\",url=\"{url}\"}} {cool}"
+                    );
+                }
+            }
+        }
+    }
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response())
 }
 async fn logs(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult {
     require(&headers, &state.engine.store, "viewer").await?;
@@ -760,13 +849,24 @@ async fn websocket_session(state: ApiState, mut socket: WebSocket) {
     {
         return;
     }
+    let mut last_auth_check = tokio::time::Instant::now();
     loop {
         tokio::select! {
             event = events.recv() => {
-                let Some(account) = websocket_account(&mut socket, &state, token).await else { return; };
-                // Reconnecting delivers fresh snapshots if a slow subscriber missed an update.
                 let Ok(event) = event else { return; };
                 let value: Value = serde_json::from_str(&event).unwrap_or_default();
+                let check_now = value["type"] == "session.check"
+                    || last_auth_check.elapsed() >= Duration::from_secs(60);
+                if check_now {
+                    if websocket_account(&mut socket, &state, token).await.is_none() {
+                        return;
+                    }
+                    last_auth_check = tokio::time::Instant::now();
+                }
+                if value["type"] == "session.check" {
+                    continue;
+                }
+                // Reconnecting delivers fresh snapshots if a slow subscriber missed an update.
                 let event = if value["type"] == "features.changed" { state.engine.features.snapshot(account.role == "admin").await.to_string() } else { event };
                 if socket.send(WsMessage::Text(event.into())).await.is_err() { return; }
             }
@@ -776,6 +876,7 @@ async fn websocket_session(state: ApiState, mut socket: WebSocket) {
                 if !["listeners.update", "cache.update", "features.update", "gfwlist.refresh", "geoip.refresh"].iter().any(|kind| value["type"] == *kind) { continue; }
                 let request_id = value["request_id"].clone();
                 let Some(account) = websocket_account(&mut socket, &state, token).await else { return; };
+                last_auth_check = tokio::time::Instant::now();
                 let result = if account.role == "admin" {
                     if value["type"] == "listeners.update" {
                         match serde_json::from_value::<ListenerSettings>(value["settings"].clone()) {
@@ -1222,150 +1323,18 @@ async fn update_certificate_paths(
     }
 }
 
-#[derive(Deserialize)]
-struct DohQuery {
-    dns: String,
-}
-async fn doh_get(
-    State(state): State<ApiState>,
-    axum::Extension(user): axum::Extension<Option<i64>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Query(input): Query<DohQuery>,
-) -> Response {
-    let Ok(wire) = URL_SAFE_NO_PAD.decode(input.dns.as_bytes()) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let forwarded = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok());
-    doh_answer(state, peer, user, forwarded, &wire).await
-}
-async fn doh_post(
-    State(state): State<ApiState>,
-    axum::Extension(user): axum::Extension<Option<i64>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        != Some("application/dns-message")
-    {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
-    }
-    let forwarded = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok());
-    doh_answer(state, peer, user, forwarded, &body).await
-}
-async fn doh_answer(
-    state: ApiState,
-    peer: SocketAddr,
-    user: Option<i64>,
-    forwarded: Option<&str>,
-    wire: &[u8],
-) -> Response {
-    if wire.len() > 65535 {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let peer = doh_client(&state, peer, forwarded);
-    match state.engine.answer_for(wire, peer, "doh", user).await {
-        Ok(answer) => (
-            [
-                (header::CONTENT_TYPE, "application/dns-message"),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            answer,
-        )
-            .into_response(),
-        Err(_) => StatusCode::BAD_REQUEST.into_response(),
-    }
-}
-
-pub(crate) fn doh_client(
-    state: &ApiState,
-    peer: SocketAddr,
-    forwarded: Option<&str>,
-) -> SocketAddr {
-    let ip = state
-        .engine
-        .features
-        .current
-        .load()
-        .access
-        .client_ip(peer.ip(), forwarded);
-    SocketAddr::new(ip, peer.port())
-}
-
-async fn index() -> Response {
-    serve("index.html")
-}
-async fn asset(Path(path): Path<String>) -> Response {
-    serve(&path)
-}
-fn serve(path: &str) -> Response {
-    if path.contains("..") || path.starts_with('/') {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let path = if Web::get(path).is_some() {
-        path
-    } else if path.contains('.')
-        || path.starts_with("api/")
-        || path.starts_with("portal/")
-        || path.starts_with("dns/")
-        || path.starts_with("dns-")
-    {
-        return StatusCode::NOT_FOUND.into_response();
-    } else {
-        "index.html"
-    };
-    let Some(asset) = Web::get(path) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let mime = if path.ends_with(".js") {
-        "text/javascript"
-    } else if path.ends_with(".css") {
-        "text/css"
-    } else if path.ends_with(".svg") {
-        "image/svg+xml"
-    } else if path.ends_with(".woff2") {
-        "font/woff2"
-    } else if path.ends_with(".list") {
-        "text/plain; charset=utf-8"
-    } else {
-        "text/html"
-    };
-    (
-        [
-            (header::CONTENT_TYPE, mime),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        asset.data.to_vec(),
-    )
-        .into_response()
-}
-
 pub async fn fetch_subscription(engine: &Engine, id: i64, url: &str) -> anyhow::Result<usize> {
     anyhow::ensure!(url.starts_with("https://"), "HTTPS URL required");
     let runtime = engine.features.current.load_full();
-    let client =
-        crate::upstream::http_client(&engine.config, runtime.settings.subscription_proxy())?
-            .timeout(Duration::from_secs(20))
-            .build()?;
-    let response = client.get(url).send().await?.error_for_status()?;
-    let mut stream = response.bytes_stream();
-    let mut data = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        anyhow::ensure!(
-            data.len() + chunk.len() <= 10 * 1024 * 1024,
-            "subscription exceeds 10 MiB"
-        );
-        data.extend_from_slice(&chunk);
-    }
-    let domains = parse_subscription_domains(&data)?;
+    let data = crate::upstream::download_with_timeout(
+        &engine.config,
+        url,
+        runtime.settings.subscription_proxy(),
+        10 * 1024 * 1024,
+        Duration::from_secs(20),
+    )
+    .await?;
+    let domains = tokio::task::spawn_blocking(move || parse_subscription_domains(&data)).await??;
     engine
         .store
         .replace_subscription_domains(id, &domains)

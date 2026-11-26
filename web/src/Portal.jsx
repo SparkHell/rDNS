@@ -356,6 +356,9 @@ export function Portal() {
       ) : !user ? (
         <section className="panel portal-login">
           <h1>{signup ? '注册账户' : '登录用户门户'}</h1>
+          {typeof window !== 'undefined' && !window.isSecureContext && (
+            <p role="alert" className="notice error">当前通过非 HTTPS 地址访问，浏览器将拦截门户登录 Cookie。请改用 HTTPS 或本机地址（127.0.0.1 / localhost）访问。</p>
+          )}
           <div className="portal-methods">
             {passwordEnabled && <button type="button" aria-pressed={!signup && !emailSelected} onClick={()=>selectMethod('password')}>账号登录</button>}
             {options.email && <button type="button" aria-pressed={Boolean(emailSelected)} onClick={()=>selectMethod('email')}>邮箱验证码登录</button>}

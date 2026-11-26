@@ -1,3 +1,4 @@
+mod policy;
 mod prefetch;
 mod umbrella;
 mod warmup;
@@ -6,17 +7,14 @@ use crate::{
     config::Config,
     features::Features,
     portal::{DnsPreferences, query_policy},
-    store::{Rule, RuleInput, Store},
+    store::{RuleInput, Store},
     upstream::{DohGroup, RecursionCompatibility, ResolveMode},
 };
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use hickory_proto::{
     op::{Edns, Message, MessageType, OpCode, ResponseCode},
-    rr::{
-        DNSClass, Name, RData, Record, RecordType,
-        rdata::{A, AAAA, CNAME, TXT, opt::EdnsOption},
-    },
+    rr::{DNSClass, Name, RData, Record, RecordType, rdata::opt::EdnsOption},
 };
 use hickory_resolver::{
     TtlConfig,
@@ -26,134 +24,20 @@ use hickory_resolver::{
         DnssecConfig, DnssecPolicy, QNameMinimization, Recursor, RecursorError, RecursorOptions,
     },
 };
+use policy::{FilterDecision, Policy, answer_local, forward};
+pub use policy::{ImportedFilter, parse_filter_list, parse_imported_filters};
+pub(crate) use policy::{domain_glob, domain_regex, matches_domain, normalize_domain};
 use std::{
-    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
-};
 pub use warmup::CacheJobInput;
-
-#[derive(Default)]
-struct DomainFilter {
-    suffixes: HashSet<String>,
-    wildcards: HashSet<String>,
-}
-
-impl DomainFilter {
-    fn insert(&mut self, name: String) {
-        if let Some(suffix) = name.strip_prefix("*.") {
-            self.wildcards.insert(suffix.to_owned());
-        } else {
-            self.suffixes.insert(name);
-        }
-    }
-
-    fn matches(&self, domain: &str) -> bool {
-        matches_domain(&self.suffixes, domain)
-            || (!self.wildcards.is_empty()
-                && domain
-                    .split_once('.')
-                    .is_some_and(|(_, suffix)| matches_domain(&self.wildcards, suffix)))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FilterDecision {
-    Allow,
-    Block(&'static str),
-}
 
 pub(crate) struct QueryAnswer {
     pub wire: Vec<u8>,
     pub block_reason: Option<&'static str>,
     pub duration_ms: f64,
-}
-
-#[derive(Default)]
-struct Policy {
-    local: HashMap<String, Vec<Rule>>,
-    wild_local: HashMap<String, Vec<Rule>>,
-    allow: DomainFilter,
-    block: DomainFilter,
-    subscription_blocks: HashSet<String>,
-    imported_exact: HashMap<String, (i64, bool)>,
-    imported_suffix: HashMap<String, (i64, bool)>,
-    imported_patterns: Vec<(i64, bool, regex::Regex)>,
-    forward: Vec<(String, SocketAddr)>,
-}
-
-impl Policy {
-    fn local_records(&self, domain: &str) -> Option<&[Rule]> {
-        if let Some(records) = self.local.get(domain) {
-            return Some(records);
-        }
-        let mut name = domain;
-        while let Some((_, suffix)) = name.split_once('.') {
-            if let Some(records) = self.wild_local.get(suffix) {
-                return Some(records);
-            }
-            name = suffix;
-        }
-        None
-    }
-
-    fn forward_target(&self, domain: &str) -> Option<SocketAddr> {
-        self.forward.iter().find_map(|(pattern, target)| {
-            let wildcard = pattern.strip_prefix("*.");
-            let suffix = wildcard.unwrap_or(pattern);
-            let subdomain = domain
-                .strip_suffix(suffix)
-                .is_some_and(|prefix| prefix.ends_with('.'));
-            (subdomain || (wildcard.is_none() && domain == suffix)).then_some(*target)
-        })
-    }
-
-    fn filter(&self, domain: &str) -> Option<FilterDecision> {
-        let mut latest = self.imported_exact.get(domain).copied();
-        if !self.imported_suffix.is_empty() {
-            let mut suffix = domain;
-            loop {
-                if let Some(&rule) = self.imported_suffix.get(suffix)
-                    && latest.is_none_or(|current| current.0 < rule.0)
-                {
-                    latest = Some(rule);
-                }
-                let Some((_, parent)) = suffix.split_once('.') else {
-                    break;
-                };
-                suffix = parent;
-            }
-        }
-        for (id, block, pattern) in &self.imported_patterns {
-            if latest.is_some_and(|current| current.0 >= *id) {
-                break;
-            }
-            if pattern.is_match(domain) {
-                latest = Some((*id, *block));
-                break;
-            }
-        }
-        if let Some((_, block)) = latest {
-            return Some(if block {
-                FilterDecision::Block("imported_rule")
-            } else {
-                FilterDecision::Allow
-            });
-        }
-        if self.allow.matches(domain) {
-            Some(FilterDecision::Allow)
-        } else if self.block.matches(domain) {
-            Some(FilterDecision::Block("blacklist"))
-        } else {
-            matches_domain(&self.subscription_blocks, domain)
-                .then_some(FilterDecision::Block("subscription"))
-        }
-    }
 }
 
 pub(crate) fn record_type_label(kind: RecordType) -> String {
@@ -282,122 +166,13 @@ impl Engine {
     pub async fn reload_policy(&self) -> Result<()> {
         let _guard = self.policy_reload.lock().await;
         let (rules, domains) = self.store.policy_snapshot().await?;
-        let mut policy = Policy::default();
-        for rule in rules {
-            if let Some(match_type) = rule.filter_match.as_deref() {
-                let block = rule.kind == "block";
-                match match_type {
-                    "DOMAIN" => {
-                        policy.imported_exact.insert(rule.domain, (rule.id, block));
-                    }
-                    "DOMAIN-SUFFIX" => {
-                        policy.imported_suffix.insert(rule.domain, (rule.id, block));
-                    }
-                    _ => {
-                        let pattern = imported_domain_pattern(match_type, &rule.domain)?;
-                        policy.imported_patterns.push((rule.id, block, pattern));
-                    }
-                }
-                continue;
-            }
-            match rule.kind.as_str() {
-                "local" => {
-                    if let Some(suffix) = rule.domain.strip_prefix("*.") {
-                        policy
-                            .wild_local
-                            .entry(suffix.to_owned())
-                            .or_default()
-                            .push(rule);
-                    } else {
-                        policy
-                            .local
-                            .entry(rule.domain.clone())
-                            .or_default()
-                            .push(rule);
-                    }
-                }
-                "allow" => {
-                    policy.allow.insert(rule.domain);
-                }
-                "block" => {
-                    policy.block.insert(rule.domain);
-                }
-                "forward" => {
-                    if let Some(value) = &rule.value {
-                        policy.forward.push((rule.domain, value.parse()?));
-                    }
-                }
-                _ => {}
-            }
-        }
-        policy.subscription_blocks.extend(domains);
-        policy
-            .imported_patterns
-            .sort_unstable_by_key(|rule| std::cmp::Reverse(rule.0));
-        policy.forward.sort_by_key(|(domain, _)| {
-            let wildcard = domain.strip_prefix("*.");
-            std::cmp::Reverse((wildcard.unwrap_or(domain).len(), wildcard.is_some()))
-        });
+        let policy = Policy::compile(rules, domains)?;
         self.policy.store(Arc::new(policy));
         Ok(())
     }
 
     pub fn validate_rule(input: &RuleInput) -> Result<RuleInput> {
-        let domain = input.domain.trim();
-        let normalized = match domain.strip_prefix("*.") {
-            Some(suffix) if !suffix.starts_with(char::is_whitespace) => {
-                normalize_domain(suffix).map(|suffix| format!("*.{suffix}"))
-            }
-            _ => normalize_domain(domain),
-        }
-        .map_err(|_| anyhow::anyhow!("请填写有效域名，通配符只支持 *.example.com 这种格式"))?;
-        anyhow::ensure!(normalized.len() <= 253, "规则域名过长");
-        anyhow::ensure!(
-            ["local", "allow", "block", "forward"].contains(&input.kind.as_str()),
-            "invalid rule kind"
-        );
-        let mut result = input.clone();
-        result.domain = normalized;
-        match input.kind.as_str() {
-            "local" => {
-                let kind = input
-                    .record_type
-                    .as_deref()
-                    .context("record_type required")?
-                    .to_uppercase();
-                anyhow::ensure!(
-                    ["A", "AAAA", "CNAME", "TXT"].contains(&kind.as_str()),
-                    "record_type must be A, AAAA, CNAME or TXT"
-                );
-                let value = input.value.as_deref().context("value required")?;
-                parse_rdata(&kind, value)?;
-                anyhow::ensure!(
-                    (1..=86400).contains(&input.ttl.unwrap_or(300)),
-                    "TTL must be 1..86400"
-                );
-                result.record_type = Some(kind);
-                result.ttl = Some(input.ttl.unwrap_or(300));
-            }
-            "forward" => {
-                let addr: SocketAddr = input
-                    .value
-                    .as_deref()
-                    .context("upstream socket address required")?
-                    .parse()?;
-                anyhow::ensure!(
-                    !addr.ip().is_unspecified(),
-                    "upstream cannot be unspecified"
-                );
-                result.record_type = None;
-                result.ttl = None;
-            }
-            _ => {
-                result.record_type = None;
-                result.value = None;
-                result.ttl = None;
-            }
-        }
-        Ok(result)
+        policy::validate_rule(input)
     }
 
     pub async fn answer(
@@ -468,7 +243,7 @@ impl Engine {
         let location = runtime.geo.lookup(crate::access::canonical_ip(peer.ip()));
         let access = runtime.access.decide(peer.ip(), &location);
         let personal = match user_id.filter(|_| access.is_ok()) {
-            Some(user) => query_policy(&self.store.pool, user, &domain).await?,
+            Some(user) => query_policy(&self.store, user, &domain).await?,
             None => Some((
                 DnsPreferences {
                     adguard: test_adguard,
@@ -535,7 +310,7 @@ impl Engine {
         } else if let Some(upstream) = forward_target {
             let _foreground = self.begin_foreground(true);
             let budget = Duration::from_millis(runtime.settings.resolution.timeout_ms);
-            match tokio::time::timeout(budget, forward(wire, upstream)).await {
+            match tokio::time::timeout(budget, forward(wire, &request, upstream)).await {
                 Err(_) => {
                     response.metadata.response_code = ResponseCode::ServFail;
                     outcome = "timeout";
@@ -605,27 +380,22 @@ impl Engine {
         }
         let wire = response.to_vec()?;
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
-        if let Err(error) = self
-            .store
-            .query_log
-            .push(crate::query_log::QueryLogEntry {
-                at: chrono::Utc::now().to_rfc3339(),
-                user_id,
-                client: peer.ip().to_string(),
-                domain,
-                qtype: kind,
-                outcome: outcome.into(),
-                protocol: protocol.into(),
-                duration_ms,
-                country: location.country,
-                province: location.province,
-                city: location.city,
-                upstream: selected_upstream,
-                rcode: Some(u16::from(response.metadata.response_code)),
-                response_wire: user_id.map(|_| wire.clone()),
-            })
-            .await
-        {
+        if let Err(error) = self.store.query_log.push(crate::query_log::QueryLogEntry {
+            at: chrono::Utc::now().to_rfc3339(),
+            user_id,
+            client: peer.ip().to_string(),
+            domain,
+            qtype: kind,
+            outcome: outcome.into(),
+            protocol: protocol.into(),
+            duration_ms,
+            country: location.country,
+            province: location.province,
+            city: location.city,
+            upstream: selected_upstream,
+            rcode: Some(u16::from(response.metadata.response_code)),
+            response_wire: user_id.map(|_| wire.clone()),
+        }) {
             tracing::warn!(%error, "query log write failed");
         }
         Ok(QueryAnswer {
@@ -763,25 +533,17 @@ impl Engine {
         allow_unverified: bool,
         strict: bool,
     ) -> Result<Resolved, LookupFailure> {
-        let recursors = if crate::cache::bypass_cache(request) {
-            match build_recursor(&self.roots, &self.cache) {
-                Ok(recursor) => Arc::new(recursor),
-                Err(error) => {
-                    tracing::debug!(%error, "could not prepare recursive refresh");
-                    return Err(LookupFailure::Unavailable);
-                }
-            }
-        } else {
-            self.recursor.load_full()
-        };
-        let validating = if strict {
-            &recursors.strict
-        } else {
-            &recursors.relaxed
+        let recursors = self.recursor.load_full();
+        let fresh = crate::cache::bypass_cache(request);
+        let (validating, unverified) = match (fresh, strict) {
+            (true, true) => (&recursors.fresh_strict, &recursors.fresh_unverified),
+            (true, false) => (&recursors.fresh_relaxed, &recursors.fresh_unverified),
+            (false, true) => (&recursors.strict, &recursors.unverified),
+            (false, false) => (&recursors.relaxed, &recursors.unverified),
         };
         match Self::resolve_recursive(validating, request).await {
             Err(LookupFailure::Dnssec(code)) if allow_unverified => {
-                let mut answer = Self::resolve_recursive(&recursors.unverified, request)
+                let mut answer = Self::resolve_recursive(unverified, request)
                     .await
                     .map_err(|_| LookupFailure::Dnssec(code))?;
                 answer.outcome = "recursive_dnssec_unverified";
@@ -992,6 +754,9 @@ struct Recursors {
     relaxed: Recursor<CachedProvider>,
     strict: Recursor<CachedProvider>,
     unverified: Recursor<CachedProvider>,
+    fresh_relaxed: Recursor<CachedProvider>,
+    fresh_strict: Recursor<CachedProvider>,
+    fresh_unverified: Recursor<CachedProvider>,
 }
 
 fn build_recursor(roots: &[IpAddr], cache: &Arc<PersistentCache>) -> Result<Recursors> {
@@ -1015,13 +780,14 @@ fn build_recursor_with_settings(
         cache_policy: TtlConfig::from_opts(&resolver_options),
         ..RecursorOptions::default()
     };
-    let build = |policy, qname_minimization| {
+    let build = |policy, qname_minimization, response_cache_size| {
         Recursor::new(
             roots,
             policy,
             None,
             RecursorOptions {
                 qname_minimization,
+                response_cache_size,
                 ..options.clone()
             },
             CachedProvider::new(cache.clone(), roots),
@@ -1032,12 +798,33 @@ fn build_recursor_with_settings(
         relaxed: build(
             DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
             QNameMinimization::Relaxed,
+            2_048,
         )?,
         strict: build(
             DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
             QNameMinimization::Strict,
+            2_048,
         )?,
-        unverified: build(DnssecPolicy::ValidationDisabled, QNameMinimization::Relaxed)?,
+        unverified: build(
+            DnssecPolicy::ValidationDisabled,
+            QNameMinimization::Relaxed,
+            2_048,
+        )?,
+        fresh_relaxed: build(
+            DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
+            QNameMinimization::Relaxed,
+            0,
+        )?,
+        fresh_strict: build(
+            DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
+            QNameMinimization::Strict,
+            0,
+        )?,
+        fresh_unverified: build(
+            DnssecPolicy::ValidationDisabled,
+            QNameMinimization::Relaxed,
+            0,
+        )?,
     })
 }
 
@@ -1097,266 +884,14 @@ fn parse_root_hints(text: &str) -> Result<Vec<IpAddr>> {
     Ok(addresses)
 }
 
-pub(crate) fn normalize_domain(domain: &str) -> Result<String> {
-    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    anyhow::ensure!(
-        !domain.is_empty() && domain.len() <= 253 && !domain.contains('*'),
-        "invalid domain"
-    );
-    Name::from_ascii(format!("{domain}."))?;
-    Ok(domain)
-}
-
-pub(crate) fn matches_domain(set: &HashSet<String>, domain: &str) -> bool {
-    let mut remaining = domain;
-    loop {
-        if set.contains(remaining) {
-            return true;
-        }
-        let Some((_, suffix)) = remaining.split_once('.') else {
-            return false;
-        };
-        remaining = suffix;
-    }
-}
-
-fn answer_local<'a>(
-    response: &mut Message,
-    query: &hickory_proto::op::Query,
-    kind: &str,
-    records: impl Iterator<Item = (&'a str, &'a str, u32)>,
-) -> Result<()> {
-    for (record_type, value, ttl) in records {
-        if record_type == "CNAME" || query.query_type() == RecordType::ANY || record_type == kind {
-            response.add_answer(Record::from_rdata(
-                query.name().clone(),
-                ttl,
-                parse_rdata(record_type, value)?,
-            ));
-        }
-    }
-    response.metadata.authoritative = true;
-    Ok(())
-}
-
-fn parse_rdata(kind: &str, value: &str) -> Result<RData> {
-    Ok(match kind {
-        "A" => RData::A(A(value.parse()?)),
-        "AAAA" => RData::AAAA(AAAA(value.parse()?)),
-        "CNAME" => RData::CNAME(CNAME(Name::from_ascii(format!(
-            "{}.",
-            normalize_domain(value)?
-        ))?)),
-        "TXT" => {
-            anyhow::ensure!(value.len() <= 255, "TXT exceeds 255 bytes");
-            RData::TXT(TXT::new(vec![value.to_string()]))
-        }
-        _ => anyhow::bail!("unsupported record type"),
-    })
-}
-
-async fn forward(wire: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
-    let bind = if upstream.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind).await?;
-    socket.connect(upstream).await?;
-    socket.send(wire).await?;
-    let mut buffer = vec![0u8; 65535];
-    let length = tokio::time::timeout(Duration::from_secs(3), socket.recv(&mut buffer)).await??;
-    buffer.truncate(length);
-    let reply = Message::from_vec(&buffer)?;
-    let query = Message::from_vec(wire)?;
-    anyhow::ensure!(
-        reply.metadata.id == query.metadata.id && reply.queries == query.queries,
-        "upstream response mismatch"
-    );
-    if !reply.metadata.truncation {
-        return Ok(buffer);
-    }
-    let mut stream =
-        tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(upstream)).await??;
-    stream.write_all(&(wire.len() as u16).to_be_bytes()).await?;
-    stream.write_all(wire).await?;
-    let length = stream.read_u16().await? as usize;
-    anyhow::ensure!(length <= 65535, "upstream response too large");
-    buffer.resize(length, 0);
-    stream.read_exact(&mut buffer).await?;
-    let reply = Message::from_vec(&buffer)?;
-    anyhow::ensure!(
-        reply.metadata.id == query.metadata.id && reply.queries == query.queries,
-        "upstream response mismatch"
-    );
-    Ok(buffer)
-}
-
-pub struct ImportedFilter {
-    pub domain: String,
-    pub match_type: &'static str,
-    pub block: bool,
-}
-
-pub(crate) fn domain_glob(pattern: &str) -> String {
-    regex::escape(pattern)
-        .replace("\\*", ".*")
-        .replace("\\?", ".")
-}
-
-pub(crate) fn domain_regex(expression: &str) -> Result<regex::Regex> {
-    Ok(regex::RegexBuilder::new(expression)
-        .case_insensitive(true)
-        .size_limit(1024 * 1024)
-        .build()?)
-}
-
-fn imported_domain_pattern(kind: &str, pattern: &str) -> Result<regex::Regex> {
-    anyhow::ensure!(!pattern.is_empty(), "请填写匹配表达式");
-    match kind {
-        "DOMAIN-WILDCARD" => {
-            anyhow::ensure!(
-                pattern.len() <= 253
-                    && pattern
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b".-*?".contains(&byte)),
-                "通配符域名只支持字母、数字、点、连字符、* 和 ?"
-            );
-            domain_regex(&format!(r"\A(?:{})\z", domain_glob(pattern)))
-        }
-        "DOMAIN-REGEX" => domain_regex(pattern).context("域名正则无效或超出编译限制"),
-        _ => anyhow::bail!("未知的域名匹配类型"),
-    }
-}
-
-pub fn parse_imported_filters(text: &str) -> Result<Vec<ImportedFilter>> {
-    let mut rules = Vec::new();
-    for (index, line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty()
-            || line.starts_with([';', '!', '#'])
-            || line.starts_with("//")
-            || line.eq_ignore_ascii_case("[Rule]")
-            || line.eq_ignore_ascii_case("rules:")
-        {
-            continue;
-        }
-        let rule = parse_imported_filter(line)
-            .with_context(|| format!("第 {} 行", index + 1))
-            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
-        rules.push(rule);
-    }
-    anyhow::ensure!(!rules.is_empty(), "请至少输入一条过滤规则");
-    let mut seen = HashSet::new();
-    rules.reverse();
-    rules.retain(|rule| seen.insert((rule.match_type, rule.domain.clone())));
-    rules.reverse();
-    Ok(rules)
-}
-
-fn parse_imported_filter(line: &str) -> Result<ImportedFilter> {
-    let line = line
-        .find(" #")
-        .map_or(line, |index| &line[..index])
-        .trim_end();
-    let entry = line.strip_prefix('-').unwrap_or(line).trim();
-    let entry = ['\'', '"']
-        .into_iter()
-        .find_map(|quote| entry.strip_prefix(quote)?.strip_suffix(quote))
-        .unwrap_or(entry);
-    let (kind, fields) = entry
-        .split_once(',')
-        .context("请使用 匹配类型,匹配值,策略")?;
-    let (hostname, action) = fields
-        .rsplit_once(',')
-        .context("请使用 匹配类型,匹配值,策略")?;
-    let hostname = hostname.trim();
-    let match_type = match kind.trim().to_ascii_uppercase().as_str() {
-        "DOMAIN" => "DOMAIN",
-        "DOMAIN-SUFFIX" => "DOMAIN-SUFFIX",
-        "DOMAIN-WILDCARD" => "DOMAIN-WILDCARD",
-        "DOMAIN-REGEX" => "DOMAIN-REGEX",
-        _ => anyhow::bail!("匹配类型只支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-WILDCARD 和 DOMAIN-REGEX"),
-    };
-    let block = match action.trim().to_ascii_uppercase().as_str() {
-        "REJECT" => true,
-        "DIRECT" => false,
-        _ => anyhow::bail!("策略只支持 REJECT 和 DIRECT"),
-    };
-    if matches!(match_type, "DOMAIN-WILDCARD" | "DOMAIN-REGEX") {
-        let domain = if match_type == "DOMAIN-WILDCARD" {
-            hostname.trim_end_matches('.').to_ascii_lowercase()
-        } else {
-            hostname.to_owned()
-        };
-        imported_domain_pattern(match_type, &domain)?;
-        return Ok(ImportedFilter {
-            domain,
-            match_type,
-            block,
-        });
-    }
-    anyhow::ensure!(
-        hostname
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte))
-            && hostname.parse::<IpAddr>().is_err(),
-        "请填写有效域名"
-    );
-    let domain = normalize_domain(hostname).context("请填写有效域名")?;
-    anyhow::ensure!(
-        domain.parse::<IpAddr>().is_err()
-            && domain
-                .split('.')
-                .all(|label| !label.starts_with('-') && !label.ends_with('-')),
-        "请填写有效域名"
-    );
-    Ok(ImportedFilter {
-        domain,
-        match_type,
-        block,
-    })
-}
-
-pub fn parse_filter_list(text: &str) -> Result<Vec<String>> {
-    let mut domains = HashSet::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty()
-            || line.starts_with('#')
-            || line.starts_with('!')
-            || line.starts_with('[')
-            || line.starts_with("@@")
-        {
-            continue;
-        }
-        let candidate = if let Some(rest) = line.strip_prefix("||") {
-            rest.split('^').next().unwrap_or("")
-        } else if line.starts_with("0.0.0.0 ") || line.starts_with("127.0.0.1 ") {
-            line.split_whitespace().nth(1).unwrap_or("")
-        } else if line.contains('/')
-            || line.contains('$')
-            || line.contains('*')
-            || line.contains(' ')
-        {
-            continue;
-        } else {
-            line
-        };
-        if let Ok(domain) = normalize_domain(candidate) {
-            domains.insert(domain);
-        }
-        anyhow::ensure!(domains.len() <= 1_000_000, "filter list too large");
-    }
-    let mut result: Vec<_> = domains.into_iter().collect();
-    result.sort();
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::dnssec::Proof;
+    use hickory_proto::{
+        dnssec::Proof,
+        rr::rdata::{A, CNAME},
+    };
+    use std::collections::HashSet;
 
     fn ready(outcome: &'static str) -> Result<Resolved, LookupFailure> {
         Ok(Resolved {

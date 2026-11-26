@@ -10,10 +10,11 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::UNIX_EPOCH,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
+use moka::sync::Cache;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -78,6 +79,7 @@ pub struct GeoIpService {
     ipv4_path: PathBuf,
     ipv6_path: PathBuf,
     readers: Arc<RwLock<Readers>>,
+    cache: Cache<IpAddr, GeoLocation>,
 }
 
 #[derive(Default)]
@@ -108,6 +110,10 @@ impl GeoIpService {
             ipv4_path,
             ipv6_path,
             readers: Arc::new(RwLock::new(Readers::default())),
+            cache: Cache::builder()
+                .max_capacity(16_384)
+                .time_to_live(Duration::from_secs(3600))
+                .build(),
         };
         service.reload();
         service
@@ -117,15 +123,22 @@ impl GeoIpService {
         if !self.enabled || !is_public_ip(ip) {
             return GeoLocation::unknown();
         }
-        let readers = self.readers.read().expect("GeoIP reader lock poisoned");
-        let reader = match ip {
-            IpAddr::V4(_) => readers.ipv4.as_ref(),
-            IpAddr::V6(_) => readers.ipv6.as_ref(),
+        if let Some(cached) = self.cache.get(&ip) {
+            return cached;
+        }
+        let location = {
+            let readers = self.readers.read().expect("GeoIP reader lock poisoned");
+            let reader = match ip {
+                IpAddr::V4(_) => readers.ipv4.as_ref(),
+                IpAddr::V6(_) => readers.ipv6.as_ref(),
+            };
+            reader
+                .and_then(|reader| reader.lookup(ip).ok().flatten())
+                .map(|value| GeoLocation::from_xdb(&value))
+                .unwrap_or_default()
         };
-        reader
-            .and_then(|reader| reader.lookup(ip).ok().flatten())
-            .map(|value| GeoLocation::from_xdb(&value))
-            .unwrap_or_default()
+        self.cache.insert(ip, location.clone());
+        location
     }
 
     pub fn status(&self) -> GeoIpStatus {
@@ -208,6 +221,7 @@ impl GeoIpService {
             readers.ipv6 = Some(staged.reader.clone());
             readers.ipv6_error = None;
         }
+        self.cache.invalidate_all();
         Ok(())
     }
 
@@ -219,6 +233,7 @@ impl GeoIpService {
         readers.ipv6 = ipv6.map(Arc::new);
         readers.ipv4_error = ipv4_error;
         readers.ipv6_error = ipv6_error;
+        self.cache.invalidate_all();
     }
 }
 
@@ -328,18 +343,23 @@ impl XdbReader {
     }
 
     fn lookup(&self, ip: IpAddr) -> anyhow::Result<Option<String>> {
-        let octets: Vec<u8> = match (ip, self.ip_version) {
-            (IpAddr::V4(ip), XdbIpVersion::V4) => ip.octets().to_vec(),
-            (IpAddr::V6(ip), XdbIpVersion::V6) => ip.octets().to_vec(),
+        let (b0, b1, ip_len) = match (ip, self.ip_version) {
+            (IpAddr::V4(ip), XdbIpVersion::V4) => {
+                let octets = ip.octets();
+                (usize::from(octets[0]), usize::from(octets[1]), 4usize)
+            }
+            (IpAddr::V6(ip), XdbIpVersion::V6) => {
+                let octets = ip.octets();
+                (usize::from(octets[0]), usize::from(octets[1]), 16usize)
+            }
             _ => bail!("IP version does not match XDB database"),
         };
-        let point = HEADER_LENGTH + ((usize::from(octets[0]) * 256 + usize::from(octets[1])) * 8);
+        let point = HEADER_LENGTH + ((b0 * 256 + b1) * 8);
         let start = read_u32(&self.bytes, point)? as usize;
         let end = read_u32(&self.bytes, point + 4)? as usize;
         if start == 0 || end == 0 || end < start {
             return Ok(None);
         }
-        let ip_len = octets.len();
         let record_len = ip_len * 2 + 6;
         let mut left = 0usize;
         let mut right = (end - start) / record_len;
@@ -347,23 +367,52 @@ impl XdbReader {
             let mid = (left + right) / 2;
             let offset = start.saturating_add(mid.saturating_mul(record_len));
             let record = slice(&self.bytes, offset, record_len)?;
-            let start_ip = decode_index_ip(&record[..ip_len], self.ip_version);
-            let end_ip = decode_index_ip(&record[ip_len..ip_len * 2], self.ip_version);
-            if octets < start_ip {
-                let Some(next) = mid.checked_sub(1) else {
-                    break;
-                };
-                right = next;
-            } else if octets > end_ip {
-                left = mid + 1;
-            } else {
-                let length =
-                    u16::from_le_bytes(record[ip_len * 2..ip_len * 2 + 2].try_into()?) as usize;
-                let data_offset =
-                    u32::from_le_bytes(record[ip_len * 2 + 2..ip_len * 2 + 6].try_into()?) as usize;
-                return Ok(Some(String::from_utf8(
-                    slice(&self.bytes, data_offset, length)?.to_vec(),
-                )?));
+            let cmp = match ip {
+                IpAddr::V4(v4) => {
+                    let target = u32::from(v4);
+                    let start_ip = u32::from_le_bytes(record[..4].try_into()?);
+                    let end_ip = u32::from_le_bytes(record[4..8].try_into()?);
+                    if target < start_ip {
+                        std::cmp::Ordering::Less
+                    } else if target > end_ip {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                }
+                IpAddr::V6(v6) => {
+                    let target = v6.octets();
+                    let start_ip = &record[..16];
+                    let end_ip = &record[16..32];
+                    if target.as_slice() < start_ip {
+                        std::cmp::Ordering::Less
+                    } else if target.as_slice() > end_ip {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                }
+            };
+            match cmp {
+                std::cmp::Ordering::Less => {
+                    let Some(next) = mid.checked_sub(1) else {
+                        break;
+                    };
+                    right = next;
+                }
+                std::cmp::Ordering::Greater => {
+                    left = mid + 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    let length =
+                        u16::from_le_bytes(record[ip_len * 2..ip_len * 2 + 2].try_into()?) as usize;
+                    let data_offset =
+                        u32::from_le_bytes(record[ip_len * 2 + 2..ip_len * 2 + 6].try_into()?)
+                            as usize;
+                    return Ok(Some(String::from_utf8(
+                        slice(&self.bytes, data_offset, length)?.to_vec(),
+                    )?));
+                }
             }
         }
         Ok(None)
@@ -378,13 +427,6 @@ fn slice(bytes: &[u8], offset: usize, length: usize) -> anyhow::Result<&[u8]> {
     bytes
         .get(offset..offset.saturating_add(length))
         .context("XDB pointer is outside the database")
-}
-
-fn decode_index_ip(bytes: &[u8], version: XdbIpVersion) -> Vec<u8> {
-    match version {
-        XdbIpVersion::V4 => bytes.iter().rev().copied().collect(),
-        XdbIpVersion::V6 => bytes.to_vec(),
-    }
 }
 
 pub fn is_public_ip(ip: IpAddr) -> bool {

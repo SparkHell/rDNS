@@ -101,6 +101,7 @@ pub(super) async fn test(
     h: HeaderMap,
     Json(input): Json<Input>,
 ) -> Reply {
+    check_same_origin(&h)?;
     let id = dns::authenticate_active(&s, &h).await?;
     run(&s, peer, &h, input, Some(id)).await
 }

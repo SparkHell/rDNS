@@ -138,10 +138,32 @@ pub async fn download_with_timeout(
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     validate_https(url)?;
-    let response = http_client(config, proxy)?
-        .read_timeout(Duration::from_secs(60))
-        .timeout(timeout)
-        .build()?
+    type ClientKey = (Option<std::path::PathBuf>, String, u64);
+    static CLIENTS: std::sync::OnceLock<moka::sync::Cache<ClientKey, reqwest::Client>> =
+        std::sync::OnceLock::new();
+    let clients = CLIENTS.get_or_init(|| {
+        moka::sync::Cache::builder()
+            .max_capacity(32)
+            .time_to_live(Duration::from_secs(600))
+            .build()
+    });
+    let key = (
+        config.subscription_ca.clone(),
+        proxy.to_owned(),
+        timeout.as_secs(),
+    );
+    let client = match clients.get(&key) {
+        Some(client) => client,
+        None => {
+            let built = http_client(config, proxy)?
+                .read_timeout(Duration::from_secs(60))
+                .timeout(timeout)
+                .build()?;
+            clients.insert(key, built.clone());
+            built
+        }
+    };
+    let response = client
         .get(url)
         .send()
         .await

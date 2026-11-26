@@ -97,6 +97,7 @@ pub(super) async fn create_qr(
     h: HeaderMap,
     uri: Uri,
 ) -> Reply {
+    check_same_origin(&h)?;
     let id = authenticate(&s, &h).await?;
     let (credential, base): (String, String) = sqlx::query_as(
         "SELECT credential,base FROM portal_users,portal_settings WHERE portal_users.id=? AND status='active' AND credential IS NOT NULL",
@@ -117,34 +118,6 @@ pub(super) async fn create_qr(
         "url": url,
         "image": format!("data:image/svg+xml;base64,{}", STANDARD.encode(image)),
     })))
-}
-
-pub(super) async fn download_qr(
-    State(s): State<ApiState>,
-    Path(ticket): Path<String>,
-) -> Result<Response> {
-    let unavailable = || {
-        (
-            StatusCode::NOT_FOUND,
-            "二维码已失效，请返回 rDns 门户重新生成。".into(),
-        )
-    };
-    if ticket.len() != 48 || !ticket.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-        return Err(unavailable());
-    }
-    let mut tx = s
-        .engine
-        .store
-        .pool
-        .begin_with("BEGIN IMMEDIATE")
-        .await
-        .map_err(internal)?;
-    let (id, origin): (i64,String) = sqlx::query_as("DELETE FROM portal_profile_tickets WHERE hash=? AND expires>unixepoch() RETURNING user_id,origin")
-        .bind(digest(&ticket)).fetch_optional(&mut *tx).await.map_err(internal)?.ok_or_else(unavailable)?;
-    let credential: String = sqlx::query_scalar("SELECT credential FROM portal_users WHERE id=? AND status='active' AND credential IS NOT NULL")
-        .bind(id).fetch_optional(&mut *tx).await.map_err(internal)?.ok_or_else(unavailable)?;
-    tx.commit().await.map_err(internal)?;
-    Ok(profile(id, &credential, &origin))
 }
 
 fn profile(id: i64, credential: &str, origin: &str) -> Response {

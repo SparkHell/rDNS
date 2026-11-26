@@ -5,7 +5,7 @@ pub(crate) mod lookup;
 mod mobileconfig;
 mod reporting;
 
-pub(crate) use dns::{DnsPreferences, query_policy};
+pub(crate) use dns::{DnsPreferences, PersonalRecord, query_policy};
 
 use crate::api::{ApiState, require};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
@@ -17,11 +17,116 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use moka::sync::Cache;
 use rand::{Rng, distributions::Alphanumeric, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+type CachedUserDns = Arc<(DnsPreferences, HashMap<String, Vec<PersonalRecord>>)>;
+
+pub struct PortalCache {
+    public_doh: Cache<(), bool>,
+    credentials: Cache<String, Option<i64>>,
+    pub(crate) user_dns: Cache<i64, Option<CachedUserDns>>,
+    login_failures: Cache<String, (u32, Instant)>,
+}
+
+impl Default for PortalCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PortalCache {
+    pub fn new() -> Self {
+        Self {
+            public_doh: Cache::builder()
+                .max_capacity(1)
+                .time_to_live(Duration::from_secs(30))
+                .build(),
+            credentials: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(30))
+                .build(),
+            user_dns: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(30))
+                .build(),
+            login_failures: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(60))
+                .build(),
+        }
+    }
+
+    pub fn invalidate_public(&self) {
+        self.public_doh.invalidate_all();
+    }
+
+    pub fn invalidate_user(&self, user_id: i64) {
+        self.credentials.invalidate_all();
+        self.user_dns.invalidate(&user_id);
+    }
+
+    pub fn invalidate_user_dns(&self, user_id: i64) {
+        self.user_dns.invalidate(&user_id);
+    }
+}
+
+pub(crate) fn check_login_rate_limit(cache: &PortalCache, scope: &str, key: &str) -> bool {
+    let cache_key = format!("{scope}:{key}");
+    if let Some((count, since)) = cache.login_failures.get(&cache_key)
+        && count >= 5
+        && since.elapsed() < Duration::from_secs(60)
+    {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn record_login_failure(cache: &PortalCache, scope: &str, key: &str) {
+    let cache_key = format!("{scope}:{key}");
+    let entry = match cache.login_failures.get(&cache_key) {
+        Some((count, since)) if since.elapsed() < Duration::from_secs(60) => (count + 1, since),
+        _ => (1, Instant::now()),
+    };
+    cache.login_failures.insert(cache_key, entry);
+}
+
+pub(crate) fn clear_login_failures(cache: &PortalCache, scope: &str, key: &str) {
+    cache.login_failures.invalidate(&format!("{scope}:{key}"));
+}
+
+pub(crate) fn check_same_origin(headers: &HeaderMap) -> Result<()> {
+    if let Some(site) = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        && site.eq_ignore_ascii_case("cross-site")
+    {
+        return Err((StatusCode::FORBIDDEN, "禁止跨站请求".into()));
+    }
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
+        && let Ok(url) = reqwest::Url::parse(origin)
+        && let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok())
+    {
+        let origin_host = match (url.host_str(), url.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_owned(),
+            _ => return Err((StatusCode::FORBIDDEN, "无效的请求来源".into())),
+        };
+        if !origin_host.eq_ignore_ascii_case(host) {
+            return Err((StatusCode::FORBIDDEN, "请求来源不匹配".into()));
+        }
+    }
+    Ok(())
+}
 
 type Error = (StatusCode, String);
 type Result<T> = std::result::Result<T, Error>;
@@ -75,7 +180,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS portal_local_name ON portal_users(name) WHERE identity IS NULL",
         "CREATE TABLE IF NOT EXISTS portal_dns_preferences(user_id INTEGER PRIMARY KEY REFERENCES portal_users(id) ON DELETE CASCADE, adguard INTEGER NOT NULL, gfwlist INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS portal_dns_records(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES portal_users(id) ON DELETE CASCADE, domain TEXT NOT NULL, record_type TEXT NOT NULL, value TEXT NOT NULL, ttl INTEGER NOT NULL, UNIQUE(user_id,domain,record_type,value))",
-        "CREATE TABLE IF NOT EXISTS portal_profile_tickets(user_id INTEGER PRIMARY KEY REFERENCES portal_users(id) ON DELETE CASCADE,hash TEXT UNIQUE NOT NULL,origin TEXT NOT NULL,expires INTEGER NOT NULL)",
+        "DROP TABLE IF EXISTS portal_profile_tickets",
         "CREATE TABLE IF NOT EXISTS portal_sessions(hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES portal_users(id),expires INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS portal_mail(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL)",
         "INSERT OR IGNORE INTO portal_mail VALUES(1,'{}')",
@@ -115,6 +220,14 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS portal_queries ON query_log(portal_user_id,at)")
         .execute(&mut *tx)
         .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_query_log_entry_at ON query_log(entry,at)")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS query_log_responses(query_log_id INTEGER PRIMARY KEY REFERENCES query_log(id) ON DELETE CASCADE, response_wire BLOB NOT NULL)",
+    )
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -134,10 +247,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/portal/api/logout", post(logout))
         .route("/portal/api/rdns.mobileconfig", get(mobileconfig::download))
         .route("/portal/api/ios-qr", post(mobileconfig::create_qr))
-        .route(
-            "/portal/install/{ticket}/rdns.mobileconfig",
-            get(mobileconfig::download_qr).head(|| async { StatusCode::METHOD_NOT_ALLOWED }),
-        )
         .route("/portal/api/me", get(me))
         .route("/portal/api/rotate", post(rotate))
         .route("/portal/api/lookup", post(lookup::test))
@@ -176,11 +285,20 @@ pub fn admin_routes() -> Router<ApiState> {
 pub async fn identify_doh(State(s): State<ApiState>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path();
     let pool = &s.engine.store.pool;
+    let cache = &s.engine.store.portal_cache;
     let identity = if path == "/dns-query" {
-        sqlx::query_scalar::<_, bool>("SELECT public FROM portal_settings WHERE id=1")
-            .fetch_one(pool)
-            .await
-            .map(|on| on.then_some(None))
+        if let Some(on) = cache.public_doh.get(&()) {
+            Ok(on.then_some(None))
+        } else {
+            let res =
+                sqlx::query_scalar::<_, bool>("SELECT public FROM portal_settings WHERE id=1")
+                    .fetch_one(pool)
+                    .await;
+            if let Ok(on) = res {
+                cache.public_doh.insert((), on);
+            }
+            res.map(|on| on.then_some(None))
+        }
     } else if let Some(key) = path
         .strip_prefix("/dns/")
         .filter(|k| k.len() == 22 && k.bytes().all(|b| b.is_ascii_alphanumeric()))
@@ -198,13 +316,20 @@ pub async fn identify_doh(State(s): State<ApiState>, mut req: Request, next: Nex
             }
             return response;
         }
-        sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM portal_users WHERE credential=? AND status='active'",
-        )
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .map(|id| id.map(Some))
+        if let Some(cached) = cache.credentials.get(key) {
+            Ok(cached.map(Some))
+        } else {
+            let res = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM portal_users WHERE credential=? AND status='active'",
+            )
+            .bind(key)
+            .fetch_optional(pool)
+            .await;
+            if let Ok(id) = res {
+                cache.credentials.insert(key.to_owned(), id);
+            }
+            res.map(|id| id.map(Some))
+        }
     } else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -332,6 +457,7 @@ async fn configure(
         .map_err(internal)?;
     audit(&mut tx, &actor, "portal.settings", "updated").await?;
     tx.commit().await.map_err(internal)?;
+    s.engine.store.portal_cache.invalidate_public();
     Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
@@ -347,14 +473,7 @@ async fn allocate(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<()> {
             .execute(&mut **tx)
             .await
         {
-            Ok(_) => {
-                sqlx::query("DELETE FROM portal_profile_tickets WHERE user_id=?")
-                    .bind(id)
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(internal)?;
-                return Ok(());
-            }
+            Ok(_) => return Ok(()),
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => continue,
             Err(e) => return Err(internal(e)),
         }
@@ -449,7 +568,12 @@ fn user_write_error(error: sqlx::Error) -> Error {
     }
 }
 
-async fn register(State(s): State<ApiState>, Json(c): Json<Credentials>) -> Result<Response> {
+async fn register(
+    State(s): State<ApiState>,
+    h: HeaderMap,
+    Json(c): Json<Credentials>,
+) -> Result<Response> {
+    check_same_origin(&h)?;
     require_password_login(&s.engine.store.pool).await?;
     let name = c.username.trim();
     if !(3..=128).contains(&name.len()) || c.password.is_empty() || c.password.len() > 1024 {
@@ -469,9 +593,31 @@ async fn register(State(s): State<ApiState>, Json(c): Json<Credentials>) -> Resu
     tx.commit().await.map_err(internal)?;
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({"ok":true}))).into_response())
 }
-async fn login(State(s): State<ApiState>, Json(c): Json<Credentials>) -> Result<Response> {
+async fn login(
+    State(s): State<ApiState>,
+    h: HeaderMap,
+    Json(c): Json<Credentials>,
+) -> Result<Response> {
+    check_same_origin(&h)?;
     require_password_login(&s.engine.store.pool).await?;
-    let row=sqlx::query("SELECT id,password FROM portal_users WHERE identity IS NULL AND name=? AND status!='disabled'").bind(c.username.trim()).fetch_optional(&s.engine.store.pool).await.map_err(internal)?.ok_or_else(denied)?;
+    let username = c.username.trim().to_owned();
+    if !check_login_rate_limit(&s.engine.store.portal_cache, "portal", &username) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "登录失败次数过多，请稍后再试".into(),
+        ));
+    }
+    let Some(row) = sqlx::query(
+        "SELECT id,password FROM portal_users WHERE identity IS NULL AND name=? AND status!='disabled'",
+    )
+    .bind(&username)
+    .fetch_optional(&s.engine.store.pool)
+    .await
+    .map_err(internal)?
+    else {
+        record_login_failure(&s.engine.store.portal_cache, "portal", &username);
+        return Err(denied());
+    };
     let hash: String = row.get("password");
     let verified_hash = hash.clone();
     let slot = password_slot()?;
@@ -486,6 +632,7 @@ async fn login(State(s): State<ApiState>, Json(c): Json<Credentials>) -> Result<
     .await
     .map_err(internal)?;
     if !ok {
+        record_login_failure(&s.engine.store.portal_cache, "portal", &username);
         return Err(denied());
     }
     let mut tx = s
@@ -504,13 +651,16 @@ async fn login(State(s): State<ApiState>, Json(c): Json<Credentials>) -> Result<
             .await
             .map_err(internal)?;
     if current.as_deref() != Some(verified_hash.as_str()) {
+        record_login_failure(&s.engine.store.portal_cache, "portal", &username);
         return Err(denied());
     }
     let cookie = session(&mut tx, id).await?;
     tx.commit().await.map_err(internal)?;
+    clear_login_failures(&s.engine.store.portal_cache, "portal", &username);
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({"ok":true}))).into_response())
 }
 async fn logout(State(s): State<ApiState>, h: HeaderMap, Json(_): Json<Value>) -> Result<Response> {
+    check_same_origin(&h)?;
     sqlx::query("DELETE FROM portal_sessions WHERE hash=?")
         .bind(digest(cookie(&h, SESSION).unwrap_or("")))
         .execute(&s.engine.store.pool)
@@ -552,6 +702,7 @@ async fn me(
     })))
 }
 async fn rotate(State(s): State<ApiState>, h: HeaderMap, Json(_): Json<Value>) -> Reply {
+    check_same_origin(&h)?;
     let id = authenticate(&s, &h).await?;
     change(&s, id, "rotate", &format!("portal:{id}")).await
 }
@@ -662,15 +813,11 @@ async fn delete_user(State(s): State<ApiState>, h: HeaderMap, Path(id): Path<i64
     }
     audit(&mut tx, &actor, "portal.user.delete", &id.to_string()).await?;
     tx.commit().await.map_err(internal)?;
+    s.engine.store.portal_cache.invalidate_user(id);
     Ok(Json(json!({"ok":true})))
 }
 
 async fn revoke_user_sessions(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM portal_profile_tickets WHERE user_id=?")
-        .bind(id)
-        .execute(&mut **tx)
-        .await
-        .map_err(internal)?;
     sqlx::query("DELETE FROM portal_sessions WHERE user_id=?")
         .bind(id)
         .execute(&mut **tx)
@@ -728,5 +875,71 @@ async fn change(s: &ApiState, id: i64, action: &str, actor: &str) -> Reply {
     }
     audit(&mut tx, actor, &format!("portal.{action}"), &id.to_string()).await?;
     tx.commit().await.map_err(internal)?;
+    s.engine.store.portal_cache.invalidate_user(id);
     Ok(Json(json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_rate_limit_blocks_after_five_failures_and_clears() {
+        let cache = PortalCache::new();
+        assert!(check_login_rate_limit(&cache, "admin", "alice"));
+        for _ in 0..5 {
+            record_login_failure(&cache, "admin", "alice");
+        }
+        assert!(!check_login_rate_limit(&cache, "admin", "alice"));
+        assert!(check_login_rate_limit(&cache, "portal", "alice"));
+        clear_login_failures(&cache, "admin", "alice");
+        assert!(check_login_rate_limit(&cache, "admin", "alice"));
+    }
+
+    #[test]
+    fn same_origin_rejects_cross_site_headers() {
+        let mut headers = HeaderMap::new();
+        assert!(check_same_origin(&headers).is_ok());
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(check_same_origin(&headers).is_ok());
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(check_same_origin(&headers).is_err());
+
+        let mut origin_headers = HeaderMap::new();
+        origin_headers.insert(header::HOST, "dns.example.com".parse().unwrap());
+        origin_headers.insert(header::ORIGIN, "https://dns.example.com".parse().unwrap());
+        assert!(check_same_origin(&origin_headers).is_ok());
+        origin_headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        assert!(check_same_origin(&origin_headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn query_log_persists_personal_response_wire_in_side_table() -> anyhow::Result<()> {
+        let store = crate::store::Store::open(std::path::Path::new(":memory:")).await?;
+        let wire = vec![1u8, 2, 3, 4];
+        store.query_log.push(crate::query_log::QueryLogEntry {
+            user_id: Some(7),
+            at: chrono::Utc::now().to_rfc3339(),
+            client: "127.0.0.1".into(),
+            domain: "side-table.test".into(),
+            qtype: "A".into(),
+            outcome: "local".into(),
+            protocol: "doh".into(),
+            duration_ms: 0.5,
+            country: None,
+            province: None,
+            city: None,
+            upstream: None,
+            rcode: Some(0),
+            response_wire: Some(wire.clone()),
+        })?;
+        store.query_log.flush().await?;
+        let stored: Vec<u8> = sqlx::query_scalar(
+            "SELECT qr.response_wire FROM query_log q JOIN query_log_responses qr ON qr.query_log_id=q.id WHERE q.domain='side-table.test'",
+        )
+        .fetch_one(&store.pool)
+        .await?;
+        assert_eq!(stored, wire);
+        Ok(())
+    }
 }

@@ -18,10 +18,10 @@ pub(super) struct RecordInput {
     ttl: Option<i64>,
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Clone, Serialize, sqlx::FromRow)]
 pub(crate) struct PersonalRecord {
     id: i64,
-    domain: String,
+    pub domain: String,
     pub record_type: String,
     pub value: String,
     pub ttl: u32,
@@ -102,6 +102,7 @@ pub(super) async fn save_preferences(
     h: HeaderMap,
     Json(input): Json<DnsPreferences>,
 ) -> Reply {
+    check_same_origin(&h)?;
     let (user, mut tx) = edit_transaction(&s, &h).await?;
     sqlx::query(
         "INSERT INTO portal_dns_preferences(user_id,adguard,gfwlist) VALUES(?,?,?)
@@ -114,36 +115,52 @@ pub(super) async fn save_preferences(
     .await
     .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
+    s.engine.store.portal_cache.invalidate_user_dns(user);
     Ok(Json(json!(input)))
 }
 
 pub(crate) async fn query_policy(
-    pool: &SqlitePool,
+    store: &crate::store::Store,
     user: i64,
     domain: &str,
 ) -> anyhow::Result<Option<(DnsPreferences, Vec<PersonalRecord>)>> {
+    if let Some(cached) = store.portal_cache.user_dns.get(&user) {
+        return Ok(cached
+            .as_ref()
+            .map(|entry| (entry.0, entry.1.get(domain).cloned().unwrap_or_default())));
+    }
     let rows = sqlx::query(
         "SELECT COALESCE(p.adguard,0) AS adguard,COALESCE(p.gfwlist,0) AS gfwlist,
                 r.id,r.domain,r.record_type,r.value,r.ttl
          FROM portal_users u LEFT JOIN portal_dns_preferences p ON p.user_id=u.id
-         LEFT JOIN portal_dns_records r ON r.user_id=u.id AND r.domain=?
+         LEFT JOIN portal_dns_records r ON r.user_id=u.id
          WHERE u.id=? AND u.status='active' AND u.credential IS NOT NULL ORDER BY r.id",
     )
-    .bind(domain)
     .bind(user)
-    .fetch_all(pool)
+    .fetch_all(&store.pool)
     .await?;
     let Some(first) = rows.first() else {
+        store.portal_cache.user_dns.insert(user, None);
         return Ok(None);
     };
     let preferences = DnsPreferences::from_row(first)?;
-    let mut records = Vec::new();
+    let mut records_by_domain: std::collections::HashMap<String, Vec<PersonalRecord>> =
+        std::collections::HashMap::new();
     for row in rows {
         if row.try_get::<Option<i64>, _>("id")?.is_some() {
-            records.push(PersonalRecord::from_row(&row)?);
+            let record = PersonalRecord::from_row(&row)?;
+            records_by_domain
+                .entry(record.domain.clone())
+                .or_default()
+                .push(record);
         }
     }
-    Ok(Some((preferences, records)))
+    let domain_records = records_by_domain.get(domain).cloned().unwrap_or_default();
+    store
+        .portal_cache
+        .user_dns
+        .insert(user, Some(Arc::new((preferences, records_by_domain))));
+    Ok(Some((preferences, domain_records)))
 }
 
 fn conflict(message: &str) -> Error {
@@ -267,6 +284,7 @@ async fn write_record(s: &ApiState, h: &HeaderMap, id: Option<i64>, input: Recor
         .fetch_one(&mut *tx).await
     }.map_err(record_write_error)?;
     tx.commit().await.map_err(internal)?;
+    s.engine.store.portal_cache.invalidate_user_dns(user);
     Ok(Json(json!(saved)))
 }
 
@@ -275,6 +293,7 @@ pub(super) async fn add_record(
     h: HeaderMap,
     Json(input): Json<RecordInput>,
 ) -> Reply {
+    check_same_origin(&h)?;
     write_record(&s, &h, None, input).await
 }
 
@@ -284,6 +303,7 @@ pub(super) async fn edit_record(
     Path(id): Path<i64>,
     Json(input): Json<RecordInput>,
 ) -> Reply {
+    check_same_origin(&h)?;
     write_record(&s, &h, Some(id), input).await
 }
 
@@ -292,6 +312,7 @@ pub(super) async fn delete_record(
     h: HeaderMap,
     Path(id): Path<i64>,
 ) -> Reply {
+    check_same_origin(&h)?;
     let (user, mut tx) = edit_transaction(&s, &h).await?;
     let result = sqlx::query("DELETE FROM portal_dns_records WHERE user_id=? AND id=?")
         .bind(user)
@@ -303,5 +324,6 @@ pub(super) async fn delete_record(
         return Err(missing_record());
     }
     tx.commit().await.map_err(internal)?;
+    s.engine.store.portal_cache.invalidate_user_dns(user);
     Ok(Json(json!({"ok": true})))
 }

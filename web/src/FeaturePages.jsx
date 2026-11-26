@@ -172,7 +172,10 @@ export default function FeaturePages({ page, status, draft, setDraft, isAdmin, b
         </div>)}
         {!draft.groups.length && <p className="policy-help">暂无上游组。</p>}
       </Section>
-      <Section title="上游运行状态" description="最近一次读取的请求与失败次数"><div className="table-wrap"><table><thead><tr><th>上游组</th><th>地址</th><th>请求</th><th>失败</th></tr></thead><tbody>{status.groups.flatMap(item => item.servers.map(server => <tr key={`${item.name}-${server.url}`}><td>{item.name}</td><td>{server.url}</td><td>{server.requests}</td><td>{server.failures}</td></tr>))}</tbody></table></div></Section>
+      <Section title="上游运行状态" description="最近一次读取的请求与失败次数"><div className="table-wrap"><table><thead><tr><th>上游组</th><th>地址</th><th>状态</th><th>请求</th><th>失败</th></tr></thead><tbody>{status.groups.flatMap(item => item.servers.map(server => {
+        const remaining = server.cooldown_until ? Math.max(0, server.cooldown_until - Math.floor(Date.now() / 1000)) : 0
+        return <tr key={`${item.name}-${server.url}`}><td>{item.name}</td><td>{server.url}</td><td><span className={`tag ${remaining > 0 ? 'block' : 'local'}`}>{remaining > 0 ? `冷却中 ${remaining}s` : '正常'}</span></td><td>{server.requests}</td><td>{server.failures}</td></tr>
+      }))}</tbody></table></div></Section>
     </>}
     {page === 'subscriptions' && !saved && <p className="policy-help">更新使用已保存的来源配置。修改下载地址后，请先保存再更新。</p>}
     {page === 'subscriptions' && <Section title="AdGuard 广告过滤" description="维护广告过滤订阅，由用户在个人 DoH 中选择启用">

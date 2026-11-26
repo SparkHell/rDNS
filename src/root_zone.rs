@@ -1,4 +1,4 @@
-use crate::{cache::PersistentCache, store::Store};
+use crate::{cache::PersistentCache, config::Config, features::Features, store::Store, upstream};
 use anyhow::{Context, Result, ensure};
 use arc_swap::ArcSwapOption;
 use chrono::Utc;
@@ -232,14 +232,13 @@ impl RootDelegations {
     }
 }
 
-pub async fn maintain(cache: Arc<PersistentCache>, store: Store, mut force: bool) {
-    let client = match Client::builder().timeout(Duration::from_secs(60)).build() {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::warn!(%error, "root zone HTTP client failed");
-            return;
-        }
-    };
+pub async fn maintain(
+    config: Config,
+    features: Arc<Features>,
+    cache: Arc<PersistentCache>,
+    store: Store,
+    mut force: bool,
+) {
     loop {
         let snapshot = cache.root.0.load_full();
         let now = Utc::now().timestamp();
@@ -251,6 +250,25 @@ pub async fn maintain(cache: Arc<PersistentCache>, store: Store, mut force: bool
             tokio::time::sleep(Duration::from_secs(delay as u64)).await;
         }
         force = false;
+        let proxy = features
+            .current
+            .load()
+            .settings
+            .subscription_proxy()
+            .to_owned();
+        let client = match upstream::http_client(&config, &proxy)
+            .and_then(|builder| Ok(builder.timeout(Duration::from_secs(60)).build()?))
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%error, "root zone HTTP client failed");
+                tokio::time::sleep(Duration::from_secs(
+                    snapshot.map_or(900, |s| s.retry).into(),
+                ))
+                .await;
+                continue;
+            }
+        };
         let result = cache.root.refresh(&store, &client, SOURCE).await;
         let _ = store
             .set_setting(

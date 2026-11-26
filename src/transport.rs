@@ -11,20 +11,20 @@ use tokio_rustls::TlsAcceptor;
 pub async fn udp(engine: Arc<Engine>, socket: UdpSocket) -> Result<()> {
     let socket = Arc::new(socket);
     let limit = Arc::new(Semaphore::new(256));
+    let mut buffer = [0u8; 4096];
     loop {
-        let mut buffer = vec![0u8; 4096];
         let (length, peer) = socket.recv_from(&mut buffer).await?;
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
         };
-        buffer.truncate(length);
+        let packet = buffer[..length].to_vec();
         let engine = engine.clone();
         let socket = socket.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match engine.answer(&buffer, peer, "udp").await {
+            match engine.answer(&packet, peer, "udp").await {
                 Ok(answer) => {
-                    let max_len = hickory_proto::op::Message::from_vec(&buffer)
+                    let max_len = hickory_proto::op::Message::from_vec(&packet)
                         .ok()
                         .map(|query| query.max_payload().max(512) as usize)
                         .unwrap_or(512);
@@ -117,8 +117,12 @@ where
             response.len() <= u16::MAX as usize,
             "DNS response too large"
         );
-        stream.write_u16(response.len() as u16).await?;
-        stream.write_all(&response).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            stream.write_u16(response.len() as u16).await?;
+            stream.write_all(&response).await?;
+            stream.flush().await
+        })
+        .await??;
     }
 }
 
@@ -136,20 +140,29 @@ pub async fn doq(engine: Arc<Engine>, endpoint: quinn::Endpoint) -> Result<()> {
                 return;
             };
             let peer = connection.remote_address();
-            while let Ok((mut send, mut receive)) = connection.accept_bi().await {
+            let streams = Arc::new(Semaphore::new(64));
+            while let Ok(Ok((mut send, mut receive))) =
+                tokio::time::timeout(Duration::from_secs(30), connection.accept_bi()).await
+            {
+                let Ok(stream_permit) = streams.clone().try_acquire_owned() else {
+                    let _ = send.reset(0x3u32.into());
+                    continue;
+                };
                 let engine = engine.clone();
                 tokio::spawn(async move {
+                    let _stream_permit = stream_permit;
                     let Ok(frame) = receive.read_to_end(65537).await else {
                         return;
                     };
                     if frame.len() < 2 {
+                        let _ = send.reset(0x2u32.into());
                         return;
                     }
                     let length = u16::from_be_bytes([frame[0], frame[1]]) as usize;
-                    if length != frame.len() - 2 {
-                        return;
-                    }
-                    if frame.len() >= 4 && (frame[2] != 0 || frame[3] != 0) {
+                    if length != frame.len() - 2
+                        || (frame.len() >= 4 && (frame[2] != 0 || frame[3] != 0))
+                    {
+                        let _ = send.reset(0x2u32.into());
                         return;
                     }
                     if let Ok(response) = engine.answer(&frame[2..], peer, "doq").await

@@ -37,6 +37,7 @@ pub struct QueryLog {
 struct Metrics {
     write_us: AtomicU64,
     failed_entries: AtomicU64,
+    dropped_entries: AtomicU64,
 }
 
 impl QueryLog {
@@ -47,40 +48,71 @@ impl QueryLog {
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(64);
             while receiver.recv_many(&mut batch, 64).await > 0 {
-                let entries = batch.iter().filter_map(|item| match item {
-                    Item::Entry(entry) => Some(entry),
-                    _ => None,
-                });
-                let count = entries.clone().count();
+                let entries: Vec<&QueryLogEntry> = batch
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Entry(entry) => Some(entry.as_ref()),
+                        _ => None,
+                    })
+                    .collect();
+                let count = entries.len();
                 if count > 0 {
                     let started = std::time::Instant::now();
-                    let mut query = QueryBuilder::new(
-                        "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol,duration_ms,country,province,city,upstream,portal_user_id,entry,rcode,response_wire) ",
-                    );
-                    query.push_values(entries, |mut row, e| {
-                        row.push_bind(&e.at)
-                            .push_bind(&e.client)
-                            .push_bind(&e.domain)
-                            .push_bind(&e.qtype)
-                            .push_bind(&e.outcome)
-                            .push_bind(&e.protocol)
-                            .push_bind(e.duration_ms)
-                            .push_bind(&e.country)
-                            .push_bind(&e.province)
-                            .push_bind(&e.city)
-                            .push_bind(&e.upstream)
-                            .push_bind(e.user_id)
-                            .push_bind(if e.user_id.is_some() {
-                                "personal"
-                            } else if e.protocol == "doh" {
-                                "public"
-                            } else {
-                                e.protocol.as_str()
-                            })
-                            .push_bind(e.rcode.map(i64::from))
-                            .push_bind(&e.response_wire);
-                    });
-                    if let Err(error) = query.build().execute(&pool).await {
+                    let write_result: Result<()> = async {
+                        let has_wires = entries.iter().any(|e| e.response_wire.is_some());
+                        let mut query = QueryBuilder::new(
+                            "INSERT INTO query_log(at,client,domain,qtype,outcome,protocol,duration_ms,country,province,city,upstream,portal_user_id,entry,rcode) ",
+                        );
+                        query.push_values(entries.iter().copied(), |mut row, e| {
+                            row.push_bind(&e.at)
+                                .push_bind(&e.client)
+                                .push_bind(&e.domain)
+                                .push_bind(&e.qtype)
+                                .push_bind(&e.outcome)
+                                .push_bind(&e.protocol)
+                                .push_bind(e.duration_ms)
+                                .push_bind(&e.country)
+                                .push_bind(&e.province)
+                                .push_bind(&e.city)
+                                .push_bind(&e.upstream)
+                                .push_bind(e.user_id)
+                                .push_bind(if e.user_id.is_some() {
+                                    "personal"
+                                } else if e.protocol == "doh" {
+                                    "public"
+                                } else {
+                                    e.protocol.as_str()
+                                })
+                                .push_bind(e.rcode.map(i64::from));
+                        });
+                        if has_wires {
+                            query.push(" RETURNING id");
+                            let mut tx = pool.begin().await?;
+                            let ids: Vec<i64> = query.build_query_scalar().fetch_all(&mut *tx).await?;
+                            let wires: Vec<(i64, &[u8])> = ids
+                                .into_iter()
+                                .zip(entries.iter())
+                                .filter_map(|(id, e)| {
+                                    e.response_wire.as_deref().map(|wire| (id, wire))
+                                })
+                                .collect();
+                            if !wires.is_empty() {
+                                let mut wire_query = QueryBuilder::new(
+                                    "INSERT INTO query_log_responses(query_log_id,response_wire) ",
+                                );
+                                wire_query.push_values(wires, |mut row, (id, wire)| {
+                                    row.push_bind(id).push_bind(wire);
+                                });
+                                wire_query.build().execute(&mut *tx).await?;
+                            }
+                            tx.commit().await?;
+                        } else {
+                            query.build().execute(&pool).await?;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(error) = write_result {
                         worker_metrics
                             .failed_entries
                             .fetch_add(count as u64, Ordering::Relaxed);
@@ -100,11 +132,17 @@ impl QueryLog {
         Self { sender, metrics }
     }
 
-    pub async fn push(&self, entry: QueryLogEntry) -> Result<()> {
-        self.sender
-            .send(Item::Entry(Box::new(entry)))
-            .await
-            .map_err(|_| anyhow::anyhow!("query log writer stopped"))
+    pub fn push(&self, entry: QueryLogEntry) -> Result<()> {
+        match self.sender.try_send(Item::Entry(Box::new(entry))) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.dropped_entries.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow::anyhow!("query log writer stopped"))
+            }
+        }
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -119,6 +157,7 @@ impl QueryLog {
     pub fn metrics(&self) -> serde_json::Value {
         serde_json::json!({"last_batch_write_us": self.metrics.write_us.load(Ordering::Relaxed),
             "failed_entries": self.metrics.failed_entries.load(Ordering::Relaxed),
+            "dropped_entries": self.metrics.dropped_entries.load(Ordering::Relaxed),
             "queue_depth": self.sender.max_capacity() - self.sender.capacity()})
     }
 }

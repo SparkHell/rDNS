@@ -6,18 +6,21 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
-    Row, SqlitePool,
+    QueryBuilder, Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
+    time::Duration,
 };
 
 #[derive(Clone)]
 pub struct Store {
     pub pool: SqlitePool,
     pub query_log: crate::query_log::QueryLog,
+    pub portal_cache: Arc<crate::portal::PortalCache>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -64,6 +67,7 @@ impl Store {
         let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))?
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -142,6 +146,7 @@ impl Store {
         crate::portal::migrate(&pool).await?;
         Ok(Self {
             query_log: crate::query_log::QueryLog::new(pool.clone()),
+            portal_cache: Arc::new(crate::portal::PortalCache::new()),
             pool,
         })
     }
@@ -290,7 +295,8 @@ impl Store {
             "username must have at least 3 characters"
         );
         anyhow::ensure!(!password.is_empty(), "password cannot be empty");
-        let hash = password_hash(password)?;
+        let raw_password = password.to_owned();
+        let hash = tokio::task::spawn_blocking(move || password_hash(&raw_password)).await??;
         sqlx::query("INSERT INTO accounts(username,role,password_hash) VALUES(?,?,?)")
             .bind(username)
             .bind(role)
@@ -346,7 +352,11 @@ impl Store {
             return Ok(None);
         };
         let hash: String = row.get("password_hash");
-        if !password_matches(password, &hash)? {
+        let verified_hash = hash.clone();
+        let raw_password = password.to_owned();
+        if !tokio::task::spawn_blocking(move || password_matches(&raw_password, &verified_hash))
+            .await??
+        {
             return Ok(None);
         }
         let mut bytes = [0u8; 32];
@@ -526,12 +536,15 @@ impl Store {
             .bind(rule.match_type)
             .execute(&mut *tx)
             .await?;
-            sqlx::query("INSERT INTO rules(kind,domain,filter_match) VALUES(?,?,?)")
-                .bind(if rule.block { "block" } else { "allow" })
-                .bind(&rule.domain)
-                .bind(rule.match_type)
-                .execute(&mut *tx)
-                .await?;
+        }
+        for chunk in rules.chunks(250) {
+            let mut query = QueryBuilder::new("INSERT INTO rules(kind,domain,filter_match) ");
+            query.push_values(chunk, |mut row, rule| {
+                row.push_bind(if rule.block { "block" } else { "allow" })
+                    .push_bind(&rule.domain)
+                    .push_bind(rule.match_type);
+            });
+            query.build().execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -606,12 +619,13 @@ impl Store {
             .bind(id)
             .execute(&mut *connection)
             .await?;
-        for domain in domains {
-            sqlx::query("INSERT INTO subscription_domains(subscription_id,domain) VALUES(?,?)")
-                .bind(id)
-                .bind(domain)
-                .execute(&mut *connection)
-                .await?;
+        for chunk in domains.chunks(500) {
+            let mut query =
+                QueryBuilder::new("INSERT INTO subscription_domains(subscription_id,domain) ");
+            query.push_values(chunk, |mut row, domain| {
+                row.push_bind(id).push_bind(domain);
+            });
+            query.build().execute(&mut *connection).await?;
         }
         sqlx::query("UPDATE subscriptions SET updated_at=?,last_error=NULL WHERE id=?")
             .bind(Utc::now().to_rfc3339())
@@ -658,13 +672,11 @@ impl Store {
 
     pub async fn stats(&self) -> Result<serde_json::Value> {
         self.query_log.flush().await?;
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
-            .fetch_one(&self.pool)
-            .await?;
-        let blocked: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM query_log WHERE outcome='blocked'")
-                .fetch_one(&self.pool)
-                .await?;
+        let (total, blocked): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE outcome='blocked') FROM query_log",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let rows = sqlx::query("SELECT COALESCE(country,'未知') AS country,COALESCE(province,'未知') AS province,COUNT(*) AS count FROM query_log GROUP BY country,province ORDER BY count DESC LIMIT 50").fetch_all(&self.pool).await?;
         let regions: Vec<_> = rows.into_iter().map(|r| serde_json::json!({"country":r.get::<String,_>("country"),"province":r.get::<String,_>("province"),"count":r.get::<i64,_>("count")})).collect();
         Ok(
@@ -680,9 +692,6 @@ impl Store {
             .await?;
         sqlx::query("DELETE FROM sessions WHERE expires_at<?")
             .bind(Utc::now().to_rfc3339())
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM portal_profile_tickets WHERE expires<=unixepoch()")
             .execute(&self.pool)
             .await?;
         sqlx::query("DELETE FROM portal_sessions WHERE expires<=unixepoch()")
@@ -736,25 +745,22 @@ mod tests {
         pool.close().await;
         let store = Store::open(&path).await?;
         assert!(store.logs().await?[0]["duration_ms"].is_null());
-        store
-            .query_log
-            .push(crate::query_log::QueryLogEntry {
-                at: Utc::now().to_rfc3339(),
-                client: "127.0.0.1".into(),
-                domain: "new.example".into(),
-                qtype: "A".into(),
-                outcome: "local".into(),
-                protocol: "udp".into(),
-                user_id: None,
-                duration_ms: 0.125,
-                country: None,
-                province: None,
-                city: None,
-                upstream: None,
-                rcode: None,
-                response_wire: None,
-            })
-            .await?;
+        store.query_log.push(crate::query_log::QueryLogEntry {
+            at: Utc::now().to_rfc3339(),
+            client: "127.0.0.1".into(),
+            domain: "new.example".into(),
+            qtype: "A".into(),
+            outcome: "local".into(),
+            protocol: "udp".into(),
+            user_id: None,
+            duration_ms: 0.125,
+            country: None,
+            province: None,
+            city: None,
+            upstream: None,
+            rcode: None,
+            response_wire: None,
+        })?;
         assert_eq!(store.logs().await?[0]["duration_ms"], 0.125);
         store.pool.close().await;
         let reopened = Store::open(&path).await?;

@@ -5,7 +5,7 @@ use futures::{StreamExt, stream};
 use hickory_proto::{op::Query, rr::RecordType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::{sync::watch, task::JoinHandle};
 
 const REGIONS: &str = include_str!("../../resources/regions.txt");
@@ -94,6 +94,8 @@ impl Engine {
         if jobs.settings.ns && self.config.root_hints.is_none() {
             self.cache.root.load(&self.store).await?;
             jobs.ns = Some(tokio::spawn(crate::root_zone::maintain(
+                self.config.clone(),
+                self.features.clone(),
                 self.cache.clone(),
                 self.store.clone(),
                 false,
@@ -182,6 +184,8 @@ impl Engine {
             stop(&mut jobs.ns).await;
             if new.ns {
                 jobs.ns = Some(tokio::spawn(crate::root_zone::maintain(
+                    self.config.clone(),
+                    self.features.clone(),
                     self.cache.clone(),
                     self.store.clone(),
                     false,
@@ -221,6 +225,8 @@ impl Engine {
             "ns" if jobs.ns.is_some() => {
                 stop(&mut jobs.ns).await;
                 jobs.ns = Some(tokio::spawn(crate::root_zone::maintain(
+                    self.config.clone(),
+                    self.features.clone(),
                     self.cache.clone(),
                     self.store.clone(),
                     true,
